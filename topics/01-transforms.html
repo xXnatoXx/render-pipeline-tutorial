@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Coordinate Spaces & Transforms · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .chain-table td:first-child { font-weight: 600; white-space: nowrap; }
+  .chain-table td.num { font-family: var(--font-mono); font-size: 0.82rem; white-space: pre; font-variant-numeric: tabular-nums; }
+  .chain-table tr.hl td { background: color-mix(in srgb, var(--vtx) 12%, transparent); }
+  .space-tag { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; background: var(--vtx); vertical-align: 0; }
+</style>
+</head>
+<body data-topic="01">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 01 · Foundations</p>
+    <h1>Coordinate Spaces & Transforms</h1>
+    <p class="lede">Before a GPU can color a single pixel, every vertex has to make a journey: from the model's own coordinates, into the world, in front of a camera, through a projection, and finally onto a grid of pixels. This chapter follows one vertex all the way.</p>
+    <div class="stage-band"><span class="app">Application</span><span class="on vtx">Vertex</span><span class="ras">Rasterize</span><span class="frag">Fragment</span><span class="out">Output</span></div>
+  </section>
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>The six coordinate spaces: object, world, view, clip, NDC and screen.</li>
+    <li>Why graphics uses 4D homogeneous coordinates, and what <code>w</code> is for.</li>
+    <li>Why matrix order matters (<code>T·R</code> ≠ <code>R·T</code>), and why MVP is written <code>P·V·M</code>.</li>
+    <li>How perspective and orthographic projection differ, and why depth precision is uneven.</li>
+    <li>How normalized device coordinates become pixel positions, including the y flip.</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="model">
+    <h2><span class="step-no">STEP 1</span>Object space → world space</h2>
+    <p>An artist builds a model around its own origin. A cube's corners might sit at <code>(±0.5, ±0.5, ±0.5)</code>. That is <b>object space</b> (also called model space). It says nothing about where the cube is in the game. The <b>model matrix</b> <code>M</code> places the object in the shared <b>world space</b>: it scales it, rotates it and moves it.</p>
+    <p>Moving (translation) is the awkward part. A 3×3 matrix can scale and rotate, but it can't add a constant offset, because a matrix times the zero vector is always zero. The trick is to add a fourth coordinate, <code>w</code>. Points get <code>w = 1</code>, and a 4×4 matrix can then put the offset in its last column. These are <b>homogeneous coordinates</b>. As a bonus, directions such as normals get <code>w = 0</code>, so translation leaves them alone.</p>
+    <div class="math">p_world = M · p_object          M = T · R · S   (scale first, then rotate, then translate)
+
+T(tx,ty,tz) = | 1  0  0  tx |      T · [x y z 1]ᵀ = [x+tx  y+ty  z+tz  1]ᵀ   point: moves
+              | 0  1  0  ty |
+              | 0  0  1  tz |      T · [x y z 0]ᵀ = [x     y     z     0]ᵀ   direction: unchanged
+              | 0  0  0  1  |</div>
+    <p>With column vectors, the matrix closest to the point is applied <i>first</i>. So <code>T·R·S·p</code> means "scale, then rotate, then translate". Swap two of them and you get a different result. Try it below. With <b>T·R</b> the cube spins in place and then moves. With <b>R·T</b> it moves first, and the rotation then swings it around the world origin like a planet in orbit.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="s1" class="tall" aria-label="3D view of a cube in world space with its local axes gizmo, a faint outline of the cube at the world origin, and world axes. Sliders change the model matrix."></canvas><div class="hud" id="s1-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="s1-ry">Rotate Y <output for="s1-ry"></output></label><input type="range" id="s1-ry" min="-180" max="180" step="1" value="35"></div>
+        <div class="control"><label for="s1-tx">Translate X <output for="s1-tx"></output></label><input type="range" id="s1-tx" min="-3" max="3" step="0.1" value="2"></div>
+        <div class="control"><label for="s1-sc">Scale <output for="s1-sc"></output></label><input type="range" id="s1-sc" min="0.3" max="2" step="0.05" value="1"></div>
+        <div class="btn-row" id="s1-order" aria-label="Matrix order"><button class="btn" data-value="TRS" aria-pressed="true">M = T·R·S</button><button class="btn" data-value="RTS">M = R·T·S</button></div>
+      </div>
+      <figcaption><b>Try it:</b> set Translate X to 2, then sweep Rotate Y in each order. The dashed outline is the cube as authored in object space. The coloured arrows are its local x (red), y (green) and z (blue) axes after <code>M</code>.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> A 4×4 matrix with <code>w = 1</code> for points can scale, rotate <i>and</i> translate. Read a product of matrices right to left: the rightmost one acts on the vertex first.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="view">
+    <h2><span class="step-no">STEP 2</span>World space → view space</h2>
+    <p>GPUs don't have a "camera" object. Instead, we move the <i>whole world</i> so that the camera sits at the origin and looks down <code>−Z</code>, with <code>+Y</code> up and <code>+X</code> to the right. The result is <b>view space</b> (eye or camera space). The <b>view matrix</b> <code>V</code> that does this is the inverse of the camera's own placement in the world. If the camera is 6 units in front of the cube, then in view space the cube is 6 units <i>down −Z</i>, at <code>z = −6</code>.</p>
+    <p>A common way to build <code>V</code> is <code>lookAt(eye, target, up)</code>. It works out the camera's right vector <code>r</code>, up vector <code>u</code> and backward vector <code>b</code> (pointing away from the target), puts them in the rows, and subtracts the eye position:</p>
+    <div class="math">V = | rx  ry  rz  −r·eye |        b = normalize(eye − target)
+    | ux  uy  uz  −u·eye |        r = normalize(up × b)
+    | bx  by  bz  −b·eye |        u = b × r
+    | 0   0   0     1    |</div>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="s2map" aria-label="Top-down map of the world showing four cubes and a camera with its field-of-view wedge. Drag the camera to move it, drag elsewhere to aim it."></canvas><span class="pane-label">Top-down map · world</span></div>
+        <div class="viz-stage"><canvas id="s2cam" aria-label="What the camera sees: the four cubes rendered in perspective, with the view matrix shown."></canvas><div class="hud" id="s2-hud"></div><span class="pane-label">Camera view</span></div>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="s2-yaw">Camera yaw <output for="s2-yaw"></output></label><input type="range" id="s2-yaw" min="-180" max="180" step="1" value="0"></div>
+        <div class="control"><label for="s2-x">Camera X <output for="s2-x"></output></label><input type="range" id="s2-x" min="-6" max="6" step="0.1" value="0"></div>
+        <div class="control"><label for="s2-z">Camera Z <output for="s2-z"></output></label><input type="range" id="s2-z" min="-6" max="6" step="0.1" value="6"></div>
+      </div>
+      <figcaption><b>Try it:</b> on the map, drag the camera dot to move it, or drag anywhere else to aim it. Watch the amber cube's view-space position: it has negative <code>z</code> whenever it is in front of the camera. The arrows on the camera are its right (+x, red) and forward (−z, blue) axes.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> The view matrix doesn't move a camera. It moves the world into the camera's frame, so that "in front of the camera" always means "negative z".</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="projection">
+    <h2><span class="step-no">STEP 3</span>Projection: view space → clip space</h2>
+    <p>The camera sees a region called the <b>view frustum</b>. For a perspective camera it's a pyramid with the tip cut off, bounded by a <b>near</b> plane, a <b>far</b> plane and the field of view (FOV). The <b>projection matrix</b> <code>P</code> reshapes the frustum into <b>clip space</b>. Here's the OpenGL perspective matrix, with <code>n</code> and <code>f</code> the near and far distances:</p>
+    <div class="math">k = 1 / tan(fov / 2)
+
+P = | k/aspect  0        0              0        |
+    | 0         k        0              0        |
+    | 0         0   (f+n)/(n−f)    2·f·n/(n−f)    |
+    | 0         0       −1              0        |      →   w_clip = −z_view</div>
+    <p>The bottom row is where perspective happens. It copies the vertex's distance in front of the camera, <code>−z_view</code>, into <code>w</code>. A point 8 units away gets <code>w = 8</code>, and one 2 units away gets <code>w = 2</code>. In the next step everything gets divided by <code>w</code>, so distant things shrink. An <b>orthographic</b> projection keeps <code>w = 1</code>. It just scales and shifts a box, so size no longer depends on distance. That suits CAD views, 2D games and shadow maps.</p>
+    <p>A point is inside the frustum exactly when <code>−w ≤ x, y, z ≤ w</code>. The GPU clips triangles against these planes in clip space, before any division, which is where the name comes from.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="s3" class="tall" aria-label="Side view of the camera frustum, with the eye on the left and depth increasing to the right. A draggable point shows its projection onto the near plane and its clip coordinates."></canvas><div class="hud" id="s3-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="s3-near">Near <output for="s3-near"></output></label><input type="range" id="s3-near" min="0.2" max="5" step="0.1" value="1"></div>
+        <div class="control"><label for="s3-far">Far <output for="s3-far"></output></label><input type="range" id="s3-far" min="4" max="20" step="0.5" value="10"></div>
+        <div class="control"><label for="s3-fov">FOV <output for="s3-fov"></output></label><input type="range" id="s3-fov" min="20" max="120" step="1" value="60"></div>
+        <div class="control"><label for="s3-pz">Point depth (−z) <output for="s3-pz"></output></label><input type="range" id="s3-pz" min="0.2" max="22" step="0.1" value="6"></div>
+        <div class="control"><label for="s3-py">Point y <output for="s3-py"></output></label><input type="range" id="s3-py" min="-8" max="8" step="0.1" value="1.5"></div>
+        <div class="btn-row" id="s3-mode" aria-label="Projection type"><button class="btn" data-value="persp" aria-pressed="true">Perspective</button><button class="btn" data-value="ortho">Orthographic</button></div>
+      </div>
+      <figcaption><b>Try it:</b> drag the point. In perspective mode it projects along a ray to the eye, and <code>w</code> grows with depth. Switch to orthographic and the rays become parallel, while <code>w</code> stays 1. The orthographic box is sized to match the perspective frustum halfway between near and far. Push the point past the far plane or out of the sides and it turns red: outside clip space.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> The projection matrix doesn't divide anything. It puts depth into <code>w</code> (perspective) or leaves <code>w = 1</code> (orthographic) and sets up the frustum so that "visible" means <code>|x|, |y|, |z| ≤ w</code>.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="divide">
+    <h2><span class="step-no">STEP 4</span>Perspective divide → NDC, and why depth is nonlinear</h2>
+    <p>After clipping, the GPU divides <code>x</code>, <code>y</code> and <code>z</code> by <code>w</code>. This is the <b>perspective divide</b>. It is fixed-function hardware, so your shader doesn't do it. The result is <b>normalized device coordinates</b> (NDC). The whole frustum becomes the cube <code>[−1, 1]³</code>, with the near plane at <code>z = −1</code> and the far plane at <code>z = +1</code> (OpenGL convention; chapter 08 covers APIs that use <code>[0, 1]</code>).</p>
+    <div class="math">ndc = ( x_c / w,  y_c / w,  z_c / w )
+
+z_ndc(d) = (f+n)/(f−n) − 2·f·n / ((f−n)·d)        d = −z_view = w   (distance in front of the camera)</div>
+    <p>Look at the depth formula. It is linear in <code>1/d</code>, not in <code>d</code>. Most of the NDC depth range gets spent close to the near plane. With <code>n = 0.1</code> and <code>f = 100</code>, half of all depth values cover only the first 0.2 units of the scene. Far away, objects that are centimetres apart can end up with the same stored depth. That causes <b>z-fighting</b>, where two surfaces flicker through each other. Pushing the near plane out helps far more than pulling the far plane in.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="s4a" aria-label="Animated scatter of points moving from clip space, where the visible region is a trapezoid, to NDC, where it becomes a square. Points outside the frustum are drawn in red."></canvas><div class="hud" id="s4a-hud"></div><span class="pane-label">clip → NDC (z, y)</span></div>
+        <div class="viz-stage"><canvas id="s4b" aria-label="Graph of NDC z against view depth. Evenly spaced NDC depth values are traced back to depth, showing them crowded near the near plane."></canvas><div class="hud" id="s4b-hud"></div><span class="pane-label">NDC z vs depth</span></div>
+      </div>
+      <div class="controls">
+        <div class="btn-row"><button class="btn primary" id="s4-play" type="button">Pause</button></div>
+        <div class="control"><label for="s4-t">Divide progress <output for="s4-t"></output></label><input type="range" id="s4-t" min="0" max="1" step="0.01" value="0"></div>
+        <div class="control"><label for="s4-near">Near (graph) <output for="s4-near"></output></label><input type="range" id="s4-near" min="0.05" max="5" step="0.05" value="0.5"></div>
+        <div class="control"><label for="s4-far">Far (graph) <output for="s4-far"></output></label><input type="range" id="s4-far" min="10" max="500" step="10" value="100"></div>
+      </div>
+      <figcaption><b>Left:</b> points from a side view (n = 1, f = 10, FOV 60°) drawn at (z, y). At progress 0 they're in clip space, where the visible region is a trapezoid. At 1 each one has been divided by its own <code>w</code>, and the trapezoid has become the NDC square. <b>Right:</b> the vertical lines show where 9 evenly spaced NDC depth values land in the scene. Drag Near down toward 0.05 and watch them crowd together.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> Dividing by <code>w</code> is what makes distant things smaller. It also makes stored depth proportional to <code>1/distance</code>, so precision is high near the camera and poor far away.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="viewport">
+    <h2><span class="step-no">STEP 5</span>Viewport: NDC → pixels</h2>
+    <p>The last fixed step is the <b>viewport transform</b>. It stretches NDC <code>x</code> and <code>y</code> from <code>[−1, 1]</code> to the window size in pixels. There's one trap. NDC <code>y</code> points <i>up</i>, but this tutorial's screen space (like canvas, and most image formats) has its origin at the top-left with <code>y</code> pointing <i>down</i>. So <code>y</code> gets flipped. (OpenGL's own window coordinates actually have their origin at the bottom-left. The flip shown here is what you do when you draw into a top-left canvas.) Depth gets remapped too, from <code>[−1, 1]</code> to the depth buffer's <code>[0, 1]</code>.</p>
+    <div class="math">x_px  = (x_ndc + 1) / 2 · W
+y_px  = (1 − y_ndc) / 2 · H        ← flip: NDC y up, screen y down
+depth = (z_ndc + 1) / 2            (default depth range 0…1)
+
+pixel (i, j) has its centre at (i + 0.5, j + 0.5)</div>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="s5" tabindex="0" aria-label="A grid of pixels with NDC axes through its centre and screen axes from the top-left corner. A triangle given in NDC is drawn over it. Hover or use arrow keys to inspect a pixel."></canvas><div class="hud" id="s5-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="s5-w">Viewport width W <output for="s5-w"></output></label><input type="range" id="s5-w" min="6" max="40" step="1" value="20"></div>
+        <div class="control"><label for="s5-h">Viewport height H <output for="s5-h"></output></label><input type="range" id="s5-h" min="4" max="28" step="1" value="12"></div>
+        <div class="legend"><span><i style="background:var(--vtx)"></i>NDC axes (y up)</span><span><i style="background:var(--out)"></i>screen axes (y down)</span></div>
+      </div>
+      <figcaption><b>Try it:</b> hover a pixel, or focus the canvas and use the arrow keys, to see its centre in pixel and NDC coordinates. The triangle's corners are fixed in NDC, so it stretches with the viewport. Shaded cells have their centre inside the triangle, which is a preview of rasterization in chapter 02.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> The viewport transform is a scale and an offset, plus a y flip when the screen's origin is at the top. The same NDC triangle lands on different pixels at every resolution.</div>
+  </section>
+
+  <!-- STEP 6 -->
+  <section class="step" id="chain">
+    <h2><span class="step-no">STEP 6</span>The whole chain, one vertex at a time</h2>
+    <p>In a real vertex shader, the matrices are multiplied together once on the CPU, and each vertex does a single multiply: <code>gl_Position = P · V · M · p</code>. Read right to left: model, then view, then projection. The GPU does the rest (clip, divide, viewport). The table follows one corner of the cube through every stage. Move the sliders and watch which numbers change.</p>
+    <div class="math">clip   = P · V · M · [x y z 1]ᵀ      ← the vertex shader's job (gl_Position)
+ndc    = clip.xyz / clip.w             ← fixed-function divide
+screen = viewport(ndc)                 ← fixed-function, y flipped for a top-left origin</div>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="s6" aria-label="Rendered cube with one highlighted vertex whose coordinates through every stage appear in the table below."></canvas><div class="hud" id="s6-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="s6-ry">Model rotate Y <output for="s6-ry"></output></label><input type="range" id="s6-ry" min="-180" max="180" step="1" value="30"></div>
+        <div class="control"><label for="s6-d">Camera distance <output for="s6-d"></output></label><input type="range" id="s6-d" min="1.5" max="10" step="0.1" value="5"></div>
+        <div class="control"><label for="s6-fov">FOV <output for="s6-fov"></output></label><input type="range" id="s6-fov" min="20" max="110" step="1" value="50"></div>
+        <div class="control"><label for="s6-v">Vertex # <output for="s6-v"></output></label><input type="range" id="s6-v" min="0" max="7" step="1" value="7"></div>
+      </div>
+      <div class="table-wrap" style="border:0;border-top:1px solid var(--line);border-radius:0">
+        <table class="chain-table" aria-live="polite">
+          <thead><tr><th>Space</th><th>Coordinates</th><th>Produced by</th></tr></thead>
+          <tbody id="s6-body"></tbody>
+        </table>
+      </div>
+      <figcaption><b>Try it:</b> rotating the model changes every row from World down. Moving the camera leaves World alone. FOV only changes Clip and below. Bring the camera very close and watch <code>w</code> shrink toward zero and the NDC values blow up.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> Each space has one job. Object space is for authoring, world for placing, view for the camera, clip for clipping, NDC for a resolution-independent screen, and pixels for the framebuffer.</div>
+  </section>
+
+  <section class="step" id="recap"><h2><span class="step-no">RECAP</span>What to remember</h2><ul>
+    <li><b>Object → world:</b> the model matrix <code>M = T·R·S</code>. Order matters, and the rightmost matrix acts first.</li>
+    <li><b>Homogeneous coordinates:</b> points use <code>w = 1</code> so 4×4 matrices can translate them. Directions use <code>w = 0</code>.</li>
+    <li><b>World → view:</b> the view matrix moves the world so the camera is at the origin looking down <code>−Z</code>. Visible things have negative <code>z</code>.</li>
+    <li><b>View → clip:</b> the projection matrix puts <code>−z_view</code> into <code>w</code> (perspective) or keeps <code>w = 1</code> (orthographic). Visible means <code>|x|, |y|, |z| ≤ w</code>.</li>
+    <li><b>Perspective divide:</b> <code>xyz / w</code> gives NDC in <code>[−1, 1]³</code>. Distant things shrink because they have a bigger <code>w</code>.</li>
+    <li><b>Depth is nonlinear:</b> NDC z depends on <code>1/d</code>. A near plane that is too small wastes precision and causes z-fighting far away.</li>
+    <li><b>Viewport:</b> NDC is scaled to pixels, with <code>y</code> flipped for a top-left origin, and depth mapped to <code>[0, 1]</code>.</li>
+    <li><b>MVP = P·V·M:</b> the vertex shader outputs clip space. The GPU clips, divides and maps to the viewport. Next, chapter 02 turns those screen-space triangles into fragments.</li>
+  </ul></section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const { m4, v3 } = RP;
+  const DEG = Math.PI / 180;
+  const MONO = '"JetBrains Mono", ui-monospace, Consolas, monospace';
+
+  /* ---------- shared helpers: number formatting, cube, software projector ---------- */
+  function num(x, d) {
+    if (d === undefined) d = 2;
+    let v = Number(x.toFixed(d)); if (v === 0) v = 0;
+    const s = v.toFixed(d); return s.charAt(0) === "-" ? s : " " + s;
+  }
+  function vecStr(v, d, pad) { return "[" + v.map((x) => num(x, d).padStart(pad || 6)).join(" ") + " ]"; }
+  function matStr(m, d) {
+    const rows = [];
+    for (let r = 0; r < 4; r++) rows.push("| " + [m[r], m[4 + r], m[8 + r], m[12 + r]].map((x) => num(x, d).padStart(6)).join(" ") + " |");
+    return rows.join("\n");
+  }
+  const CUBE_V = [];
+  for (let i = 0; i < 8; i++) CUBE_V.push([(i & 1) ? 0.5 : -0.5, (i & 2) ? 0.5 : -0.5, (i & 4) ? 0.5 : -0.5]);
+  const CUBE_E = [];
+  for (let i = 0; i < 8; i++) for (const b of [1, 2, 4]) if (!(i & b)) CUBE_E.push([i, i | b]);
+
+  function toScreen(P, v, w, h) {
+    const c = m4.xform(P, v);
+    return [(c[0] / c[3] * 0.5 + 0.5) * w, (1 - (c[1] / c[3] * 0.5 + 0.5)) * h];
+  }
+  // add a world-space segment to the current path, clipped against the near plane in view space
+  function seg3(ctx, V, P, a, b, w, h, near) {
+    const zc = -(near || 0.05);
+    let A = m4.xform(V, [a[0], a[1], a[2], 1]), B = m4.xform(V, [b[0], b[1], b[2], 1]);
+    if (A[2] > zc && B[2] > zc) return;
+    if (A[2] > zc || B[2] > zc) {
+      const t = (zc - A[2]) / (B[2] - A[2]);
+      const I = [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, zc, 1];
+      if (A[2] > zc) A = I; else B = I;
+    }
+    const pa = toScreen(P, A, w, h), pb = toScreen(P, B, w, h);
+    ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]);
+  }
+  function pt3(V, P, p, w, h, near) {
+    const v = m4.xform(V, [p[0], p[1], p[2], 1]);
+    if (v[2] > -(near || 0.05)) return null;
+    return toScreen(P, v, w, h);
+  }
+  function grid3(ctx, V, P, w, h, ext, color) {
+    ctx.beginPath();
+    for (let i = -ext; i <= ext; i++) {
+      seg3(ctx, V, P, [i, 0, -ext], [i, 0, ext], w, h);
+      seg3(ctx, V, P, [-ext, 0, i], [ext, 0, i], w, h);
+    }
+    ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke();
+  }
+  function cube3(ctx, V, P, M, w, h, color, lw, dash) {
+    const wv = CUBE_V.map((p) => m4.xform(M, [p[0], p[1], p[2], 1]));
+    ctx.beginPath();
+    for (const [i, j] of CUBE_E) seg3(ctx, V, P, wv[i], wv[j], w, h);
+    ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = lw || 2; ctx.stroke(); ctx.setLineDash([]);
+  }
+  function label(ctx, txt, x, y, color, align) {
+    ctx.font = "600 11px " + MONO; ctx.fillStyle = color; ctx.textAlign = align || "left"; ctx.textBaseline = "middle";
+    ctx.fillText(txt, x, y);
+  }
+  function arrow(ctx, x0, y0, x1, y1, color, lw) {
+    const a = Math.atan2(y1 - y0, x1 - x0), L = 7;
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw || 2;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - L * Math.cos(a - 0.4), y1 - L * Math.sin(a - 0.4));
+    ctx.lineTo(x1 - L * Math.cos(a + 0.4), y1 - L * Math.sin(a + 0.4)); ctx.closePath(); ctx.fill();
+  }
+
+  /* ---------- STEP 1: object -> world ---------- */
+  const s1 = { ry: 35, tx: 2, sc: 1, order: "TRS" };
+  const hud1 = document.getElementById("s1-hud");
+  function modelMatrix1() {
+    const T = m4.translate(s1.tx, 0, 0), R = m4.rotY(s1.ry * DEG), S = m4.scale(s1.sc, s1.sc, s1.sc);
+    return s1.order === "TRS" ? m4.chain(T, R, S) : m4.chain(R, T, S);
+  }
+  const v1 = RP.canvas("#s1", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const V = m4.lookAt([3.2, 4.2, 7.5], [0.3, 0, 0], [0, 1, 0]);
+    const P = m4.perspective(45 * DEG, w / h, 0.1, 100);
+    grid3(ctx, V, P, w, h, 4, RP.alpha(c.line, 1));
+    // world axes
+    const o = pt3(V, P, [0, 0, 0], w, h);
+    [[[3.6, 0, 0], "X"], [[0, 2.6, 0], "Y"], [[0, 0, 3.6], "Z"]].forEach(([p, n]) => {
+      const q = pt3(V, P, p, w, h); if (!o || !q) return;
+      ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(o[0], o[1]); ctx.lineTo(q[0], q[1]);
+      ctx.strokeStyle = c.muted; ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]);
+      label(ctx, "world " + n, q[0] + 4, q[1] - 6, c.muted);
+    });
+    // orbit circle when R·T
+    if (s1.order === "RTS" && Math.abs(s1.tx) > 0.05) {
+      ctx.beginPath();
+      const r = Math.abs(s1.tx);
+      for (let i = 0; i < 64; i++) {
+        const a0 = i / 64 * Math.PI * 2, a1 = (i + 1) / 64 * Math.PI * 2;
+        seg3(ctx, V, P, [r * Math.cos(a0), 0, r * Math.sin(a0)], [r * Math.cos(a1), 0, r * Math.sin(a1)], w, h);
+      }
+      ctx.setLineDash([3, 5]); ctx.strokeStyle = c.accent; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    }
+    // object-space ghost
+    cube3(ctx, V, P, m4.identity(), w, h, c.muted, 1, [4, 4]);
+    const M = modelMatrix1();
+    // filled faces hint (top face) then edges
+    cube3(ctx, V, P, M, w, h, c.vtx, 2.5);
+    // local axes gizmo
+    const go = pt3(V, P, m4.xform(M, [0, 0, 0, 1]), w, h);
+    [[[1, 0, 0], c.bad, "x"], [[0, 1, 0], c.good, "y"], [[0, 0, 1], c.out, "z"]].forEach(([d, col, n]) => {
+      const q = pt3(V, P, m4.xform(M, [d[0], d[1], d[2], 1]), w, h);
+      if (go && q) { arrow(ctx, go[0], go[1], q[0], q[1], col, 2.5); label(ctx, n, q[0] + 5, q[1], col); }
+    });
+    // tracked corner
+    const corner = [0.5, 0.5, 0.5, 1], wc = m4.xform(M, corner);
+    const cp = pt3(V, P, wc, w, h);
+    if (cp) { ctx.beginPath(); ctx.arc(cp[0], cp[1], 5, 0, Math.PI * 2); ctx.fillStyle = c.ink; ctx.fill(); }
+    hud1.textContent = "M = " + (s1.order === "TRS" ? "T·R·S" : "R·T·S") + "\n" + matStr(M) +
+      "\n\ncorner (dot)\nobject " + vecStr(corner, 2, 5) + "\nworld  " + vecStr(wc, 2, 5);
+  });
+  RP.slider("#s1-ry", (v) => { s1.ry = v; v1.draw(); }, { fmt: (v) => v + "°" });
+  RP.slider("#s1-tx", (v) => { s1.tx = v; v1.draw(); }, { fmt: (v) => v.toFixed(1) });
+  RP.slider("#s1-sc", (v) => { s1.sc = v; v1.draw(); }, { fmt: (v) => v.toFixed(2) + "×" });
+  RP.toggleGroup("#s1-order", (v) => { s1.order = v; v1.draw(); });
+
+  /* ---------- STEP 2: world -> view ---------- */
+  const cam = { x: 0, z: 6, yaw: 0 };
+  const EYE_Y = 1.2, FOV2 = 60;
+  const objs2 = [
+    { p: [0, 0.5, 0], col: "vtx" }, { p: [-2.5, 0.5, -2], col: "frag" },
+    { p: [2.5, 0.5, -3], col: "ras" }, { p: [1.5, 0.5, 2.5], col: "out" },
+  ];
+  const hud2 = document.getElementById("s2-hud");
+  const fwd = () => [-Math.sin(cam.yaw * DEG), 0, -Math.cos(cam.yaw * DEG)];
+  function viewMatrix2() {
+    const eye = [cam.x, EYE_Y, cam.z], f = fwd();
+    return m4.lookAt(eye, v3.add(eye, f), [0, 1, 0]);
+  }
+  function mapXf(s) {
+    const k = Math.min(s.w, s.h) / 15;
+    return { k, X: (x) => s.w / 2 + x * k, Y: (z) => s.h / 2 + z * k, ix: (px) => (px - s.w / 2) / k, iz: (py) => (py - s.h / 2) / k };
+  }
+  let v2cam = null;
+  const v2map = RP.canvas("#s2map", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const t = mapXf(s);
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = -10; i <= 10; i++) { ctx.moveTo(t.X(i), 0); ctx.lineTo(t.X(i), h); ctx.moveTo(0, t.Y(i)); ctx.lineTo(w, t.Y(i)); }
+    ctx.stroke();
+    arrow(ctx, t.X(0), t.Y(0), t.X(1.6), t.Y(0), c.muted, 1); label(ctx, "+x", t.X(1.7), t.Y(0), c.muted);
+    arrow(ctx, t.X(0), t.Y(0), t.X(0), t.Y(1.6), c.muted, 1); label(ctx, "+z", t.X(0) + 4, t.Y(1.8), c.muted);
+    // fov wedge
+    const aspect = v2cam && v2cam.h > 1 ? v2cam.w / v2cam.h : 1;
+    const half = Math.atan(Math.tan(FOV2 / 2 * DEG) * aspect);
+    const L = 30, yaw = cam.yaw * DEG;
+    const dir = (a) => [-Math.sin(yaw + a), -Math.cos(yaw + a)];
+    const cx = t.X(cam.x), cy = t.Y(cam.z);
+    const dl = dir(half), dr = dir(-half);
+    ctx.beginPath(); ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + dl[0] * L * t.k, cy + dl[1] * L * t.k); ctx.lineTo(cx + dr[0] * L * t.k, cy + dr[1] * L * t.k); ctx.closePath();
+    ctx.fillStyle = RP.alpha(c.accent, 0.1); ctx.fill();
+    // objects
+    for (const o of objs2) {
+      const x = t.X(o.p[0] - 0.5), y = t.Y(o.p[2] - 0.5);
+      ctx.fillStyle = RP.alpha(c[o.col], 0.35); ctx.fillRect(x, y, t.k, t.k);
+      ctx.strokeStyle = c[o.col]; ctx.lineWidth = 2; ctx.strokeRect(x, y, t.k, t.k);
+    }
+    // camera axes
+    const f = fwd(), r = [Math.cos(yaw), 0, -Math.sin(yaw)];
+    arrow(ctx, cx, cy, cx + f[0] * 1.6 * t.k, cy + f[2] * 1.6 * t.k, c.out, 2);
+    label(ctx, "−z", cx + f[0] * 1.9 * t.k, cy + f[2] * 1.9 * t.k, c.out, "center");
+    arrow(ctx, cx, cy, cx + r[0] * 1.1 * t.k, cy + r[2] * 1.1 * t.k, c.bad, 2);
+    label(ctx, "+x", cx + r[0] * 1.4 * t.k, cy + r[2] * 1.4 * t.k, c.bad, "center");
+    ctx.beginPath(); ctx.arc(cx, cy, 8, 0, Math.PI * 2); ctx.fillStyle = c.ink; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = c.surface; ctx.stroke();
+  });
+  v2cam = RP.canvas("#s2cam", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const V = viewMatrix2(), P = m4.perspective(FOV2 * DEG, w / h, 0.05, 100);
+    grid3(ctx, V, P, w, h, 8, c.line);
+    // draw farther cubes first
+    const order = objs2.map((o) => ({ o, d: m4.xform(V, [o.p[0], o.p[1], o.p[2], 1])[2] })).sort((a, b) => a.d - b.d);
+    for (const { o } of order) cube3(ctx, V, P, m4.translate(o.p[0], o.p[1], o.p[2]), w, h, c[o.col], 2);
+    const vc = m4.xform(V, [0, 0.5, 0, 1]);
+    hud2.textContent = "V =\n" + matStr(V) + "\n\namber cube centre\nworld " + vecStr([0, 0.5, 0, 1], 1, 5) +
+      "\nview  " + vecStr(vc, 1, 5) + (vc[2] < 0 ? "\n(z < 0: in front)" : "\n(z > 0: behind camera)");
+  });
+  const redraw2 = () => { v2map.draw(); v2cam.draw(); };
+  const yawS = RP.slider("#s2-yaw", (v) => { cam.yaw = v; redraw2(); }, { fmt: (v) => v + "°" });
+  const xS = RP.slider("#s2-x", (v) => { cam.x = v; redraw2(); }, { fmt: (v) => v.toFixed(1) });
+  const zS = RP.slider("#s2-z", (v) => { cam.z = v; redraw2(); }, { fmt: (v) => v.toFixed(1) });
+  let mode2 = null;
+  function aimAt(px, py) {
+    const t = mapXf(v2map), dx = t.ix(px) - cam.x, dz = t.iz(py) - cam.z;
+    if (Math.hypot(dx, dz) < 0.05) return;
+    yawS.value = Math.round(Math.atan2(-dx, -dz) / DEG);
+  }
+  RP.drag(v2map.el, {
+    down(x, y) {
+      const t = mapXf(v2map);
+      mode2 = Math.hypot(x - t.X(cam.x), y - t.Y(cam.z)) < 20 ? "move" : "aim";
+      if (mode2 === "aim") aimAt(x, y);
+    },
+    move(x, y) {
+      if (mode2 === "move") {
+        const t = mapXf(v2map);
+        xS.value = Math.round(RP.clamp(t.ix(x), -6, 6) * 10) / 10;
+        zS.value = Math.round(RP.clamp(t.iz(y), -6, 6) * 10) / 10;
+      } else aimAt(x, y);
+    },
+    up() { mode2 = null; },
+  });
+
+  /* ---------- STEP 3: projection ---------- */
+  const s3 = { near: 1, far: 10, fov: 60, py: 1.5, pz: 6, mode: "persp" };
+  const hud3 = document.getElementById("s3-hud");
+  function layout3(s) {
+    const m = 40, zmax = Math.max(s3.far, s3.pz) * 1.08 + 0.5;
+    const kx = (s.w - m - 16) / zmax;
+    const ky = (s.h / 2 - 16) / Math.max(s3.far * Math.tan(Math.min(s3.fov, 80) / 2 * DEG) * 1.05, 1);
+    const k = Math.min(kx, ky);
+    return { k, X: (d) => m + d * k, Y: (y) => s.h / 2 - y * k, id: (px) => (px - m) / k, iy: (py) => (s.h / 2 - py) / k };
+  }
+  function proj3() {
+    if (s3.mode === "persp") return m4.perspective(s3.fov * DEG, 1, s3.near, s3.far);
+    const oh = Math.tan(s3.fov / 2 * DEG) * (s3.near + s3.far) / 2;
+    return m4.ortho(-oh, oh, -oh, oh, s3.near, s3.far);
+  }
+  const v3c = RP.canvas("#s3", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const L = layout3(s), n = s3.near, f = s3.far, ta = Math.tan(s3.fov / 2 * DEG);
+    const persp = s3.mode === "persp";
+    const oh = ta * (n + f) / 2;
+    const hn = persp ? n * ta : oh, hf = persp ? f * ta : oh;
+    // optical axis
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = c.muted; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(L.X(0), L.Y(0)); ctx.lineTo(w, L.Y(0)); ctx.stroke(); ctx.setLineDash([]);
+    label(ctx, "−z (depth) →", w - 8, L.Y(0) + 12, c.muted, "right");
+    // frustum extension lines from eye (perspective)
+    if (persp) {
+      ctx.strokeStyle = RP.alpha(c.vtx, 0.35); ctx.lineWidth = 1; ctx.beginPath();
+      ctx.moveTo(L.X(0), L.Y(0)); ctx.lineTo(L.X(n), L.Y(hn)); ctx.moveTo(L.X(0), L.Y(0)); ctx.lineTo(L.X(n), L.Y(-hn)); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.moveTo(L.X(n), L.Y(hn)); ctx.lineTo(L.X(f), L.Y(hf)); ctx.lineTo(L.X(f), L.Y(-hf)); ctx.lineTo(L.X(n), L.Y(-hn)); ctx.closePath();
+    ctx.fillStyle = RP.alpha(c.vtx, 0.12); ctx.fill(); ctx.strokeStyle = c.vtx; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(L.X(n), L.Y(hn)); ctx.lineTo(L.X(n), L.Y(-hn)); ctx.stroke();
+    label(ctx, "near", L.X(n), Math.min(h - 10, L.Y(-hn) + 14), c.vtx, "center");
+    label(ctx, "far", L.X(f), Math.min(h - 10, L.Y(-hf) + 14), c.vtx, "center");
+    // eye
+    ctx.beginPath(); ctx.arc(L.X(0), L.Y(0), 6, 0, Math.PI * 2); ctx.fillStyle = c.ink; ctx.fill();
+    label(ctx, "eye", L.X(0), L.Y(0) - 14, c.ink, "center");
+    // point
+    const P = proj3(), zv = -s3.pz, pv = [0, s3.py, zv, 1];
+    const clip = m4.xform(P, pv), ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+    const inside = clip[3] > 0 && Math.abs(clip[1]) <= clip[3] && Math.abs(clip[2]) <= clip[3];
+    const px = L.X(s3.pz), py = L.Y(s3.py);
+    const yNear = persp ? s3.py * n / s3.pz : s3.py;
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = c.accent; ctx.lineWidth = 1.5; ctx.beginPath();
+    if (persp) { ctx.moveTo(px, py); ctx.lineTo(L.X(0), L.Y(0)); } else { ctx.moveTo(px, py); ctx.lineTo(L.X(0), py); }
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(L.X(n), L.Y(yNear), 5, 0, Math.PI * 2); ctx.fillStyle = c.accent; ctx.fill();
+    ctx.beginPath(); ctx.arc(px, py, 8, 0, Math.PI * 2); ctx.fillStyle = inside ? c.good : c.bad; ctx.fill();
+    ctx.strokeStyle = c.surface; ctx.lineWidth = 2; ctx.stroke();
+    hud3.textContent = (persp ? "perspective" : "orthographic") + "  P =\n" + matStr(P) +
+      "\n\nview  " + vecStr(pv) + "\nclip  " + vecStr(clip) + "\n      w = " + num(clip[3]) + (persp ? "  (= −z_view)" : "  (always 1)") +
+      "\nNDC   " + vecStr(ndc) + "\n" + (inside ? "inside: |y|,|z| ≤ w" : "OUTSIDE clip volume");
+  });
+  RP.slider("#s3-near", (v) => { s3.near = v; v3c.draw(); }, { fmt: (v) => v.toFixed(1) });
+  RP.slider("#s3-far", (v) => { s3.far = v; v3c.draw(); }, { fmt: (v) => v.toFixed(1) });
+  RP.slider("#s3-fov", (v) => { s3.fov = v; v3c.draw(); }, { fmt: (v) => v + "°" });
+  const pzS = RP.slider("#s3-pz", (v) => { s3.pz = v; v3c.draw(); }, { fmt: (v) => v.toFixed(1) });
+  const pyS = RP.slider("#s3-py", (v) => { s3.py = v; v3c.draw(); }, { fmt: (v) => v.toFixed(1) });
+  RP.toggleGroup("#s3-mode", (v) => { s3.mode = v; v3c.draw(); });
+  function drag3(x, y) {
+    const L = layout3(v3c);
+    pzS.value = Math.round(RP.clamp(L.id(x), 0.2, 22) * 10) / 10;
+    pyS.value = Math.round(RP.clamp(L.iy(y), -8, 8) * 10) / 10;
+  }
+  RP.drag(v3c.el, { down: drag3, move: drag3 });
+
+  /* ---------- STEP 4a: perspective divide animation ---------- */
+  const N4 = 1, F4 = 10, P4 = m4.perspective(60 * DEG, 1, N4, F4);
+  const pts4 = [];
+  for (let d = 0.5; d <= 12.01; d += 0.75) for (let y = -7; y <= 7; y += 1) {
+    if (Math.abs(y) > d * 0.8 + 0.6) continue;
+    const cl = m4.xform(P4, [0, y, -d, 1]);
+    const inside = Math.abs(cl[1]) <= cl[3] && Math.abs(cl[2]) <= cl[3];
+    pts4.push({ cl, inside });
+  }
+  const trap = [[N4, 1], [F4, 1], [F4, -1], [N4, -1]].map(([d, sgn]) => {
+    const y = sgn * d * Math.tan(30 * DEG); return m4.xform(P4, [0, y, -d, 1]);
+  });
+  let max0 = 1;
+  for (const p of pts4) max0 = Math.max(max0, Math.abs(p.cl[1]), Math.abs(p.cl[2]));
+  let t4 = 0;
+  const hud4a = document.getElementById("s4a-hud");
+  const ease = (t) => t * t * (3 - 2 * t);
+  const v4a = RP.canvas("#s4a", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const e = ease(t4), R = Math.min(w, h) * 0.44;
+    const sc = RP.lerp(R / max0, R / 1.6, e);
+    const cx = w / 2 - (1 - e) * R * 0.45, cy = h / 2;
+    const map = (cl) => [cx + RP.lerp(cl[2], cl[2] / cl[3], e) * sc, cy - RP.lerp(cl[1], cl[1] / cl[3], e) * sc];
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.beginPath();
+    ctx.moveTo(0, cy); ctx.lineTo(w, cy); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
+    label(ctx, "z", w - 10, cy - 10, c.muted, "right"); label(ctx, "y", cx + 6, 12, c.muted);
+    // clip trapezoid morphing to NDC square
+    ctx.beginPath(); trap.forEach((q, i) => { const p = map(q); if (i) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); });
+    ctx.closePath(); ctx.fillStyle = RP.alpha(c.vtx, 0.1); ctx.fill(); ctx.strokeStyle = c.vtx; ctx.lineWidth = 1.5; ctx.stroke();
+    if (e > 0.6) { const a = map([0, 1, -1, 1]); label(ctx, "NDC [−1,1]²", a[0], a[1] - 10, c.vtx); }
+    let nin = 0;
+    for (const p of pts4) {
+      const q = map(p.cl); if (p.inside) nin++;
+      ctx.beginPath(); ctx.arc(q[0], q[1], p.inside ? 3 : 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = p.inside ? c.vtx : RP.alpha(c.bad, 0.8); ctx.fill();
+    }
+    hud4a.textContent = (e < 0.02 ? "clip space (z_c, y_c)" : e > 0.98 ? "NDC (z_c/w, y_c/w)" : "dividing by w …") +
+      "\ninside: " + nin + "   outside: " + (pts4.length - nin);
+  });
+  const tS = RP.slider("#s4-t", (v) => { t4 = v; v4a.draw(); }, { fmt: (v) => v.toFixed(2) });
+  const playBtn = document.getElementById("s4-play");
+  let phase = 0;
+  const anim = RP.loop(v4a.el, (t, dt) => {
+    phase += dt * 0.6;
+    tS.value = Math.round((0.5 - 0.5 * Math.cos(phase)) * 100) / 100;
+  });
+  function syncBtn() { playBtn.textContent = anim.running ? "Pause" : "Play"; playBtn.setAttribute("aria-pressed", String(anim.running)); }
+  playBtn.addEventListener("click", () => { if (anim.running) anim.stop(); else anim.start(); syncBtn(); });
+  document.getElementById("s4-t").addEventListener("input", () => {
+    if (anim.running) { anim.stop(); syncBtn(); }
+    phase = Math.acos(RP.clamp(1 - 2 * t4, -1, 1));
+  });
+  syncBtn();
+
+  /* ---------- STEP 4b: nonlinear depth graph ---------- */
+  const s4 = { n: 0.5, f: 100 };
+  const hud4b = document.getElementById("s4b-hud");
+  const zndc = (d, n, f) => (f + n) / (f - n) - 2 * f * n / ((f - n) * d);
+  const dOf = (z, n, f) => 2 * f * n / ((f + n) - z * (f - n));
+  const v4b = RP.canvas("#s4b", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const { n, f } = s4;
+    const l = 44, r = w - 14, t = 70, b = h - 34;
+    const X = (d) => l + (d / f) * (r - l), Y = (z) => b - (z + 1) / 2 * (b - t);
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.beginPath();
+    for (const z of [-1, 0, 1]) { ctx.moveTo(l, Y(z)); ctx.lineTo(r, Y(z)); }
+    ctx.stroke();
+    ctx.strokeStyle = c.muted; ctx.beginPath(); ctx.moveTo(l, t - 6); ctx.lineTo(l, b); ctx.lineTo(r, b); ctx.stroke();
+    label(ctx, "+1", l - 6, Y(1), c.muted, "right"); label(ctx, "0", l - 6, Y(0), c.muted, "right"); label(ctx, "−1", l - 6, Y(-1), c.muted, "right");
+    label(ctx, "0", l, b + 14, c.muted, "center"); label(ctx, "depth d → " + f, r, b + 14, c.muted, "right");
+    label(ctx, "z_ndc", l + 4, t - 14, c.muted);
+    // evenly spaced z_ndc -> depth
+    for (let i = 0; i <= 8; i++) {
+      const z = -1 + i * 0.25, d = dOf(z, n, f);
+      ctx.strokeStyle = RP.alpha(c.accent, 0.55); ctx.lineWidth = 1; ctx.beginPath();
+      ctx.moveTo(l, Y(z)); ctx.lineTo(X(d), Y(z)); ctx.lineTo(X(d), b); ctx.stroke();
+      ctx.beginPath(); ctx.arc(X(d), b, 2.5, 0, Math.PI * 2); ctx.fillStyle = c.accent; ctx.fill();
+    }
+    // curve
+    ctx.beginPath();
+    for (let i = 0; i <= 300; i++) {
+      const d = n + (f - n) * Math.pow(i / 300, 2), p = [X(d), Y(zndc(d, n, f))];
+      if (i) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]);
+    }
+    ctx.strokeStyle = c.vtx; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X(n), t - 4); ctx.lineTo(X(n), b); ctx.setLineDash([3, 3]); ctx.strokeStyle = c.vtx; ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]);
+    const half = dOf(0, n, f);
+    const step24 = Math.pow(2, -24) * (f - n) * f * f / (f * n);
+    hud4b.textContent = "z_ndc = 0 already at d = " + half.toFixed(2) + "\n(" + (100 * (half - n) / (f - n)).toFixed(1) +
+      "% of the near→far range)\n24-bit depth step at far ≈ " + (step24 < 0.01 ? step24.toExponential(1) : step24.toFixed(3)) + " units";
+  });
+  RP.slider("#s4-near", (v) => { s4.n = v; v4b.draw(); }, { fmt: (v) => v.toFixed(2) });
+  RP.slider("#s4-far", (v) => { s4.f = v; v4b.draw(); }, { fmt: (v) => String(v) });
+
+  /* ---------- STEP 5: viewport ---------- */
+  const s5 = { W: 20, H: 12, hx: 13, hy: 3 };
+  const tri5 = [[-0.7, -0.6], [0.75, -0.25], [-0.05, 0.75]];
+  const hud5 = document.getElementById("s5-hud");
+  function layout5(s) {
+    const m = 30, cell = Math.max(4, Math.min((s.w - 2 * m) / s5.W, (s.h - 2 * m - 10) / s5.H));
+    const gw = cell * s5.W, gh = cell * s5.H;
+    return { cell, ox: (s.w - gw) / 2, oy: (s.h - gh) / 2 + 8, gw, gh };
+  }
+  function edge(a, b, p) { return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]); }
+  function inTri(p) {
+    const e0 = edge(tri5[0], tri5[1], p), e1 = edge(tri5[1], tri5[2], p), e2 = edge(tri5[2], tri5[0], p);
+    return (e0 >= 0 && e1 >= 0 && e2 >= 0) || (e0 <= 0 && e1 <= 0 && e2 <= 0);
+  }
+  const ndcOf = (i, j) => [(i + 0.5) / s5.W * 2 - 1, 1 - (j + 0.5) / s5.H * 2];
+  const v5 = RP.canvas("#s5", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const L = layout5(s);
+    s5.hx = Math.min(s5.hx, s5.W - 1); s5.hy = Math.min(s5.hy, s5.H - 1);
+    for (let j = 0; j < s5.H; j++) for (let i = 0; i < s5.W; i++) {
+      const x = L.ox + i * L.cell, y = L.oy + j * L.cell;
+      ctx.fillStyle = inTri(ndcOf(i, j)) ? RP.alpha(c.ras, 0.45) : c.surface;
+      ctx.fillRect(x + 0.5, y + 0.5, L.cell - 1, L.cell - 1);
+    }
+    // triangle outline mapped from NDC
+    const sx = (x) => L.ox + (x + 1) / 2 * L.gw, sy = (y) => L.oy + (1 - y) / 2 * L.gh;
+    ctx.beginPath(); tri5.forEach((p, i) => { if (i) ctx.lineTo(sx(p[0]), sy(p[1])); else ctx.moveTo(sx(p[0]), sy(p[1])); });
+    ctx.closePath(); ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5; ctx.stroke();
+    // NDC axes
+    const mx = sx(0), my = sy(0);
+    arrow(ctx, L.ox, my, L.ox + L.gw + 10, my, c.vtx, 1.5); label(ctx, "x_ndc", L.ox + L.gw + 12, my, c.vtx);
+    arrow(ctx, mx, L.oy + L.gh, mx, L.oy - 10, c.vtx, 1.5); label(ctx, "y_ndc", mx + 6, L.oy - 12, c.vtx);
+    label(ctx, "(1,1)", L.ox + L.gw, L.oy - 8, c.vtx, "right"); label(ctx, "(−1,−1)", L.ox, L.oy + L.gh + 12, c.vtx);
+    // screen axes from top-left
+    arrow(ctx, L.ox, L.oy, L.ox + Math.min(60, L.gw * 0.3), L.oy, c.out, 2.5);
+    arrow(ctx, L.ox, L.oy, L.ox, L.oy + Math.min(60, L.gh * 0.4), c.out, 2.5);
+    label(ctx, "(0,0) px", L.ox - 4, L.oy - 10, c.out, "left");
+    // hovered pixel
+    const hx = L.ox + s5.hx * L.cell, hy = L.oy + s5.hy * L.cell;
+    ctx.strokeStyle = c.accent; ctx.lineWidth = 2.5; ctx.strokeRect(hx + 1, hy + 1, L.cell - 2, L.cell - 2);
+    ctx.beginPath(); ctx.arc(hx + L.cell / 2, hy + L.cell / 2, 2.5, 0, Math.PI * 2); ctx.fillStyle = c.accent; ctx.fill();
+    const nd = ndcOf(s5.hx, s5.hy);
+    hud5.textContent = "viewport " + s5.W + "×" + s5.H + " px\npixel (" + s5.hx + ", " + s5.hy + ")  centre (" + (s5.hx + 0.5) + ", " + (s5.hy + 0.5) + ")" +
+      "\nNDC  x = " + num(nd[0], 3) + "  y = " + num(nd[1], 3) + "\n" + (inTri(nd) ? "centre inside triangle" : "centre outside triangle");
+  });
+  RP.slider("#s5-w", (v) => { s5.W = v; v5.draw(); });
+  RP.slider("#s5-h", (v) => { s5.H = v; v5.draw(); });
+  RP.drag(v5.el, {
+    down() { return false; },
+    hover(x, y) {
+      const L = layout5(v5), i = Math.floor((x - L.ox) / L.cell), j = Math.floor((y - L.oy) / L.cell);
+      if (i >= 0 && j >= 0 && i < s5.W && j < s5.H && (i !== s5.hx || j !== s5.hy)) { s5.hx = i; s5.hy = j; v5.draw(); }
+    },
+  });
+  v5.el.addEventListener("pointerdown", (e) => {
+    const r = v5.el.getBoundingClientRect(), L = layout5(v5);
+    const i = Math.floor((e.clientX - r.left - L.ox) / L.cell), j = Math.floor((e.clientY - r.top - L.oy) / L.cell);
+    if (i >= 0 && j >= 0 && i < s5.W && j < s5.H) { s5.hx = i; s5.hy = j; v5.draw(); }
+  });
+  v5.el.addEventListener("keydown", (e) => {
+    const d = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+    if (!d) return;
+    e.preventDefault();
+    s5.hx = RP.clamp(s5.hx + d[0], 0, s5.W - 1); s5.hy = RP.clamp(s5.hy + d[1], 0, s5.H - 1); v5.draw();
+  });
+
+  /* ---------- STEP 6: whole chain ---------- */
+  const s6 = { ry: 30, d: 5, fov: 50, vi: 7 };
+  const body6 = document.getElementById("s6-body");
+  const hud6 = document.getElementById("s6-hud");
+  const v6 = RP.canvas("#s6", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const M = m4.chain(m4.translate(0, 0.25, 0), m4.rotY(s6.ry * DEG), m4.scale(1.4, 1.4, 1.4));
+    const eye = [0, s6.d * 0.45, s6.d];
+    const V = m4.lookAt(eye, [0, 0, 0], [0, 1, 0]);
+    const n = 0.1, f = 50, P = m4.perspective(s6.fov * DEG, w / h, n, f);
+    grid3(ctx, V, P, w, h, 5, c.line);
+    cube3(ctx, V, P, M, w, h, c.vtx, 2.5);
+    const po = CUBE_V[s6.vi].concat([1]);
+    const pw = m4.xform(M, po), pv = m4.xform(V, pw), pc = m4.xform(P, pv);
+    const pn = [pc[0] / pc[3], pc[1] / pc[3], pc[2] / pc[3]];
+    const sx = (pn[0] + 1) / 2 * w, sy = (1 - pn[1]) / 2 * h, depth = (pn[2] + 1) / 2;
+    const visible = pc[3] > 0 && Math.abs(pc[0]) <= pc[3] && Math.abs(pc[1]) <= pc[3] && Math.abs(pc[2]) <= pc[3];
+    if (pv[2] < -n) {
+      ctx.beginPath(); ctx.arc(sx, sy, 7, 0, Math.PI * 2); ctx.fillStyle = c.ink; ctx.fill();
+      ctx.strokeStyle = c.surface; ctx.lineWidth = 2; ctx.stroke();
+      label(ctx, "v" + s6.vi, sx + 11, sy - 10, c.ink);
+    }
+    hud6.textContent = "viewport " + Math.round(w) + "×" + Math.round(h) + " px" + (visible ? "" : "\nvertex is outside the clip volume");
+    const rows = [
+      ["Object", vecStr(po), "mesh data"],
+      ["World", vecStr(pw), "M (model)"],
+      ["View", vecStr(pv), "V (view)"],
+      ["Clip", vecStr(pc), "P (projection) → gl_Position"],
+      ["NDC", vecStr(pn), "÷ w (perspective divide)"],
+      ["Screen", "[" + sx.toFixed(1).padStart(7) + " " + sy.toFixed(1).padStart(7) + "  depth " + depth.toFixed(4) + " ]", "viewport (y flipped)"],
+    ];
+    body6.innerHTML = rows.map((r, i) => '<tr' + (i === 3 ? ' class="hl"' : "") + '><td><span class="space-tag"></span>' + r[0] +
+      '</td><td class="num">' + r[1] + "</td><td>" + r[2] + "</td></tr>").join("");
+  });
+  RP.slider("#s6-ry", (v) => { s6.ry = v; v6.draw(); }, { fmt: (v) => v + "°" });
+  RP.slider("#s6-d", (v) => { s6.d = v; v6.draw(); }, { fmt: (v) => v.toFixed(1) });
+  RP.slider("#s6-fov", (v) => { s6.fov = v; v6.draw(); }, { fmt: (v) => v + "°" });
+  RP.slider("#s6-v", (v) => { s6.vi = v; v6.draw(); }, { fmt: (v) => "v" + v + " " + vecStr(CUBE_V[v], 1, 4) });
+})();
+</script>
+</body>
+</html>

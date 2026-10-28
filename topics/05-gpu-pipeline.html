@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Programmable GPU · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+.info-panel { padding: 14px 16px; border-top: 1px solid var(--line); display: grid; gap: 6px; font-size: 0.95rem; }
+.info-panel h3 { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.badge { font: 600 0.68rem/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; padding: 5px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.badge.prog { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.badge.when { color: var(--ink); }
+.editor { display: grid; gap: 10px; padding: 14px 16px; border-top: 1px solid var(--line); }
+.editor label { font: 600 0.72rem/1.2 var(--font-mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+textarea.glsl {
+  width: 100%; min-height: 260px; resize: vertical; font: 400 0.85rem/1.55 var(--font-mono);
+  background: var(--code-bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+  tab-size: 2; white-space: pre; overflow-x: auto;
+}
+textarea.glsl:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.compile-status { font: 400 0.82rem/1.5 var(--font-mono); border-radius: 8px; padding: 10px 12px; border: 1px solid var(--line); white-space: pre-wrap; word-break: break-word; }
+.compile-status.ok { border-color: var(--good); color: var(--good); background: var(--surface); }
+.compile-status.err { border-color: var(--bad); color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--surface)); }
+.legend .hatch { background: repeating-linear-gradient(45deg, var(--muted) 0 2px, transparent 2px 5px); }
+.legend .outl { border: 2px solid var(--muted); background: transparent; }
+.legend .half { background: color-mix(in srgb, var(--muted) 45%, transparent); }
+.legend .solid { background: var(--muted); }
+.legend .h1 { background: var(--good); } .legend .h2 { background: var(--warn); } .legend .h3 { background: var(--frag); } .legend .h4 { background: var(--bad); }
+.legend .lane-a { background: var(--ras); } .legend .lane-b { background: var(--frag); } .legend .lane-x { border: 1px solid var(--muted); background: transparent; }
+</style>
+</head>
+<body data-topic="05">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 05 · GPU era</p>
+    <h1>The Programmable GPU</h1>
+    <p class="lede">Chapters 01–04 built the pipeline by hand. Now meet the chip that runs it: a fixed assembly line that slowly became programmable, until thousands of tiny cores ran <em>your</em> code for every vertex and every fragment.</p>
+    <div class="stage-band"><span class="app">Application</span><span class="on vtx">Vertex</span><span class="ras">Rasterize</span><span class="on frag">Fragment</span><span class="out">Output</span></div>
+  </section>
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>How GPUs went from fixed-function hardware to programmable and then unified shader cores.</li>
+    <li>The full logical GPU pipeline, which stages you program and which are fixed, and where mesh shaders fit.</li>
+    <li>How to write a real GLSL fragment shader, live in the page.</li>
+    <li>How GPUs execute shaders: warps, SIMT, the cost of branch divergence, and 2×2 quads.</li>
+    <li>What overdraw is and how early-z and draw order reduce it.</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="history">
+    <h2><span class="step-no">STEP 1</span>From fixed function to programmable</h2>
+    <p>The first 3D hardware was a <b>fixed-function</b> pipeline: the math from chapters 01–03 was baked into silicon. You could turn features on and off and set parameters (a light's direction, a fog color, a texture blend mode), but you couldn't write new math. If you wanted a lighting model the hardware didn't have, you were out of luck.</p>
+    <p>Over roughly fifteen years each stage gave way to small programs called <b>shaders</b>. Pick an era below and watch which stages become programmable. Notice what never changes: rasterization, depth testing and blending are still fixed hardware today, because they're simple, run constantly, and are fastest as dedicated circuits.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="tl" aria-label="Timeline of GPU eras. Below it, six pipeline stages are drawn to show whether each one is CPU-side, fixed, configurable or programmable in the selected era."></canvas></div>
+      <div class="controls">
+        <div class="btn-row" id="era-btns" role="group" aria-label="Choose an era">
+          <button class="btn" data-value="0" aria-pressed="true">Fixed</button>
+          <button class="btn" data-value="1">HW T&amp;L</button>
+          <button class="btn" data-value="2">First shaders</button>
+          <button class="btn" data-value="3">SM 2–3</button>
+          <button class="btn" data-value="4">Unified</button>
+          <button class="btn" data-value="5">Compute &amp; mesh</button>
+        </div>
+        <div class="legend"><span><i class="hatch"></i>CPU</span><span><i class="outl"></i>fixed</span><span><i class="half"></i>configurable / tiny programs</span><span><i class="solid"></i>programmable</span></div>
+      </div>
+      <div class="info-panel" id="era-info" aria-live="polite"></div>
+      <figcaption><b>Try it:</b> click a dot on the timeline (or use the buttons). Stage colors match the rest of the tutorial: amber vertex, teal raster, magenta fragment, blue output.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> "Programmable" moved through the pipeline from the vertex end to the pixel end, then the separate units merged into one pool of general cores. The steps in between (rasterize, depth, blend) stayed fixed.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="pipeline">
+    <h2><span class="step-no">STEP 2</span>The whole logical pipeline</h2>
+    <p>Here's the pipeline as an API like OpenGL, Direct3D or Vulkan describes it. It's the <em>logical</em> order: real hardware overlaps and reorders work, but the results must look as if every stage ran in this order. Filled boxes are <b>programmable</b> (you write a shader); outlined boxes are <b>fixed</b> (you can only configure them).</p>
+    <p>A draw call feeds vertices in at the top. The <b>vertex shader</b> runs once per vertex and must output a clip-space position. Fixed hardware then assembles triangles, clips them, does the perspective divide and the viewport transform, and <b>rasterizes</b> them into fragments (chapter 02). The <b>fragment shader</b> runs once per fragment to compute a color, and the output stages test depth and blend the result into the framebuffer.</p>
+    <p>Two kinds of optional extras exist. <b>Tessellation</b> (hull/control shader → fixed tessellator → domain/evaluation shader) subdivides patches into many triangles, and the <b>geometry shader</b> can emit or delete whole primitives. More recently, <b>mesh shaders</b> replace the whole vertex front end with a compute-style stage that outputs small batches of triangles called meshlets.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="pipe" class="tall" aria-label="Pipeline diagram. A row of stage boxes on top; below, a preview of the data at the current stage, starting with three vertices and ending with blended pixels."></canvas><div class="hud" id="pipe-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row">
+          <button class="btn" id="pipe-prev" type="button" aria-label="Previous stage">◀ Prev</button>
+          <button class="btn primary" id="pipe-play" type="button">Pause</button>
+          <button class="btn" id="pipe-next" type="button" aria-label="Next stage">Next ▶</button>
+        </div>
+        <div class="btn-row">
+          <button class="btn" id="pipe-opt" type="button" aria-pressed="false">Show optional stages</button>
+          <button class="btn" id="pipe-mesh" type="button" aria-pressed="false">Mesh shader path</button>
+        </div>
+      </div>
+      <div class="info-panel" id="pipe-info" aria-live="polite"></div>
+      <figcaption><b>Try it:</b> step through with Prev/Next or click any stage box. In the fragment shader stage, look for the 2×2 quads: hatched cells are "helper" invocations outside the triangle.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Stage</th><th>Runs</th><th>Kind</th></tr></thead>
+      <tbody>
+        <tr><td>Input assembler</td><td>per draw (reads vertex/index buffers)</td><td>fixed, configurable layout</td></tr>
+        <tr><td>Vertex shader</td><td>once per vertex</td><td>programmable</td></tr>
+        <tr><td>Hull · tessellator · domain</td><td>per patch · fixed · per new vertex</td><td>prog · fixed · prog (optional)</td></tr>
+        <tr><td>Geometry shader</td><td>once per primitive</td><td>programmable (optional)</td></tr>
+        <tr><td>Task/amplification + mesh shader</td><td>per workgroup (meshlet)</td><td>programmable (replaces the rows above)</td></tr>
+        <tr><td>Primitive assembly, clip, cull, viewport</td><td>per primitive</td><td>fixed</td></tr>
+        <tr><td>Rasterizer</td><td>per primitive → fragments</td><td>fixed</td></tr>
+        <tr><td>Fragment (pixel) shader</td><td>once per fragment</td><td>programmable</td></tr>
+        <tr><td>Depth/stencil test, blending</td><td>per fragment / sample</td><td>fixed, configurable</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout ras"><strong>Key idea.</strong> You program the per-vertex and per-fragment work. The hardware owns everything in between (assembly, clipping, rasterization, interpolation) and everything after (depth, blending).</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="shader">
+    <h2><span class="step-no">STEP 3</span>Write a fragment shader</h2>
+    <p>Time to program the GPU directly. The canvas below is a real WebGL pipeline drawing one rectangle (two triangles) that covers the whole canvas. The vertex shader is trivial: it passes four corners straight to clip space. All the interesting work happens in the fragment shader, which runs once for every pixel of the canvas: about 300,000 times per frame for a 600×500 canvas.</p>
+    <p>Your shader gets three <b>uniforms</b>, values that are the same for every fragment in a draw: <code>u_time</code> in seconds, <code>u_resolution</code> in pixels, and <code>u_mouse</code> (the pointer position in pixels, origin bottom-left like <code>gl_FragCoord</code>). Its job is to write <code>gl_FragColor</code>. Edit the code and it recompiles as you type. If the code won't compile, the driver's error message appears below the editor.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="glsl" aria-label="WebGL output of the fragment shader in the editor below, drawn on a full-screen rectangle."></canvas></div>
+      <div class="controls">
+        <div class="btn-row" id="presets" role="group" aria-label="Shader presets">
+          <button class="btn" data-value="uv" aria-pressed="true">UV gradient</button>
+          <button class="btn" data-value="sphere">Lambert sphere</button>
+          <button class="btn" data-value="checker">Checker</button>
+          <button class="btn" data-value="rings">Rings</button>
+        </div>
+        <div class="btn-row">
+          <button class="btn primary" id="glsl-run" type="button">Compile</button>
+          <button class="btn" id="glsl-time" type="button">Pause time</button>
+        </div>
+      </div>
+      <div class="editor">
+        <label for="glsl-src">Fragment shader (GLSL ES 1.00): editable</label>
+        <textarea id="glsl-src" class="glsl" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+        <div class="compile-status ok" id="glsl-status" role="status">Compiled OK.</div>
+        <details><summary>Matching vertex shader (read-only)</summary><pre><code id="glsl-vs"></code></pre></details>
+      </div>
+      <figcaption><b>Try it:</b> in the sphere preset, move the pointer over the canvas to move the light. Then break something on purpose (delete a semicolon) and read the error.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> A fragment shader is a function from "where am I + uniforms + interpolated inputs" to a color. It can't see its neighbours or remember the previous pixel. That independence is exactly why the GPU can run hundreds of thousands of copies at once.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="simt">
+    <h2><span class="step-no">STEP 4</span>Thousands of threads, marching in lockstep</h2>
+    <p>How does a GPU run one shader 300,000 times per frame? It has thousands of simple arithmetic lanes and groups threads into bundles that share one instruction stream: <b>warps</b> of 32 threads on NVIDIA, <b>wavefronts</b> of 64 (or 32 on newer designs) on AMD. Each clock, the scheduler issues one instruction and every lane in the warp executes it on its own data. This is called <b>SIMT</b>, single instruction, multiple threads.</p>
+    <p>The catch is <b>branches</b>. If some lanes take an <code>if</code> and others take the <code>else</code>, the warp can't do both at once. It runs the <code>if</code> path with the other lanes masked off, then the <code>else</code> path with the first group masked off. This is <b>divergence</b>: masked lanes do no useful work. If all 32 lanes agree, the untaken path is skipped entirely and nothing is lost.</p>
+    <p>Fragments are also packed in <b>2×2 quads</b>. Functions like <code>dFdx</code> and the automatic mip selection in <code>texture2D</code> (chapter 04) compare values between neighbouring pixels, so all four pixels of a quad must run, even ones outside the triangle (those are "helper" lanes). Thin triangles waste many lanes this way.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="warp" class="tall" aria-label="Top: lanes of each warp colored by which branch they take. Bottom: per-warp execution timeline showing the if and else paths run one after the other, with filled height equal to the fraction of active lanes."></canvas><div class="hud" id="warp-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="warp-p">Lanes taking the <code>if</code> <output for="warp-p"></output></label><input type="range" id="warp-p" min="0" max="100" value="30"></div>
+        <div class="btn-row" id="warp-pat" role="group" aria-label="Branch pattern">
+          <button class="btn" data-value="scatter" aria-pressed="true">Scattered</button>
+          <button class="btn" data-value="coherent">Coherent</button>
+        </div>
+        <div class="btn-row" id="warp-size" role="group" aria-label="Warp width">
+          <button class="btn" data-value="32" aria-pressed="true">32 lanes</button>
+          <button class="btn" data-value="64">64 lanes</button>
+        </div>
+        <div class="legend"><span><i class="lane-a"></i>if path</span><span><i class="lane-b"></i>else path</span><span><i class="lane-x"></i>masked (idle)</span></div>
+      </div>
+      <figcaption><b>Try it:</b> with "Scattered", even 5% of lanes taking the branch makes almost every warp run both paths. Switch to "Coherent" (neighbouring threads agree, like a branch on screen region) and utilization recovers.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> A branch costs the sum of both paths whenever lanes in the same warp disagree. Branches that are uniform across a warp (or across the whole draw, like one based on a uniform) are cheap. Branches that differ pixel by pixel can be expensive.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="overdraw">
+    <h2><span class="step-no">STEP 5</span>Overdraw and early-z</h2>
+    <p>Each pixel ends up showing one surface, but many surfaces may have been <em>shaded</em> there first. Every time an opaque fragment is shaded and later covered by a nearer one, that shader work is wasted. This is <b>overdraw</b>, measured as fragment-shader invocations per visible pixel.</p>
+    <p>Logically the depth test comes after the fragment shader. But if a shader doesn't change its fragment's depth (and doesn't use features like <code>discard</code> that complicate things), the GPU can test depth <em>before</em> shading. This is <b>early-z</b>, and it skips the shader for hidden fragments. It only helps when nearer surfaces are already in the depth buffer, so engines sort opaque objects roughly <b>front to back</b>, or run a cheap depth-only <b>pre-pass</b> first. Transparent objects are different: they must be blended back to front, so they always pay full overdraw.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="od" aria-label="Overlapping opaque rectangles at different depths, drawn as a heatmap of fragment-shader invocations per pixel, or as final colors."></canvas><div class="hud" id="od-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row" id="od-order" role="group" aria-label="Draw order">
+          <button class="btn" data-value="back" aria-pressed="true">Back → front</button>
+          <button class="btn" data-value="front">Front → back</button>
+          <button class="btn" data-value="mixed">Unsorted</button>
+        </div>
+        <div class="btn-row" id="od-z" role="group" aria-label="Early depth test">
+          <button class="btn" data-value="off" aria-pressed="true">Early-z off</button>
+          <button class="btn" data-value="on">Early-z on</button>
+        </div>
+        <div class="btn-row" id="od-view" role="group" aria-label="View">
+          <button class="btn" data-value="heat" aria-pressed="true">Heatmap</button>
+          <button class="btn" data-value="color">Final image</button>
+        </div>
+        <div class="control"><label for="od-n">Draw calls submitted <output for="od-n"></output></label><input type="range" id="od-n" min="0" max="7" value="7"></div>
+        <div class="legend"><span><i class="h1"></i>shaded 1×</span><span><i class="h2"></i>2×</span><span><i class="h3"></i>3×</span><span><i class="h4"></i>4×+</span></div>
+      </div>
+      <figcaption><b>Try it:</b> turn early-z on, then compare back→front with front→back. Scrub "draw calls" to watch the depth buffer fill. Each cell stands for one fragment at reduced resolution. The numbers on the outlines show draw order.</figcaption>
+    </figure>
+    <div class="callout out"><strong>Key idea.</strong> Early-z turns "draw nearest first" into real savings: hidden fragments are rejected before the expensive shader runs. Drawn back to front, every layer passes the depth test, and you pay for every one.</div>
+  </section>
+
+  <section class="step" id="recap"><h2><span class="step-no">RECAP</span>What to remember</h2><ul>
+    <li>GPUs went from <b>fixed function</b> (switches and parameters) to <b>programmable shaders</b> (around 2001) to <b>unified shader cores</b> (around 2006) that run any shader type, plus compute.</li>
+    <li>Logical pipeline: input assembler → <b>vertex shader</b> → (tessellation, geometry shader) → primitive assembly &amp; clipping → rasterizer → <b>fragment shader</b> → depth/stencil → blending.</li>
+    <li>You write the vertex and fragment shaders (and optional stages); assembly, clipping, rasterization, depth and blending stay fixed but configurable.</li>
+    <li><b>Mesh shaders</b> (with optional task/amplification shaders) replace the vertex front end with compute-style workgroups that output meshlets.</li>
+    <li>Shaders run in <b>warps/wavefronts</b> of 32 or 64 lanes (SIMT). Divergent branches run both paths, and fragments run in <b>2×2 quads</b> so derivatives work.</li>
+    <li><b>Overdraw</b> wastes fragment work. Early-z plus front-to-back sorting (or a depth pre-pass) skips hidden fragments.</li>
+    <li>Next: chapter 06 uses this machinery to organize whole frames: forward vs deferred shading, and shadow maps.</li>
+  </ul></section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const $ = (s) => document.querySelector(s);
+  const A = RP.alpha;
+
+  function rrect(ctx, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+  }
+  function wrap(ctx, text, maxW) {
+    const words = text.split(" "), lines = []; let cur = "";
+    for (const wd of words) { const t = cur ? cur + " " + wd : wd; if (ctx.measureText(t).width > maxW && cur) { lines.push(cur); cur = wd; } else cur = t; }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+  function hatch(ctx, x, y, w, h, color) {
+    ctx.save(); ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+    ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.beginPath();
+    for (let k = -h; k < w; k += 6) { ctx.moveTo(x + k, y + h); ctx.lineTo(x + k + h, y); }
+    ctx.stroke(); ctx.restore();
+  }
+  const FONT = (px, w) => `${w || 400} ${px}px "IBM Plex Sans", "Segoe UI", system-ui, sans-serif`;
+  const MONO = (px) => `400 ${px}px "JetBrains Mono", ui-monospace, Consolas, monospace`;
+
+  /* ================= STEP 1: timeline ================= */
+  const COLS = [
+    { k: "xf", n: "Vertex transform", s: "vtx" }, { k: "lt", n: "Vertex lighting", s: "vtx" },
+    { k: "geo", n: "Geometry / tessellation", s: "vtx" }, { k: "rs", n: "Rasterize", s: "ras" },
+    { k: "fr", n: "Pixel / fragment", s: "frag" }, { k: "om", n: "Depth & blend", s: "out" },
+  ];
+  const STATUS_TXT = { cpu: "CPU", fixed: "fixed", config: "configurable", limited: "tiny programs", prog: "programmable", none: "n/a" };
+  const ERAS = [
+    { label: "Fixed function", when: "early–mid 1990s", st: { xf: "cpu", lt: "cpu", geo: "none", rs: "fixed", fr: "fixed", om: "fixed" },
+      text: "SGI workstations (where OpenGL 1.0 came from in 1992) and the first consumer 3D cards ran a fixed recipe. You flipped switches like <code>glEnable(GL_LIGHTING)</code> and set parameters, but couldn't add new math. High-end SGI machines had dedicated geometry hardware. Mid-1990s PC cards usually only rasterized and textured, and the CPU did vertex transform and lighting." },
+    { label: "Hardware T&L", when: "around 1999", st: { xf: "fixed", lt: "fixed", geo: "none", rs: "fixed", fr: "config", om: "fixed" },
+      text: "Cards like NVIDIA's GeForce 256 moved transform &amp; lighting (T&amp;L) onto the GPU, and Direct3D 7 exposed it. Faster, but still fixed: the hardware implemented the classic per-vertex lighting model (a few lights, Gouraud shading) and you only chose the parameters. Texture combiners let you configure how textures and colors were mixed." },
+    { label: "First shaders", when: "around 2001", st: { xf: "prog", lt: "prog", geo: "none", rs: "fixed", fr: "limited", om: "fixed" },
+      text: "GeForce 3 and DirectX 8 introduced programmable <b>vertex shaders</b>: short assembly-like programs that ran per vertex in place of fixed T&amp;L. Pixel shaders (Shader Model 1.x) existed but were tiny, only a handful of instructions, closer to a programmable combiner than a real program." },
+    { label: "SM 2–3 pixel shaders", when: "around 2002–2004", st: { xf: "prog", lt: "prog", geo: "none", rs: "fixed", fr: "prog", om: "fixed" },
+      text: "DirectX 9-class GPUs (Shader Model 2.0, then 3.0), such as ATI's Radeon 9700, brought floating-point pixel shaders with real instruction budgets. High-level languages arrived too: HLSL, Cg and GLSL (with OpenGL 2.0). Per-pixel lighting became normal. Vertex and pixel shaders still ran on separate kinds of hardware units." },
+    { label: "Unified shaders", when: "around 2005–2006", unified: true, st: { xf: "prog", lt: "prog", geo: "prog", rs: "fixed", fr: "prog", om: "fixed" },
+      text: "The Xbox 360's Xenos GPU, then the GeForce 8800 with Direct3D 10, switched to a <b>unified shader architecture</b>: one pool of identical cores runs whatever shader work is queued (vertex, geometry or pixel), so no units sit idle when a frame is vertex-heavy or pixel-heavy. Direct3D 10 also added the geometry shader." },
+    { label: "Compute & mesh", when: "around 2009 → today", unified: true, compute: true, st: { xf: "prog", lt: "prog", geo: "prog", rs: "fixed", fr: "prog", om: "fixed" },
+      text: "The unified cores became general-purpose. <b>Compute shaders</b> (Direct3D 11, OpenGL 4.3) run arbitrary parallel work, and tessellation stages arrived with Direct3D 11. Around 2018–2020, <b>mesh shaders</b> (first on NVIDIA's Turing GPUs, later in DirectX 12 Ultimate and Vulkan extensions) offered a compute-style replacement for the vertex front end. Rasterization, depth testing and blending are still fixed hardware." },
+  ];
+  let era = 0;
+  const tlInfo = $("#era-info");
+  const tl = RP.canvas("#tl", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const pad = 22, ax = 30, n = ERAS.length, sp = (w - pad * 2) / (n - 1);
+    s.nodes = [];
+    ctx.strokeStyle = c.line; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(pad, ax); ctx.lineTo(w - pad, ax); ctx.stroke();
+    ctx.strokeStyle = c.accent; ctx.beginPath(); ctx.moveTo(pad, ax); ctx.lineTo(pad + sp * era, ax); ctx.stroke();
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    ERAS.forEach((e, i) => {
+      const x = pad + sp * i, sel = i === era;
+      s.nodes.push(x);
+      ctx.beginPath(); ctx.arc(x, ax, sel ? 9 : 6, 0, Math.PI * 2);
+      ctx.fillStyle = i <= era ? c.accent : c.surface; ctx.fill();
+      ctx.strokeStyle = i <= era ? c.accent : c.muted; ctx.lineWidth = 2; ctx.stroke();
+      ctx.font = FONT(w < 520 ? 10 : 11, sel ? 600 : 400); ctx.fillStyle = sel ? c.ink : c.muted;
+      const lines = wrap(ctx, e.label, Math.max(40, sp - 6));
+      lines.slice(0, 2).forEach((ln, j) => ctx.fillText(ln, Math.min(w - 26, Math.max(26, x)), ax + 15 + j * 13));
+    });
+    // stage boxes
+    const E = ERAS[era];
+    const oneRow = w >= 560, cols = oneRow ? 6 : 3, gap = 8;
+    const top = 88, bh = oneRow ? 74 : 60;
+    const bw = (w - pad * 2 - gap * (cols - 1)) / cols;
+    const boxes = [];
+    COLS.forEach((col, i) => {
+      const r = Math.floor(i / cols), k = i % cols;
+      const x = pad + k * (bw + gap), y = top + r * (bh + gap);
+      boxes.push({ x, y });
+      const stc = E.st[col.k], sc = c[col.s];
+      ctx.save();
+      rrect(ctx, x, y, bw, bh, 8);
+      if (stc === "prog") { ctx.fillStyle = sc; ctx.fill(); }
+      else if (stc === "limited") { ctx.fillStyle = A(sc, 0.55); ctx.fill(); ctx.strokeStyle = sc; ctx.lineWidth = 2; ctx.stroke(); }
+      else if (stc === "config") { ctx.fillStyle = A(sc, 0.22); ctx.fill(); ctx.strokeStyle = sc; ctx.lineWidth = 2; ctx.stroke(); }
+      else if (stc === "fixed") { ctx.fillStyle = c.surface; ctx.fill(); ctx.strokeStyle = sc; ctx.lineWidth = 2; ctx.stroke(); }
+      else if (stc === "cpu") { ctx.fillStyle = c.surface; ctx.fill(); hatch(ctx, x, y, bw, bh, A(c.muted, 0.5)); rrect(ctx, x, y, bw, bh, 8); ctx.strokeStyle = c.muted; ctx.lineWidth = 1.5; ctx.stroke(); }
+      else { ctx.setLineDash([4, 4]); ctx.strokeStyle = c.line; ctx.lineWidth = 1.5; ctx.stroke(); }
+      ctx.restore();
+      const txt = stc === "prog" ? c.paper : (stc === "none" ? c.muted : c.ink);
+      ctx.fillStyle = txt; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.font = FONT(w < 420 ? 10.5 : 12, 600);
+      const lines = wrap(ctx, col.n, bw - 10);
+      const ly = y + bh / 2 - 8 - (lines.length - 1) * 6.5;
+      lines.forEach((ln, j) => ctx.fillText(ln, x + bw / 2, ly + j * 13));
+      ctx.font = MONO(10); ctx.fillStyle = stc === "prog" ? c.paper : c.muted;
+      ctx.fillText(STATUS_TXT[stc], x + bw / 2, y + bh - 12);
+    });
+    let y2 = top + (oneRow ? 1 : 2) * (bh + gap) + 4;
+    if (E.unified) {
+      const x0 = boxes[0].x, x1 = pad + (oneRow ? 5 : 2) * (bw + gap) + bw;
+      rrect(ctx, x0, y2, x1 - x0, 28, 7); ctx.fillStyle = A(c.accent, 0.14); ctx.fill(); ctx.strokeStyle = c.accent; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = c.ink; ctx.font = FONT(12, 600); ctx.textAlign = "center";
+      ctx.fillText("One pool of unified shader cores runs every programmable stage", (x0 + x1) / 2, y2 + 14, x1 - x0 - 12);
+      y2 += 36;
+    }
+    if (E.compute) {
+      const x0 = boxes[0].x, x1 = pad + (oneRow ? 5 : 2) * (bw + gap) + bw;
+      rrect(ctx, x0, y2, x1 - x0, 28, 7); ctx.setLineDash([5, 4]); ctx.strokeStyle = c.accent; ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c.ink; ctx.font = FONT(12, 400);
+      ctx.fillText("+ compute shaders and mesh shaders on the same cores", (x0 + x1) / 2, y2 + 14, x1 - x0 - 12);
+    }
+  });
+  const eraGroup = RP.toggleGroup("#era-btns", (v) => {
+    era = +v;
+    const E = ERAS[era];
+    tlInfo.innerHTML = `<h3>${E.label} <span class="badge when">${E.when}</span></h3><p>${E.text}</p>`;
+    tl.draw();
+  });
+  RP.drag(tl.el, {
+    down(x, y) {
+      if (!tl.nodes || y > 84) return false;
+      let best = 0, bd = 1e9; tl.nodes.forEach((nx, i) => { const d = Math.abs(nx - x); if (d < bd) { bd = d; best = i; } });
+      eraGroup.set(String(best)); return false;
+    },
+  });
+
+  /* ================= STEP 2: pipeline flow ================= */
+  const PS = {
+    ia: { n: "Input assembler", s: "vtx", prog: false, d: "Reads vertex data (positions, normals, UVs, …) from buffers in GPU memory and uses the <b>index buffer</b> to group vertices into primitives. You only describe the data layout. Repeated indices let shared vertices be reused, and GPUs often cache recent vertex-shader results so a shared vertex isn't shaded twice." },
+    vs: { n: "Vertex shader", s: "vtx", prog: true, d: "Your code, once per vertex. Its one required output is a <b>clip-space position</b> (<code>gl_Position = P·V·M·p</code>, chapter 01). It also outputs <b>varyings</b> (colors, normals, UVs) for the rasterizer to interpolate. It sees one vertex at a time: it can't look at neighbours or create new vertices." },
+    hs: { n: "Hull / tess control", s: "vtx", prog: true, d: "<b>Hull shader</b> (Direct3D) or <b>tessellation control shader</b> (OpenGL/Vulkan). Runs per patch and outputs tessellation factors: how many pieces to cut each edge into, e.g. more near the camera. Optional." },
+    ts: { n: "Tessellator", s: "vtx", prog: false, d: "Fixed function. Given the factors, it generates a dense grid of new points inside the patch, in barycentric (u, v, w) coordinates. You can't program it, only feed it factors." },
+    ds: { n: "Domain / tess eval", s: "vtx", prog: true, d: "<b>Domain shader</b> (Direct3D) or <b>tessellation evaluation shader</b> (OpenGL/Vulkan). Runs once per generated point and computes its real position, for example by sampling a displacement map to push the surface outward, as shown here." },
+    gs: { n: "Geometry shader", s: "vtx", prog: true, d: "Sees a whole primitive (optionally with its neighbours) and can emit zero, one or several primitives: pass through, duplicate, extrude, or discard. Flexible, but often slow on real hardware, so modern engines use it sparingly. Here it passes the triangle through and could emit the dashed copy." },
+    as: { n: "Task / amplification", s: "vtx", prog: true, d: "<b>Task shader</b> (Vulkan/OpenGL naming) or <b>amplification shader</b> (Direct3D 12). An optional compute-like stage that decides which meshlets are worth drawing, culling whole clusters (e.g. outside the frustum or facing away), and launches mesh shader workgroups for the survivors." },
+    ms: { n: "Mesh shader", s: "vtx", prog: true, d: "A compute-style workgroup that directly outputs a small mesh, a <b>meshlet</b> of a few dozen vertices and triangles (64 vertices / 126 triangles is a commonly cited size). It replaces the input assembler, vertex, tessellation and geometry stages with one flexible programmable stage." },
+    pa: { n: "Primitive assembly & clip", s: "ras", prog: false, d: "Groups the shaded vertices into triangles. <b>Clipping</b> cuts triangles against the view volume in clip space (the dashed part is cut away, creating new vertices on the edge). Then the perspective divide gives NDC, back-face culling may discard triangles facing away, and the viewport transform maps NDC to pixels." },
+    rs: { n: "Rasterizer", s: "ras", prog: false, d: "Fixed function. Tests which pixel centers each triangle covers (edge functions, chapter 02) and produces one <b>fragment</b> per covered pixel, with varyings interpolated perspective-correctly. Hardware walks the triangle in tiles and 2×2 quads rather than strict scanlines." },
+    fs: { n: "Fragment shader", s: "frag", prog: true, d: "Your code, once per fragment (called a <b>pixel shader</b> in Direct3D). It computes a color from the interpolated varyings, textures and lights, and may <code>discard</code> the fragment. Fragments are shaded in <b>2×2 quads</b> so derivatives (for mipmapping) can be computed, and quad pixels outside the triangle run as hatched <b>helper</b> invocations whose output is thrown away." },
+    zs: { n: "Depth / stencil test", s: "out", prog: false, d: "Compares each fragment's depth with the depth buffer and rejects it if something nearer is already there; the stencil test can mask regions. Logically this happens after the fragment shader, but GPUs perform it <b>early</b> whenever that's safe (e.g. the shader doesn't write depth), skipping the shader for hidden fragments. See step 5." },
+    om: { n: "Blend / output merger", s: "out", prog: false, d: "Combines the fragment's color with what's already in the render target: overwrite for opaque surfaces, or a configurable blend equation such as <code>src·α + dst·(1−α)</code> for transparency. Configurable, not programmable in the core APIs. Direct3D calls this the output merger." },
+  };
+  let showOpt = false, meshPath = false, pIdx = 0, pT = 0, hold = 0, autoplay = !RP.reduced;
+  function order() {
+    const front = meshPath ? ["as", "ms"] : (showOpt ? ["ia", "vs", "hs", "ts", "ds", "gs"] : ["ia", "vs"]);
+    return front.concat(["pa", "rs", "fs", "zs", "om"]);
+  }
+  const VCOL = [[0.92, 0.3, 0.32], [0.3, 0.8, 0.42], [0.32, 0.5, 0.96]];
+  const OBJ = [[0.08, 0.72], [0.3, 0.68], [0.18, 0.3]];
+  const SCR = [[0.24, 0.84], [0.97, 0.56], [0.47, 0.1]];
+  const edge = (a, b, p) => (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+  function clipPoly(poly, C) {
+    const planes = [
+      (p) => p[0] - C.x, (p) => C.x + C.w - p[0], (p) => p[1] - C.y, (p) => C.y + C.h - p[1],
+    ];
+    let out = poly;
+    for (const f of planes) {
+      const inp = out; out = [];
+      for (let i = 0; i < inp.length; i++) {
+        const a = inp[i], b = inp[(i + 1) % inp.length], fa = f(a), fb = f(b);
+        if (fa >= 0) out.push(a);
+        if ((fa >= 0) !== (fb >= 0)) { const t = fa / (fa - fb); out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]); }
+      }
+    }
+    return out;
+  }
+  const ease = (t) => t * t * (3 - 2 * t);
+  const pipeHud = $("#pipe-hud"), pipeInfo = $("#pipe-info");
+  const pipe = RP.canvas("#pipe", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const st = order(), n = st.length;
+    if (pIdx >= n) pIdx = n - 1;
+    const pad = 12, gap = 10, rowGap = 16, bh = 40;
+    const cols = Math.max(3, Math.min(n, Math.floor((w - pad * 2 + gap) / (100 + gap))));
+    const bw = (w - pad * 2 - gap * (cols - 1)) / cols;
+    const rows = Math.ceil(n / cols);
+    s.boxes = []; s.bw = bw;
+    const top = 12;
+    st.forEach((k, i) => {
+      const r = Math.floor(i / cols), col = i % cols;
+      s.boxes.push({ x: pad + col * (bw + gap), y: top + r * (bh + rowGap), k, i });
+    });
+    // connectors
+    ctx.strokeStyle = c.muted; ctx.fillStyle = c.muted; ctx.lineWidth = 1.2;
+    for (let i = 0; i < n - 1; i++) {
+      const a = s.boxes[i], b = s.boxes[i + 1];
+      if (a.y === b.y) {
+        const x0 = a.x + bw + 1, x1 = b.x - 1, y = a.y + bh / 2;
+        ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1 - 3, y); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x1 - 5, y - 3.5); ctx.lineTo(x1 - 5, y + 3.5); ctx.fill();
+      } else {
+        const ym = a.y + bh + rowGap / 2;
+        ctx.beginPath(); ctx.moveTo(a.x + bw / 2, a.y + bh); ctx.lineTo(a.x + bw / 2, ym); ctx.lineTo(b.x + bw / 2, ym); ctx.lineTo(b.x + bw / 2, b.y - 3); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(b.x + bw / 2, b.y); ctx.lineTo(b.x + bw / 2 - 3.5, b.y - 5); ctx.lineTo(b.x + bw / 2 + 3.5, b.y - 5); ctx.fill();
+      }
+    }
+    s.boxes.forEach((b) => {
+      const d = PS[b.k], sc = c[d.s], cur = b.i === pIdx, done = b.i < pIdx;
+      rrect(ctx, b.x, b.y, bw, bh, 7);
+      if (d.prog) { ctx.fillStyle = cur || done ? sc : A(sc, 0.75); ctx.fill(); }
+      else { ctx.fillStyle = c.surface; ctx.fill(); ctx.strokeStyle = sc; ctx.lineWidth = 2; ctx.stroke(); }
+      if (cur) { rrect(ctx, b.x - 3, b.y - 3, bw + 6, bh + 6, 9); ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke(); }
+      ctx.fillStyle = d.prog ? c.paper : c.ink; ctx.font = FONT(w < 420 ? 10 : 11, 600); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      const lines = wrap(ctx, d.n, bw - 8).slice(0, 2);
+      lines.forEach((ln, j) => ctx.fillText(ln, b.x + bw / 2, b.y + bh / 2 + (j - (lines.length - 1) / 2) * 12.5));
+    });
+    // preview region
+    const py = top + rows * (bh + rowGap) + 4;
+    const ph = h - py - 30, pw = Math.min(w - 24, 560);
+    if (ph < 60) return;
+    const P = { x: (w - pw) / 2, y: py, w: pw, h: ph };
+    rrect(ctx, P.x, P.y, P.w, P.h, 8); ctx.fillStyle = c.surface; ctx.fill(); ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.stroke();
+    const C = { x: P.x + P.w * 0.12, y: P.y + P.h * 0.08, w: P.w * 0.76, h: P.h * 0.84 };
+    const toP = (q) => [P.x + q[0] * P.w, P.y + q[1] * P.h];
+    const sv = SCR.map(toP), ov = OBJ.map(toP);
+    const k = st[pIdx], t = ease(RP.clamp(pT));
+    const g = Math.max(8, Math.round(Math.min(C.w, C.h) / 13));
+    const gc = Math.floor(C.w / g), gr = Math.floor(C.h / g);
+    const gx = C.x + (C.w - gc * g) / 2, gy = C.y + (C.h - gr * g) / 2;
+    const area = edge(sv[0], sv[1], sv[2]);
+    const cells = [];
+    for (let j = 0; j < gr; j++) for (let i = 0; i < gc; i++) {
+      const p = [gx + (i + 0.5) * g, gy + (j + 0.5) * g];
+      const b0 = edge(sv[1], sv[2], p) / area, b1 = edge(sv[2], sv[0], p) / area, b2 = edge(sv[0], sv[1], p) / area;
+      if (b0 >= 0 && b1 >= 0 && b2 >= 0) cells.push({ i, j, b: [b0, b1, b2] });
+    }
+    const covered = new Set(cells.map((q) => q.i + "," + q.j));
+    const occ = { x0: 0.55, x1: 0.82, y0: 0.22, y1: 0.62 };
+    const inOcc = (q) => { const u = (q.i + 0.5) / gc, v = (q.j + 0.5) / gr; return u > occ.x0 && u < occ.x1 && v > occ.y0 && v < occ.y1; };
+    const cellColor = (q) => { const r = VCOL[0].map((x, m) => q.b[0] * VCOL[0][m] + q.b[1] * VCOL[1][m] + q.b[2] * VCOL[2][m]); return RP.rgb2css(r); };
+    let cap = "";
+    const dot = (p, col, r) => { ctx.beginPath(); ctx.arc(p[0], p[1], r || 5, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = c.surface; ctx.lineWidth = 1.5; ctx.stroke(); };
+    const triPath = (v) => { ctx.beginPath(); ctx.moveTo(v[0][0], v[0][1]); ctx.lineTo(v[1][0], v[1][1]); ctx.lineTo(v[2][0], v[2][1]); ctx.closePath(); };
+    const labelV = (v) => { ctx.font = MONO(10); ctx.fillStyle = c.ink; ctx.textAlign = "left"; ctx.textBaseline = "bottom"; v.forEach((p, i) => ctx.fillText("v" + i, p[0] + 6, p[1] - 4)); };
+    const viewport = () => { ctx.save(); ctx.setLineDash([5, 4]); ctx.strokeStyle = c.muted; ctx.lineWidth = 1; ctx.strokeRect(C.x, C.y, C.w, C.h); ctx.restore(); ctx.font = MONO(9.5); ctx.fillStyle = c.muted; ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.fillText("viewport", C.x + 4, C.y + 3); };
+    const grid = () => { ctx.strokeStyle = A(c.muted, 0.22); ctx.lineWidth = 1; ctx.beginPath(); for (let i = 0; i <= gc; i++) { ctx.moveTo(gx + i * g, gy); ctx.lineTo(gx + i * g, gy + gr * g); } for (let j = 0; j <= gr; j++) { ctx.moveTo(gx, gy + j * g); ctx.lineTo(gx + gc * g, gy + j * g); } ctx.stroke(); };
+    const tessPts = (N, disp) => {
+      const pts = {};
+      for (let i = 0; i <= N; i++) for (let j = 0; j <= N - i; j++) {
+        const u = i / N, v = j / N, w0 = 1 - u - v;
+        let x = sv[0][0] * w0 + sv[1][0] * u + sv[2][0] * v, y = sv[0][1] * w0 + sv[1][1] * u + sv[2][1] * v;
+        y -= disp * 27 * w0 * u * v * P.h * 0.12;
+        pts[i + "," + j] = [x, y];
+      }
+      return pts;
+    };
+    const tessDraw = (N, disp, frac, col) => {
+      const pts = tessPts(N, disp), tris = [];
+      for (let i = 0; i < N; i++) for (let j = 0; j < N - i; j++) {
+        tris.push([pts[i + "," + j], pts[(i + 1) + "," + j], pts[i + "," + (j + 1)]]);
+        if (i + j + 2 <= N) tris.push([pts[(i + 1) + "," + j], pts[(i + 1) + "," + (j + 1)], pts[i + "," + (j + 1)]]);
+      }
+      const m = Math.round(tris.length * frac);
+      ctx.strokeStyle = col; ctx.lineWidth = 1;
+      tris.slice(0, m).forEach((tr) => { triPath(tr); ctx.fillStyle = A(c.vtx, 0.1); ctx.fill(); ctx.stroke(); });
+      return { pts, tris };
+    };
+
+    if (k === "ia") {
+      const fr = { x: P.x + P.w * 0.03, y: P.y + P.h * 0.18, w: P.w * 0.35, h: P.h * 0.68 };
+      ctx.strokeStyle = c.line; ctx.strokeRect(fr.x, fr.y, fr.w, fr.h);
+      ctx.font = MONO(10); ctx.fillStyle = c.muted; ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.fillText("object space", fr.x + 4, fr.y + 3);
+      const nShow = Math.min(3, Math.floor(t * 3.999));
+      ov.slice(0, nShow + (t > 0 ? 1 : 0)).forEach((p, i) => dot(p, RP.rgb2css(VCOL[i])));
+      labelV(ov.slice(0, nShow + (t > 0 ? 1 : 0)));
+      const bx = P.x + P.w * 0.45, by = P.y + P.h * 0.2, rowH = Math.min(20, P.h * 0.13);
+      ctx.font = MONO(Math.min(11, P.w / 40)); ctx.textBaseline = "middle";
+      const vb = ["v0 (-0.8,-0.5, 0)", "v1 ( 0.7,-0.4, 0)", "v2 ( 0.0, 0.8, 0)"];
+      ctx.fillStyle = c.muted; ctx.fillText("vertex buffer", bx, by);
+      vb.forEach((tx, i) => { ctx.fillStyle = i <= nShow && t > 0 ? c.ink : A(c.muted, 0.6); ctx.fillText(tx, bx, by + rowH * (i + 1)); });
+      ctx.fillStyle = c.muted; ctx.fillText("index buffer", bx, by + rowH * 4.4);
+      ctx.fillStyle = t > 0.9 ? c.vtx : c.ink; ctx.fillText("[ 0, 1, 2 ] → 1 triangle", bx, by + rowH * 5.4);
+      cap = "3 vertices fetched from memory, grouped by indices";
+    } else if (k === "vs") {
+      ctx.save(); ctx.setLineDash([3, 4]); ctx.strokeStyle = A(c.muted, 0.6);
+      ov.forEach((o, i) => { ctx.beginPath(); ctx.moveTo(o[0], o[1]); ctx.lineTo(sv[i][0], sv[i][1]); ctx.stroke(); }); ctx.restore();
+      viewport();
+      const cur = ov.map((o, i) => [RP.lerp(o[0], sv[i][0], t), RP.lerp(o[1], sv[i][1], t)]);
+      cur.forEach((p, i) => dot(p, RP.rgb2css(VCOL[i]), 5.5)); labelV(cur);
+      cap = "each vertex: gl_Position = P · V · M · position  (3 invocations)";
+    } else if (k === "hs") {
+      viewport(); triPath(sv); ctx.strokeStyle = c.vtx; ctx.lineWidth = 2; ctx.stroke();
+      ctx.font = MONO(11); ctx.fillStyle = c.vtx; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      for (let i = 0; i < 3; i++) { const a = sv[i], b = sv[(i + 1) % 3]; if (t > i / 3) ctx.fillText("×4", (a[0] + b[0]) / 2 + 10, (a[1] + b[1]) / 2 - 8); }
+      sv.forEach((p, i) => dot(p, RP.rgb2css(VCOL[i])));
+      cap = "per patch: choose tessellation factors (here 4 per edge)";
+    } else if (k === "ts") {
+      viewport(); const r = tessDraw(4, 0, t, A(c.vtx, 0.9));
+      Object.values(r.pts).forEach((p) => { ctx.beginPath(); ctx.arc(p[0], p[1], 2.2, 0, 7); ctx.fillStyle = c.vtx; ctx.fill(); });
+      cap = "fixed tessellator: 1 triangle → 16 small triangles (15 points)";
+    } else if (k === "ds") {
+      viewport(); const r = tessDraw(4, t, 1, A(c.vtx, 0.9));
+      Object.values(r.pts).forEach((p) => { ctx.beginPath(); ctx.arc(p[0], p[1], 2.2, 0, 7); ctx.fillStyle = c.vtx; ctx.fill(); });
+      cap = "per new point: compute position (displaced bump)";
+    } else if (k === "gs") {
+      viewport(); triPath(sv); ctx.fillStyle = A(c.vtx, 0.18); ctx.fill(); ctx.strokeStyle = c.vtx; ctx.lineWidth = 2; ctx.stroke();
+      const off = sv.map((p) => [p[0] - 18 * t, p[1] + 14 * t]);
+      ctx.save(); ctx.globalAlpha = t; ctx.setLineDash([5, 4]); triPath(off); ctx.strokeStyle = c.vtx; ctx.lineWidth = 1.5; ctx.stroke(); ctx.restore();
+      sv.forEach((p, i) => dot(p, RP.rgb2css(VCOL[i])));
+      cap = "per primitive: emit 0…N primitives (dashed: an optional extra copy)";
+    } else if (k === "as" || k === "ms") {
+      const cxs = [0.2, 0.5, 0.8], cys = [0.3, 0.72], R = Math.min(P.w / 9, P.h / 5.2);
+      let id = 0;
+      for (const cy of cys) for (const cx of cxs) {
+        const ctr = [P.x + cx * P.w, P.y + cy * P.h], culled = id === 1 || id === 5, ours = id === 4;
+        const fade = k === "as" ? (culled ? 1 - 0.7 * t : 1) : (culled ? 0.3 : (ours ? 1 : 0.45));
+        ctx.save(); ctx.globalAlpha = fade;
+        for (let m = 0; m < 6; m++) {
+          const a0 = m * Math.PI / 3, a1 = a0 + Math.PI / 3;
+          ctx.beginPath(); ctx.moveTo(ctr[0], ctr[1]); ctx.lineTo(ctr[0] + R * Math.cos(a0), ctr[1] + R * Math.sin(a0)); ctx.lineTo(ctr[0] + R * Math.cos(a1), ctr[1] + R * Math.sin(a1)); ctx.closePath();
+          ctx.fillStyle = A(c.vtx, k === "ms" && ours ? 0.25 + 0.5 * t * (m % 2) : 0.18 + 0.12 * (m % 2)); ctx.fill(); ctx.strokeStyle = c.vtx; ctx.lineWidth = 1; ctx.stroke();
+        }
+        ctx.restore();
+        if (k === "as" && culled && t > 0.35) {
+          ctx.strokeStyle = c.bad; ctx.lineWidth = 2.5; ctx.beginPath();
+          ctx.moveTo(ctr[0] - R * 0.6, ctr[1] - R * 0.6); ctx.lineTo(ctr[0] + R * 0.6, ctr[1] + R * 0.6);
+          ctx.moveTo(ctr[0] + R * 0.6, ctr[1] - R * 0.6); ctx.lineTo(ctr[0] - R * 0.6, ctr[1] + R * 0.6); ctx.stroke();
+        }
+        ctx.font = MONO(9.5); ctx.fillStyle = c.muted; ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.fillText("meshlet " + id, ctr[0], ctr[1] + R + 3);
+        id++;
+      }
+      cap = k === "as" ? "task shader: cull meshlets 1 and 5, launch mesh shaders for 4" : "mesh shader: each workgroup writes its meshlet's vertices + triangles";
+    } else if (k === "pa") {
+      viewport();
+      const poly = clipPoly(sv, C);
+      const m = t * 3;
+      ctx.strokeStyle = c.ras; ctx.lineWidth = 2;
+      ctx.save(); ctx.setLineDash([5, 4]); ctx.strokeStyle = A(c.ras, 0.6);
+      for (let i = 0; i < 3; i++) { const f = RP.clamp(m - i); if (f <= 0) continue; const a = sv[i], b = sv[(i + 1) % 3]; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f); ctx.stroke(); }
+      ctx.restore();
+      if (t >= 0.999) {
+        ctx.beginPath(); poly.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath();
+        ctx.fillStyle = A(c.ras, 0.18); ctx.fill(); ctx.strokeStyle = c.ras; ctx.lineWidth = 2; ctx.stroke();
+        poly.forEach((p) => { const orig = sv.some((v) => Math.abs(v[0] - p[0]) < 0.5 && Math.abs(v[1] - p[1]) < 0.5); if (!orig) { ctx.beginPath(); ctx.arc(p[0], p[1], 4, 0, 7); ctx.fillStyle = c.ras; ctx.fill(); } });
+      }
+      sv.forEach((p, i) => dot(p, RP.rgb2css(VCOL[i]), 4.5));
+      cap = t < 0.999 ? "assembling triangle from v0, v1, v2…" : "clipped to the view volume: " + poly.length + "-sided polygon, new vertices on the edge";
+    } else if (k === "rs" || k === "fs" || k === "zs" || k === "om") {
+      if (k === "om") {
+        // destination: striped background + occluder already in framebuffer
+        for (let j = 0; j < gr; j++) for (let i = 0; i < gc; i++) { ctx.fillStyle = (i + j) % 2 ? A(c.out, 0.18) : A(c.out, 0.08); ctx.fillRect(gx + i * g, gy + j * g, g, g); }
+      }
+      grid(); viewport();
+      if (k === "zs" || k === "om") {
+        ctx.fillStyle = A(c.muted, 0.55);
+        ctx.fillRect(gx + occ.x0 * gc * g, gy + occ.y0 * gr * g, (occ.x1 - occ.x0) * gc * g, (occ.y1 - occ.y0) * gr * g);
+        ctx.font = MONO(9.5); ctx.fillStyle = c.ink; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText("nearer object", gx + (occ.x0 + occ.x1) / 2 * gc * g, gy + occ.y0 * gr * g - 2);
+      }
+      const nC = k === "rs" ? Math.round(cells.length * t) : cells.length;
+      let helpers = 0, rejected = 0;
+      cells.slice(0, nC).forEach((q, idx) => {
+        const x = gx + q.i * g, y = gy + q.j * g;
+        if (k === "rs") { ctx.fillStyle = A(c.ras, 0.45); ctx.fillRect(x + 1, y + 1, g - 2, g - 2); }
+        else if (k === "fs") { ctx.fillStyle = cellColor(q); ctx.globalAlpha = RP.clamp(t * 1.4 - (q.j / gr) * 0.4); ctx.fillRect(x + 1, y + 1, g - 2, g - 2); ctx.globalAlpha = 1; }
+        else if (k === "zs") {
+          const show = idx / cells.length <= t;
+          if (inOcc(q)) { rejected++; if (show) { ctx.strokeStyle = c.bad; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x + 3, y + 3); ctx.lineTo(x + g - 3, y + g - 3); ctx.moveTo(x + g - 3, y + 3); ctx.lineTo(x + 3, y + g - 3); ctx.stroke(); } }
+          else { ctx.fillStyle = cellColor(q); ctx.globalAlpha = show ? 1 : 0.35; ctx.fillRect(x + 1, y + 1, g - 2, g - 2); ctx.globalAlpha = 1; }
+        } else if (k === "om") {
+          if (!inOcc(q)) { ctx.fillStyle = cellColor(q); ctx.globalAlpha = 0.8 * t; ctx.fillRect(x, y, g, g); ctx.globalAlpha = 1; }
+        }
+      });
+      if (k === "fs") {
+        // 2x2 quads + helper lanes
+        ctx.strokeStyle = c.ink; ctx.lineWidth = 1.2;
+        for (let j = 0; j < gr - 1; j += 2) for (let i = 0; i < gc - 1; i += 2) {
+          const qc = [[i, j], [i + 1, j], [i, j + 1], [i + 1, j + 1]];
+          const nIn = qc.filter(([a, b]) => covered.has(a + "," + b)).length;
+          if (!nIn) continue;
+          qc.forEach(([a, b]) => { if (!covered.has(a + "," + b)) { helpers++; hatch(ctx, gx + a * g + 1, gy + b * g + 1, g - 2, g - 2, A(c.frag, 0.75)); } });
+          ctx.strokeRect(gx + i * g + 0.5, gy + j * g + 0.5, 2 * g - 1, 2 * g - 1);
+        }
+      }
+      if (k !== "om") { triPath(sv); ctx.strokeStyle = A(c.ink, 0.5); ctx.lineWidth = 1; ctx.stroke(); }
+      if (k === "rs") cap = nC + " of " + cells.length + " fragments generated (pixel centers inside)";
+      else if (k === "fs") cap = cells.length + " fragment invocations + " + helpers + " helper lanes in 2×2 quads";
+      else if (k === "zs") cap = rejected + " fragments fail the depth test (behind the nearer object)";
+      else cap = "blend: out = src·α + dst·(1−α), α = 0.8";
+    }
+    ctx.font = MONO(11); ctx.fillStyle = c.muted; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(cap, w / 2, h - 15, w - 20);
+    const d = PS[k];
+    pipeHud.textContent = `stage ${pIdx + 1}/${n} · ${d.prog ? "programmable" : "fixed"}`;
+  }, {});
+  function updateInfo() {
+    const st = order(); if (pIdx >= st.length) pIdx = st.length - 1;
+    const d = PS[st[pIdx]];
+    pipeInfo.innerHTML = `<h3>${d.n} <span class="badge${d.prog ? " prog" : ""}">${d.prog ? "programmable" : "fixed function"}</span></h3><p>${d.d}</p>`;
+  }
+  const pipeAnim = RP.loop(pipe.el, (time, dt) => {
+    if (pT < 1) pT = Math.min(1, pT + dt / 1.6);
+    else if (autoplay) { hold += dt; if (hold > 0.7) { hold = 0; setStage((pIdx + 1) % order().length); } }
+    pipe.draw();
+  });
+  function setStage(i) {
+    pIdx = i; pT = pipeAnim.running ? 0 : 1; hold = 0; updateInfo(); pipe.draw();
+  }
+  const playBtn = $("#pipe-play");
+  function syncPlay() { playBtn.textContent = autoplay ? "Pause" : "Play"; playBtn.setAttribute("aria-pressed", String(autoplay)); }
+  playBtn.addEventListener("click", () => { autoplay = !autoplay; if (autoplay) pipeAnim.start(); syncPlay(); });
+  $("#pipe-prev").addEventListener("click", () => { const n = order().length; setStage((pIdx - 1 + n) % n); });
+  $("#pipe-next").addEventListener("click", () => setStage((pIdx + 1) % order().length));
+  function toggleBtn(sel, fn) { const b = $(sel); b.addEventListener("click", () => { const v = b.getAttribute("aria-pressed") !== "true"; b.setAttribute("aria-pressed", String(v)); fn(v); }); }
+  toggleBtn("#pipe-opt", (v) => { const cur = order()[pIdx]; showOpt = v; const ni = order().indexOf(cur); setStage(ni >= 0 ? ni : 0); });
+  toggleBtn("#pipe-mesh", (v) => { const cur = order()[pIdx]; meshPath = v; const ni = order().indexOf(cur); setStage(ni >= 0 ? ni : 0); });
+  RP.drag(pipe.el, {
+    down(x, y) {
+      if (!pipe.boxes) return false;
+      const bw = pipe.bw;
+      const hit = pipe.boxes.find((b) => x >= b.x && x <= b.x + bw && y >= b.y && y <= b.y + 40);
+      if (hit) setStage(hit.i);
+      return false;
+    },
+  });
+  syncPlay(); updateInfo(); if (RP.reduced) pT = 1;
+
+  /* ================= STEP 3: GLSL editor ================= */
+  const VS = `attribute vec2 a_pos;      // corner of a full-screen quad, already in clip space
+void main() {
+  // no matrices needed: x, y in [-1, 1] cover the whole canvas
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+  const HEAD = `precision mediump float;
+uniform float u_time;        // seconds
+uniform vec2  u_resolution;  // canvas size in pixels
+uniform vec2  u_mouse;       // pointer in pixels, origin bottom-left
+`;
+  const PRESETS = {
+    uv: HEAD + `
+void main() {
+  // gl_FragCoord.xy = this fragment's pixel position (origin bottom-left)
+  vec2 uv = gl_FragCoord.xy / u_resolution;   // 0..1 across the canvas
+  float pulse = 0.5 + 0.5 * sin(u_time);
+  gl_FragColor = vec4(uv.x, uv.y, pulse, 1.0); // red = x, green = y
+}
+`,
+    sphere: HEAD + `
+void main() {
+  // centered coordinates: y runs -0.5..0.5, x is scaled by the aspect ratio
+  vec2 p = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+  vec2 m = (u_mouse - 0.5 * u_resolution) / u_resolution.y;
+  float r = 0.35;
+  float sd = length(p) - r;                    // signed distance to the circle
+  vec3 bg = vec3(0.10, 0.12, 0.16);
+  if (sd > 0.0) { gl_FragColor = vec4(bg, 1.0); return; }
+  // rebuild the sphere's normal from the 2D position
+  float z = sqrt(r * r - dot(p, p));
+  vec3 n = normalize(vec3(p, z));
+  vec3 l = normalize(vec3(m, 0.45));           // light direction follows the mouse
+  float diffuse = max(dot(n, l), 0.0);         // Lambert: N . L
+  vec3 albedo = vec3(0.85, 0.35, 0.55);
+  vec3 lin = albedo * (0.06 + diffuse);        // linear color
+  gl_FragColor = vec4(pow(lin, vec3(1.0 / 2.2)), 1.0); // approx. sRGB
+}
+`,
+    checker: HEAD + `
+void main() {
+  vec2 uv = gl_FragCoord.xy / u_resolution.y;
+  uv.x += u_time * 0.1;                        // scroll sideways
+  vec2 cell = floor(uv * 8.0);                 // which square am I in?
+  float c = mod(cell.x + cell.y, 2.0);         // 0 or 1, alternating
+  vec3 a = vec3(0.92), b = vec3(0.15, 0.17, 0.22);
+  gl_FragColor = vec4(mix(b, a, c), 1.0);
+}
+`,
+    rings: HEAD + `
+void main() {
+  vec2 p = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+  vec2 m = (u_mouse - 0.5 * u_resolution) / u_resolution.y;
+  float d = length(p - m);                     // distance to the pointer
+  float wave = 0.5 + 0.5 * sin(d * 60.0 - u_time * 4.0);
+  vec3 col = mix(vec3(0.05, 0.10, 0.20), vec3(0.20, 0.80, 0.90), wave);
+  col *= exp(-2.0 * d);                        // fade with distance
+  gl_FragColor = vec4(col, 1.0);
+}
+`,
+  };
+  $("#glsl-vs").textContent = VS;
+  const src = $("#glsl-src"), status = $("#glsl-status");
+  let prog = null, locs = null, glTime = 0, timeOn = true, mouse = null, buf = null;
+  const gv = RP.canvas("#glsl", (s) => {
+    const gl = s.ctx;
+    gl.viewport(0, 0, s.el.width, s.el.height);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!prog) return;
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.enableVertexAttribArray(locs.pos); gl.vertexAttribPointer(locs.pos, 2, gl.FLOAT, false, 0, 0);
+    const mx = mouse ? mouse[0] * s.dpr : s.el.width * 0.68, my = mouse ? (s.h - mouse[1]) * s.dpr : s.el.height * 0.7;
+    if (locs.time) gl.uniform1f(locs.time, glTime);
+    if (locs.res) gl.uniform2f(locs.res, s.el.width, s.el.height);
+    if (locs.mouse) gl.uniform2f(locs.mouse, mx, my);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }, { webgl: 1 });
+  const gl = gv.ctx;
+  function compile() {
+    if (!gl) return;
+    try {
+      const p = RP.glProgram(gl, VS, src.value);
+      if (prog) gl.deleteProgram(prog);
+      prog = p;
+      locs = { pos: gl.getAttribLocation(p, "a_pos"), time: gl.getUniformLocation(p, "u_time"), res: gl.getUniformLocation(p, "u_resolution"), mouse: gl.getUniformLocation(p, "u_mouse") };
+      status.className = "compile-status ok"; status.textContent = "Compiled OK. The fragment shader runs once per pixel, every frame.";
+    } catch (e) {
+      status.className = "compile-status err";
+      status.textContent = "Compile error (still showing the last working shader):\n" + String(e.message || e).replace(/\0/g, "").trim();
+    }
+    gv.draw();
+  }
+  if (!gl) {
+    RP.fallback(gv.el, "This demo needs WebGL, which isn't available here. You can still read and edit the shader code below. It's the same GLSL you'd write in any OpenGL or WebGL program.");
+    status.className = "compile-status err"; status.textContent = "WebGL unavailable: shaders can't be compiled in this browser.";
+  } else {
+    buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]), gl.STATIC_DRAW);
+  }
+  RP.toggleGroup("#presets", (v) => { src.value = PRESETS[v]; compile(); });
+  let deb = 0;
+  src.addEventListener("input", () => { clearTimeout(deb); deb = setTimeout(compile, 450); });
+  src.addEventListener("keydown", (e) => {
+    if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      // insert two spaces; Esc then Tab still leaves the editor (see blur below)
+      if (src.dataset.escaped === "1") { src.dataset.escaped = ""; return; }
+      e.preventDefault(); const a = src.selectionStart, b = src.selectionEnd;
+      src.value = src.value.slice(0, a) + "  " + src.value.slice(b); src.selectionStart = src.selectionEnd = a + 2;
+      clearTimeout(deb); deb = setTimeout(compile, 450);
+    } else if (e.key === "Escape") { src.dataset.escaped = "1"; } else { src.dataset.escaped = ""; }
+  });
+  $("#glsl-run").addEventListener("click", compile);
+  const timeBtn = $("#glsl-time");
+  const glAnim = RP.loop(gv.el, (t, dt) => { if (timeOn) glTime += dt; gv.draw(); });
+  if (RP.reduced) { timeOn = false; timeBtn.textContent = "Play time"; }
+  timeBtn.addEventListener("click", () => { timeOn = !timeOn; timeBtn.textContent = timeOn ? "Pause time" : "Play time"; if (timeOn) glAnim.start(); });
+  RP.drag(gv.el, { down(x, y) { mouse = [x, y]; gv.draw(); }, move(x, y) { mouse = [x, y]; gv.draw(); }, hover(x, y) { mouse = [x, y]; if (!glAnim.running || RP.reduced) gv.draw(); } });
+
+  /* ================= STEP 4: SIMT divergence ================= */
+  const TOTAL = 256, COST = { pre: 2, a: 4, b: 4, post: 2 };
+  let seed = 12345; const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+  const laneU = Array.from({ length: TOTAL }, rnd);
+  let wp = 0.3, pattern = "scatter", laneW = 32;
+  const warpHud = $("#warp-hud");
+  const warp = RP.canvas("#warp", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const W = TOTAL / laneW;
+    const take = (gi) => pattern === "scatter" ? laneU[gi] < wp : (gi + 0.5) / TOTAL < wp;
+    const lx = 62, rx = 12, avail = w - lx - rx;
+    const cw = avail / laneW;
+    const top = 30;
+    const rowH = Math.max(6, Math.min(16, (h * 0.42 - top) / W));
+    ctx.font = MONO(10.5); ctx.fillStyle = c.muted; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(`${TOTAL} threads → ${W} ${laneW === 32 ? "warps" : "wavefronts"} of ${laneW} lanes`, lx, 14, avail);
+    let useful = 0, total = 0, diverged = 0;
+    const stats = [];
+    for (let wi = 0; wi < W; wi++) {
+      let nA = 0;
+      const y = top + wi * rowH;
+      for (let l = 0; l < laneW; l++) {
+        const gi = wi * laneW + l, ta = take(gi); if (ta) nA++;
+        ctx.fillStyle = ta ? c.ras : c.frag;
+        ctx.fillRect(lx + l * cw + 0.5, y + 0.5, Math.max(1, cw - 1), rowH - 1);
+      }
+      const nB = laneW - nA;
+      if (nA && nB) diverged++;
+      ctx.fillStyle = c.muted; ctx.textAlign = "right"; ctx.font = MONO(Math.min(10, rowH)); ctx.fillText((laneW === 32 ? "warp " : "wave ") + wi, lx - 6, y + rowH / 2);
+      ctx.textAlign = "left";
+      const cyc = COST.pre + (nA ? COST.a : 0) + (nB ? COST.b : 0) + COST.post;
+      useful += laneW * (COST.pre + COST.post) + nA * COST.a + nB * COST.b;
+      total += laneW * cyc;
+      stats.push({ nA, nB, cyc });
+    }
+    // timeline
+    const t0 = top + W * rowH + 34;
+    const maxC = COST.pre + COST.a + COST.b + COST.post;
+    const pxc = (avail - 48) / maxC;
+    const bh = Math.max(8, Math.min(26, (h - t0 - 22) / W - 4));
+    ctx.fillStyle = c.muted; ctx.font = MONO(10.5); ctx.textBaseline = "middle"; ctx.textAlign = "left";
+    ctx.fillText("execution over time → (block height = active lanes)", lx, t0 - 16, avail);
+    // phase labels
+    const ph = [["common", COST.pre], ["if", COST.a], ["else", COST.b], ["common", COST.post]];
+    let xx = lx; ctx.font = MONO(9.5); ctx.textAlign = "center";
+    ph.forEach(([lb, cc]) => { ctx.fillStyle = c.muted; ctx.fillText(lb, xx + cc * pxc / 2, t0 - 4); xx += cc * pxc; });
+    stats.forEach((st, wi) => {
+      const y = t0 + 4 + wi * (bh + 4);
+      let x = lx;
+      const seg = (cc, n, col, present) => {
+        const sw = cc * pxc - 2;
+        if (present) {
+          ctx.fillStyle = A(c.muted, 0.12); ctx.fillRect(x, y, sw, bh);
+          const fh = bh * n / laneW; ctx.fillStyle = col; ctx.fillRect(x, y + bh - fh, sw, fh);
+          ctx.strokeStyle = A(c.muted, 0.6); ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, sw - 1, bh - 1);
+        } else {
+          ctx.save(); ctx.setLineDash([3, 3]); ctx.strokeStyle = A(c.muted, 0.35); ctx.strokeRect(x + 0.5, y + 0.5, sw - 1, bh - 1); ctx.restore();
+        }
+        x += cc * pxc;
+      };
+      seg(COST.pre, laneW, c.ink, true);
+      seg(COST.a, st.nA, c.ras, st.nA > 0);
+      seg(COST.b, st.nB, c.frag, st.nB > 0);
+      seg(COST.post, laneW, c.ink, true);
+      ctx.fillStyle = c.muted; ctx.font = MONO(Math.min(10, bh)); ctx.textAlign = "left";
+      ctx.fillText(st.cyc + "c", x + 2, y + bh / 2);
+    });
+    const util = useful / total;
+    warpHud.textContent = `lane utilization ${(util * 100).toFixed(0)}%\ndiverged: ${diverged}/${W}`;
+  });
+  RP.slider("#warp-p", (v) => { wp = v / 100; warp.draw(); }, { fmt: (v) => v + "%" });
+  RP.toggleGroup("#warp-pat", (v) => { pattern = v; warp.draw(); });
+  RP.toggleGroup("#warp-size", (v) => { laneW = +v; warp.draw(); });
+
+  /* ================= STEP 5: overdraw ================= */
+  const QUADS = [
+    { x: 0.0, y: 0.0, w: 1.0, h: 1.0, z: 0.95, col: [0.36, 0.40, 0.46] },
+    { x: 0.06, y: 0.12, w: 0.46, h: 0.62, z: 0.75, col: [0.80, 0.58, 0.32] },
+    { x: 0.55, y: 0.08, w: 0.38, h: 0.52, z: 0.65, col: [0.50, 0.74, 0.36] },
+    { x: 0.32, y: 0.28, w: 0.42, h: 0.56, z: 0.5, col: [0.32, 0.60, 0.78] },
+    { x: 0.16, y: 0.46, w: 0.36, h: 0.44, z: 0.32, col: [0.82, 0.36, 0.46] },
+    { x: 0.6, y: 0.5, w: 0.32, h: 0.4, z: 0.22, col: [0.88, 0.76, 0.32] },
+    { x: 0.42, y: 0.16, w: 0.2, h: 0.34, z: 0.1, col: [0.62, 0.46, 0.82] },
+  ];
+  let odOrder = "back", earlyZ = false, odView = "heat", odN = QUADS.length;
+  const odHud = $("#od-hud");
+  const MIXED = [3, 0, 5, 1, 6, 2, 4];
+  const od = RP.canvas("#od", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const m = 14, cell = Math.max(5, Math.round(Math.min(w, h) / 60));
+    const gw = Math.floor((w - 2 * m) / cell), gh = Math.floor((h - 2 * m) / cell);
+    const ox = (w - gw * cell) / 2, oy = (h - gh * cell) / 2;
+    const idx = QUADS.map((q, i) => i);
+    let seq = odOrder === "back" ? idx.slice().sort((a, b) => QUADS[b].z - QUADS[a].z) : odOrder === "front" ? idx.slice().sort((a, b) => QUADS[a].z - QUADS[b].z) : MIXED.slice();
+    seq = seq.slice(0, odN);
+    const N = gw * gh, depth = new Float32Array(N).fill(1), cnt = new Uint16Array(N), colr = new Int8Array(N).fill(-1);
+    let inv = 0;
+    for (const qi of seq) {
+      const q = QUADS[qi];
+      const i0 = Math.round(q.x * gw), i1 = Math.round((q.x + q.w) * gw), j0 = Math.round(q.y * gh), j1 = Math.round((q.y + q.h) * gh);
+      for (let j = j0; j < j1; j++) for (let i = i0; i < i1; i++) {
+        const k = j * gw + i;
+        if (earlyZ) { if (q.z < depth[k]) { cnt[k]++; inv++; depth[k] = q.z; colr[k] = qi; } }
+        else { cnt[k]++; inv++; if (q.z < depth[k]) { depth[k] = q.z; colr[k] = qi; } }
+      }
+    }
+    const heat = [c.surface2, c.good, c.warn, c.frag, c.bad];
+    let vis = 0;
+    for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+      const k = j * gw + i;
+      if (colr[k] >= 0) vis++;
+      if (odView === "heat") ctx.fillStyle = heat[Math.min(4, cnt[k])];
+      else ctx.fillStyle = colr[k] >= 0 ? RP.rgb2css(QUADS[colr[k]].col) : c.surface2;
+      ctx.fillRect(ox + i * cell, oy + j * cell, cell + 0.5, cell + 0.5);
+    }
+    // outlines + draw order labels
+    ctx.lineWidth = 1.5; ctx.font = FONT(12, 600); ctx.textAlign = "left"; ctx.textBaseline = "top";
+    seq.forEach((qi, n) => {
+      const q = QUADS[qi];
+      const x = ox + Math.round(q.x * gw) * cell, y = oy + Math.round(q.y * gh) * cell;
+      const ww = (Math.round((q.x + q.w) * gw) - Math.round(q.x * gw)) * cell, hh = (Math.round((q.y + q.h) * gh) - Math.round(q.y * gh)) * cell;
+      ctx.strokeStyle = A(c.ink, 0.55); ctx.strokeRect(x + 0.75, y + 0.75, ww - 1.5, hh - 1.5);
+      const lbl = "#" + (n + 1) + " z=" + q.z.toFixed(2);
+      const tw = ctx.measureText(lbl).width;
+      const lx = qi === 0 ? x + ww - tw - 10 : x + 4, ly = qi === 0 ? y + hh - 22 : y + 4;
+      ctx.fillStyle = A(c.surface, 0.85); ctx.fillRect(lx - 2, ly - 1, tw + 6, 16);
+      ctx.fillStyle = c.ink; ctx.fillText(lbl, lx + 1, ly + 1);
+    });
+    const ratio = vis ? inv / vis : 0;
+    odHud.textContent = `draw calls: ${seq.length}/${QUADS.length}\nFS invocations: ${inv.toLocaleString()}\nvisible fragments: ${vis.toLocaleString()}\noverdraw: ${ratio.toFixed(2)}×`;
+  });
+  RP.toggleGroup("#od-order", (v) => { odOrder = v; od.draw(); });
+  RP.toggleGroup("#od-z", (v) => { earlyZ = v === "on"; od.draw(); });
+  RP.toggleGroup("#od-view", (v) => { odView = v; od.draw(); });
+  RP.slider("#od-n", (v) => { odN = v; od.draw(); });
+})();
+</script>
+</body>
+</html>

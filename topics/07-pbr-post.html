@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PBR, HDR & Post-Processing · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas[hidden] { display: none !important; }
+  .light-dot {
+    position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%;
+    border: 2px solid var(--ink); background: var(--warn); pointer-events: none;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 35%, transparent);
+  }
+  .swatch-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .swatch-row input[type="color"] { width: 40px; height: 32px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+  .ctl-label { font: 600 0.72rem/1.2 var(--font-mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .ctl-group { display: grid; gap: 6px; }
+</style>
+</head>
+<body data-topic="07">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 07 · Modern techniques</p>
+    <h1>PBR, HDR & Post-Processing</h1>
+    <p class="lede">Modern renderers try to obey physics: light is conserved, surfaces are made of tiny mirrors, and brightness is not capped at 1.0. This chapter follows a pixel from the physically based fragment shader, through a high-dynamic-range buffer, to the post-processing passes that turn it into the image on your screen.</p>
+    <div class="stage-band"><span class="app">Application</span><span class="vtx">Vertex</span><span class="ras">Rasterize</span><span class="on frag">Fragment</span><span class="on out">Output</span></div>
+  </section>
+
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>Why a rough surface looks blurry: microfacets, and the Cook-Torrance BRDF with GGX, Schlick Fresnel and Smith shadowing.</li>
+    <li>The metallic/roughness material workflow used by most engines today.</li>
+    <li>Why lighting math must happen in <em>linear</em> color, and what the sRGB encoding is for.</li>
+    <li>HDR render targets, exposure and tonemapping (Reinhard, ACES-style filmic curves).</li>
+    <li>How bloom is built from a chain of downsampled, blurred images.</li>
+    <li>What SSAA, MSAA, FXAA and TAA each do against jagged edges, and what each costs.</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="microfacets">
+    <h2><span class="step-no">STEP 1</span>Surfaces are made of tiny mirrors</h2>
+    <p>In chapter 03, the Blinn-Phong highlight was a handy trick: raise <code>N·H</code> to a "shininess" power and the spot gets smaller. It looks fine, but nothing stops it from reflecting more light than came in, and the shininess number has no physical meaning. <strong>Physically based rendering (PBR)</strong> replaces the trick with a model of what a surface really looks like up close.</p>
+    <p>Zoom in far enough on any surface and it stops being flat. <strong>Microfacet theory</strong> treats it as millions of tiny, perfectly flat mirrors, each tilted a little differently. A polished surface has facets that almost all point the same way, so light bounces off in one tight direction: a sharp reflection. A rough surface has facets pointing all over the place, so the same incoming light sprays across a wide cone: a blurry, spread-out highlight. Roughness is just "how much do the facet directions vary?"</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="mf" aria-label="A magnified cross-section of a bumpy surface. Parallel light rays arrive from the upper left and each reflects off the local facet. Rougher settings make the reflected rays fan out; some rays are blocked by neighboring bumps."></canvas><div class="hud" id="mf-hud"></div><span class="pane-label">Microfacets</span></div>
+        <div class="viz-stage"><canvas id="lobe" aria-label="Top: a polar plot of the GGX normal distribution D for the current roughness. Bottom: Schlick Fresnel reflectance versus angle of incidence for the chosen material, one curve per color channel."></canvas><span class="pane-label">D lobe · Fresnel</span></div>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="r1">Roughness <output for="r1"></output></label><input type="range" id="r1" min="0.02" max="1" step="0.01" value="0.35"></div>
+        <div class="control"><label for="ang1">Light angle θ <output for="ang1"></output></label><input type="range" id="ang1" min="5" max="80" step="1" value="35"></div>
+        <div class="ctl-group"><span class="ctl-label" id="f0-label">F0 (reflectance head-on)</span>
+          <div class="btn-row" id="f0" role="group" aria-labelledby="f0-label"><button class="btn" data-value="diel" aria-pressed="true">Dielectric 0.04</button><button class="btn" data-value="gold">Gold</button><button class="btn" data-value="copper">Copper</button><button class="btn" data-value="iron">Iron</button></div></div>
+      </div>
+      <figcaption><b>Try it:</b> raise the roughness and watch the reflected rays (magenta) fan out while the D lobe on the right widens and flattens. Dashed red rays are blocked by a neighboring bump: that's the G term. Then push the light angle toward 80° and watch the Fresnel curve shoot up toward 1.</figcaption>
+    </figure>
+    <p>The standard PBR specular model is the <strong>Cook-Torrance</strong> microfacet BRDF (Cook &amp; Torrance, 1982). A BRDF answers one question: <em>of the light arriving from direction <b>l</b>, how much leaves toward the eye <b>v</b>?</em> Only facets whose normal equals the half vector <b>h</b> (halfway between <b>l</b> and <b>v</b>) can mirror light from <b>l</b> into <b>v</b>, so the formula counts those facets and corrects for a couple of effects:</p>
+    <div class="math">f_spec(l, v) = D(h) · F(v, h) · G(l, v)
+               ─────────────────────
+                  4 (n·l) (n·v)
+
+D  GGX / Trowbridge-Reitz:   D(h) = α² / ( π · ((n·h)²(α² − 1) + 1)² ),   α = roughness²
+F  Schlick Fresnel:           F    = F0 + (1 − F0) · (1 − v·h)⁵
+G  Smith (Schlick-GGX form):  G    = G1(l) · G1(v),   G1(x) = (n·x) / ((n·x)(1 − k) + k)
+                              k = (roughness + 1)² / 8   (Epic's choice for point lights)</div>
+    <ul>
+      <li><strong>D, the normal distribution</strong>, says what fraction of facets face along <b>h</b>. GGX (Walter et al. 2007; the same shape as Trowbridge-Reitz 1975) has a bright core and a long soft tail, which matches real materials better than older Gaussian-style lobes. Squaring roughness to get α makes the slider feel perceptually even.</li>
+      <li><strong>F, Fresnel</strong>, says how much light a facet reflects instead of letting it in. Everything gets more mirror-like at grazing angles: look across a lake and it reflects the sky, look straight down and you see the bottom. <code>F0</code> is the head-on reflectance. Non-metals ("dielectrics") sit near 0.04 (4%); metals reflect 50–100% and their F0 is colored, which is why gold reflections look gold.</li>
+      <li><strong>G, geometry/shadowing-masking</strong>, removes light that is blocked by neighboring bumps on the way in (shadowing) or the way out (masking). It matters most on rough surfaces at grazing angles.</li>
+    </ul>
+    <div class="callout frag"><strong>Key idea.</strong> Roughness is not a "blur" setting. It describes how spread out the microfacet normals are, and the GGX D term turns that statistic into the shape of the highlight. A rougher surface has a wider but dimmer lobe: the same energy, spread over more directions.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="materials">
+    <h2><span class="step-no">STEP 2</span>Metallic and roughness: two sliders for every material</h2>
+    <p>Artists don't want to type Fresnel coefficients. In 2012 Brent Burley's Disney course notes ("Physically-Based Shading at Disney") proposed a small set of intuitive, artist-friendly parameters, and in 2013 Brian Karis's notes "Real Shading in Unreal Engine 4" trimmed it down to what became the industry default: <strong>base color, metallic, roughness</strong>. Unity, Godot, glTF 2.0 and most other engines use essentially the same set.</p>
+    <p>The trick is that one base color serves two purposes. For a non-metal, the base color is the <em>diffuse</em> color (light that enters the surface, scatters, and comes back out tinted), and the specular reflectance is a fixed 4%. For a metal, there is no diffuse at all (metals absorb light that enters them), and the base color becomes the colored <code>F0</code>:</p>
+    <div class="math">F0       = mix(0.04, baseColor, metallic)
+diffuse  = (1 − F) · (1 − metallic) · baseColor / π
+color    = (diffuse + f_spec) · lightRadiance · (n·l)</div>
+    <p>The <code>(1 − F)</code> factor is <strong>energy conservation</strong> in action: light that was reflected by the specular term is no longer available to enter the surface and become diffuse. The <code>/ π</code> keeps a white Lambert surface from reflecting more light than it receives. Every sphere below is shaded per pixel with exactly these formulas.</p>
+    <figure class="viz">
+      <div class="viz-stage">
+        <canvas id="grid" class="tall" tabindex="0" aria-label="A five by five grid of spheres. Roughness increases from left to right; metallic increases from top to bottom. Drag or use arrow keys to move the light."></canvas>
+        <canvas id="grid2d" class="tall" tabindex="0" hidden aria-label="CPU-rendered five by five grid of spheres; roughness increases left to right, metallic top to bottom."></canvas>
+        <div class="light-dot" id="ldot" aria-hidden="true"></div>
+        <div class="hud" id="grid-hud">→ roughness 0.08 … 1.0
+↓ metallic 0 … 1
+drag to move the light</div>
+      </div>
+      <div class="controls">
+        <div class="ctl-group"><span class="ctl-label" id="base-label">Base color</span>
+          <div class="swatch-row"><div class="btn-row" id="base" role="group" aria-labelledby="base-label"><button class="btn" data-value="copper" aria-pressed="true">Copper</button><button class="btn" data-value="gold">Gold</button><button class="btn" data-value="red">Red paint</button><button class="btn" data-value="white">White</button></div>
+          <input type="color" id="basepick" value="#f9d1be" aria-label="Custom base color"></div></div>
+        <div class="ctl-group"><span class="ctl-label" id="env-label">Environment light</span>
+          <div class="btn-row" id="env" role="group" aria-labelledby="env-label"><button class="btn" data-value="on" aria-pressed="true">Sky + ground</button><button class="btn" data-value="off">Point light only</button></div></div>
+      </div>
+      <figcaption><b>Try it:</b> compare the top row (plastic: colored diffuse, white highlight) with the bottom row (metal: no diffuse, colored reflections). Switch the environment off and the smooth metals turn almost black except for one tiny highlight, because a mirror only shows what's around it.</figcaption>
+    </figure>
+    <p>That last observation is why PBR almost always comes with <strong>image-based lighting (IBL)</strong>: the surroundings are stored in an environment map (often a cube map), and every direction in it acts as a light. To make this affordable, engines pre-blur the environment map into mip levels for increasing roughness, and store the rest of the BRDF integral in a small lookup table. Karis's 2013 notes call this the "split sum" approximation. The demo above uses a crude sky/ground gradient as a stand-in so you can see the effect.</p>
+    <div class="callout frag"><strong>Key idea.</strong> With only base color, metallic and roughness, the same shader produces plastic, paint, rubber, gold and steel, and every material stays plausible under any lighting, because the math conserves energy instead of relying on hand-tuned numbers.</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="linear">
+    <h2><span class="step-no">STEP 3</span>Linear light vs sRGB: do the math in the right space</h2>
+    <p>Here is a subtle fact that trips up every graphics beginner: <strong>the number stored in an image file is not proportional to the amount of light.</strong> Images are usually stored in <strong>sRGB</strong>, which spends more of its 256 codes on dark tones, because our eyes are far more sensitive to differences in the shadows. Code 128 (0.5) is not half the light of code 255. It is only about 21% of it. Half the light is code 188 (about 0.735).</p>
+    <div class="math">decode (sRGB → linear):  c ≤ 0.04045   ?  c / 12.92   :  ((c + 0.055) / 1.055)^2.4
+encode (linear → sRGB):  c ≤ 0.0031308 ?  12.92 · c   :  1.055 · c^(1/2.4) − 0.055
+                         (close to a plain power curve: linear ≈ sRGB^2.2)</div>
+    <p>Light, on the other hand, adds and scales linearly: two equal lamps give twice the photons. So the rule is: <strong>decode textures to linear, do all lighting, blending and filtering in linear, and encode to sRGB only at the very end</strong>. GPUs help: an sRGB texture format decodes automatically when sampled, and an sRGB framebuffer encodes automatically when written.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="gm" class="tall" aria-label="Two 16-step gradient strips, one evenly spaced in sRGB code values and one evenly spaced in linear light. Below, three patches compare fine black and white lines with gray code 128 and gray code 188. At the bottom, two spheres are lit by the same light: one computed directly on sRGB values, one computed in linear and then encoded."></canvas></div>
+      <div class="controls">
+        <div class="control"><label for="gl-ang">Light angle <output for="gl-ang"></output></label><input type="range" id="gl-ang" min="-80" max="80" step="1" value="-35"></div>
+        <div class="control"><label for="gl-int">Light intensity <output for="gl-int"></output></label><input type="range" id="gl-int" min="0.2" max="2" step="0.05" value="1"></div>
+      </div>
+      <figcaption><b>Try it:</b> squint (or step back) at the striped patch: on a typical display it matches code 188, not code 128, because the eye averages <em>light</em>. Then compare the spheres: the gamma-space sphere falls off to black too quickly and its terminator looks harsh.</figcaption>
+    </figure>
+    <p>Why is the left sphere wrong? Lambert says a surface tilted 60° from the light receives <code>cos 60° = 0.5</code> of the light. Multiplying the sRGB value by 0.5 doesn't give half the light, it gives about a fifth of it. The whole falloff gets crushed toward black, and adding two lights or blending two textures goes wrong in the same way. Strip A shows why sRGB exists: its 16 steps look evenly spaced to your eye. Strip B is evenly spaced in physical light, and most of its steps look nearly white.</p>
+    <div class="callout warn"><strong>Key idea.</strong> sRGB is a <em>storage</em> encoding that matches human perception; linear is the <em>working</em> space where physics holds. Mixing them up is invisible in the code and very visible in the image: dark, muddy falloffs and blends that look wrong.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="hdr">
+    <h2><span class="step-no">STEP 4</span>HDR, exposure and tonemapping</h2>
+    <p>Real scenes have enormous brightness ranges. The sun's disk can be many thousands of times brighter than a shaded wall, yet a monitor can only show values from 0 to 1. If the renderer clamps everything at 1.0 while it works, information is lost forever: a lamp at 20 and the sun at 50 both become plain white, and later effects like bloom can't tell them apart.</p>
+    <p>So modern pipelines render into an <strong>HDR render target</strong>, a floating-point texture (commonly a 16-bit-per-channel format such as <code>RGBA16F</code>, or the packed <code>R11G11B10F</code>) that happily stores 20.0 or 5000.0. Only at the end does a <strong>tonemapping</strong> pass squeeze that range into 0–1, like a camera:</p>
+    <div class="math">exposed   = sceneColor · 2^EV                        (exposure, in photographic stops)
+clamp     = min(x, 1)
+Reinhard  = x / (1 + x)                               (Reinhard et al. 2002, simple form)
+ACES fit  = x(2.51x + 0.03) / (x(2.43x + 0.59) + 0.14)  (Narkowicz's curve fit, clamped to [0, 1])
+display   = sRGB_encode( tonemap(exposed) )</div>
+    <p>Exposure picks which part of the range is "middle". Reinhard never quite reaches 1, so bright values roll off gently instead of clipping, but blacks look a little washed out. The ACES fit, a cheap approximation by Krzysztof Narkowicz of the film-like curve from the Academy Color Encoding System, adds a gentle "toe" for richer shadows and a "shoulder" for smooth highlights. Some versions scale the input by about 0.6 first; this page uses the plain fit.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="hdrimg" aria-label="A procedural sunset scene stored with high dynamic range values: a sun disk of about 50, street lamps from 12 to 30, and a dark ground. It is displayed with the selected exposure and tonemapping operator. Hover to read the stored HDR values."></canvas><div class="hud" id="hdr-hud"></div></div>
+        <div class="viz-stage"><canvas id="tmc" aria-label="Graph of the selected tonemapping curve: exposed scene value from 0 to 10 on the x axis, display value from 0 to 1 on the y axis. Markers show where the sky, lamps and sun land."></canvas><span class="pane-label">Operator curve</span></div>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="ev">Exposure (EV) <output for="ev"></output></label><input type="range" id="ev" min="-6" max="4" step="0.1" value="0"></div>
+        <div class="ctl-group"><span class="ctl-label" id="op-label">Operator</span>
+          <div class="btn-row" id="op" role="group" aria-labelledby="op-label"><button class="btn" data-value="clamp">Clamp</button><button class="btn" data-value="reinhard">Reinhard</button><button class="btn" data-value="aces" aria-pressed="true">ACES fit</button></div></div>
+      </div>
+      <figcaption><b>Try it:</b> with <b>Clamp</b>, raise the exposure and watch the sky turn into flat white blobs (the HUD counts clipped pixels). Switch to Reinhard or ACES at the same exposure and the detail comes back. Lower the exposure to about −4 EV and the sun's disk and lamp bulbs finally show some color: the values were always there.</figcaption>
+    </figure>
+    <p>Games usually adjust exposure automatically ("eye adaptation"): they measure the average log-luminance of the frame, often by downsampling it to a single pixel, and drift the exposure toward a target over a second or two, like your eyes adjusting when you walk out of a tunnel. Note that this demo tonemaps each RGB channel separately, which is common and cheap but can shift the hue of very saturated bright colors toward yellow or white.</p>
+    <div class="callout out"><strong>Key idea.</strong> Keep light values physical (unclamped, linear) for as long as possible. Exposure and tonemapping are a final, deliberate "development" step, just like a photographer choosing how to print a negative.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="bloom">
+    <h2><span class="step-no">STEP 5</span>Bloom: letting bright light bleed</h2>
+    <p>Real lenses and eyes aren't perfect. Very bright light scatters a little, so a street lamp at night appears wrapped in a soft glow. <strong>Bloom</strong> fakes this, and it only works well with HDR input: you want a lamp at 20.0 to glow far more than a white wall at 0.9, and in an 8-bit buffer both would just be 1.0.</p>
+    <p>A wide blur at full resolution would be far too slow, so engines build bloom from a <strong>chain of shrinking images</strong>. This structure was popularized by talks such as Jorge Jimenez's 2014 "Next Generation Post Processing in Call of Duty: Advanced Warfare":</p>
+    <ol>
+      <li><strong>Bright-pass:</strong> keep only the light above a threshold.</li>
+      <li><strong>Downsample chain:</strong> halve the resolution again and again (½, ¼, ⅛ …), blurring a little at each level. A small blur on a tiny image covers a huge area of the screen for almost no cost.</li>
+      <li><strong>Upsample and add:</strong> walk back up the chain, enlarging each level and adding it to the next larger one, so tight and wide glows combine.</li>
+      <li><strong>Composite:</strong> add the result to the HDR scene (scaled by an intensity), <em>then</em> tonemap.</li>
+    </ol>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="bl" class="tall" aria-label="Bloom pass breakdown. Top: the night scene without bloom and with bloom. Bottom: thumbnails of each pass, from the bright-pass through the shrinking blurred mip levels to the upsampled sum."></canvas></div>
+      <div class="controls">
+        <div class="control"><label for="bth">Threshold <output for="bth"></output></label><input type="range" id="bth" min="0.25" max="10" step="0.25" value="1.5"></div>
+        <div class="control"><label for="bint">Intensity <output for="bint"></output></label><input type="range" id="bint" min="0" max="2" step="0.05" value="0.6"></div>
+        <div class="control"><label for="blev">Mip levels <output for="blev"></output></label><input type="range" id="blev" min="1" max="5" step="1" value="5"></div>
+      </div>
+      <figcaption><b>Try it:</b> raise the threshold until only the lamps and the neon ring survive the bright-pass. Then reduce the mip levels: with one or two levels the glow stays tight, and with five it spreads across the sky. The thumbnails are shown with nearest-neighbor scaling so you can see how few pixels the deep levels really have.</figcaption>
+    </figure>
+    <div class="callout out"><strong>Key idea.</strong> Bloom is a pyramid: cheap blurs on progressively smaller images, summed back up. Its strength depends on HDR, because only values above 1.0 should really glow.</div>
+  </section>
+
+  <!-- STEP 6 -->
+  <section class="step" id="antialiasing">
+    <h2><span class="step-no">STEP 6</span>Anti-aliasing: four ways to fight jaggies</h2>
+    <p>Chapter 02 tested each pixel's coverage with one sample at its center. An edge that cuts through a pixel is therefore either fully in or fully out, which gives staircase "jaggies" that crawl as things move. Every anti-aliasing method estimates how much of each pixel is really covered, but they spend their effort in very different places:</p>
+    <ul>
+      <li><strong>SSAA (supersampling):</strong> render at a higher resolution (here 4 samples per pixel) and average. Best quality, but it runs the fragment shader 4× as often.</li>
+      <li><strong>MSAA (multisampling):</strong> test coverage and depth at 4 sample positions, but run the fragment shader <em>once</em> per pixel per triangle and copy the result to the covered samples. Edges get smooth for little shading cost, but it does nothing for aliasing <em>inside</em> a triangle (shiny highlights, alpha-tested foliage), and it fits awkwardly with deferred shading's G-buffer.</li>
+      <li><strong>FXAA (Fast Approximate AA, Timothy Lottes, NVIDIA 2009):</strong> a post-process. Render normally, then find pixels with high luminance contrast, estimate the edge direction, and blend across it. Very cheap and works on anything, but it only sees the final image, so it can soften texture detail.</li>
+      <li><strong>TAA (temporal AA):</strong> nudge (jitter) the camera by a different sub-pixel offset every frame and blend each new frame into an accumulated <em>history</em> buffer. Over 8–16 frames each pixel effectively collects many samples. To survive motion, the history is reprojected using per-pixel motion vectors and clamped to the colors around the current pixel. When that fails you get <strong>ghosting</strong>: smeared trails behind moving objects. Brian Karis's 2014 talk "High Quality Temporal Supersampling" is a classic description; upscalers like DLSS, FSR 2+ and XeSS build on the same idea.</li>
+    </ul>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="aa" class="tall" aria-label="A magnified pixel grid showing a slowly rotating triangle rendered with the selected anti-aliasing method. In SSAA and MSAA modes, the four sample points of each edge pixel are drawn; filled dots are covered samples."></canvas><div class="hud" id="aa-hud" style="top:auto;bottom:10px"></div></div>
+      <div class="controls">
+        <div class="ctl-group"><span class="ctl-label" id="aam-label">Method</span>
+          <div class="btn-row" id="aam" role="group" aria-labelledby="aam-label"><button class="btn" data-value="none" aria-pressed="true">None</button><button class="btn" data-value="ssaa">SSAA 4×</button><button class="btn" data-value="msaa">MSAA 4×</button><button class="btn" data-value="fxaa">FXAA-style</button><button class="btn" data-value="taa">TAA</button></div></div>
+        <div class="ctl-group"><span class="ctl-label" id="aao-label">Scene &amp; TAA options</span>
+          <div class="btn-row" role="group" aria-labelledby="aao-label"><button class="btn" id="aa-play" type="button">Pause</button><button class="btn" id="aa-move" type="button" aria-pressed="false">Camera moves</button><button class="btn" id="aa-clamp" type="button" aria-pressed="true">History clamp</button></div></div>
+      </div>
+      <figcaption><b>Try it:</b> in SSAA and MSAA, look at the dots on edge pixels: SSAA shades every covered dot, while MSAA shades once and multiplies by coverage. Then pick <b>TAA</b> and turn on <b>Camera moves</b>: our toy TAA does no reprojection, so the triangle drags a ghost. Turn <b>History clamp</b> off to see how much worse the ghost gets.</figcaption>
+    </figure>
+    <p>In practice, many modern deferred renderers ship TAA (or a temporal upscaler) as the default, sometimes with a sharpening pass to counter its softness, while forward renderers, VR titles and mobile GPUs often still prefer MSAA, which tile-based mobile hardware can resolve very cheaply on chip.</p>
+    <div class="callout ras"><strong>Key idea.</strong> Anti-aliasing is about sampling. SSAA takes more samples in space, MSAA takes more <em>coverage</em> samples but not more shading, FXAA guesses from the finished image, and TAA spreads its samples across time and pays for it with blur and ghosting when motion confuses it.</div>
+  </section>
+
+  <section class="step" id="recap"><h2><span class="step-no">RECAP</span>What to remember</h2>
+    <ul>
+      <li>PBR models surfaces as microfacets. Cook-Torrance specular = <code>D·F·G / (4 (n·l)(n·v))</code>, with GGX for D, Schlick for F and Smith for G.</li>
+      <li>Roughness widens and dims the highlight. Fresnel makes everything more reflective at grazing angles. Dielectrics have F0 ≈ 0.04; metals have colored F0 and no diffuse.</li>
+      <li>Metallic/roughness (Disney 2012, Epic/UE4 2013): <code>F0 = mix(0.04, base, metallic)</code>, and diffuse is scaled by <code>(1 − F)(1 − metallic)</code> so energy is conserved.</li>
+      <li>Environment lighting (IBL) is what makes metals look like metal; engines prefilter it per roughness level.</li>
+      <li>Store in sRGB, compute in linear. Decode textures, light in linear, encode once at the end.</li>
+      <li>Render into an HDR floating-point target, then apply exposure and a tonemapping curve (Reinhard, ACES-style filmic) to fit the display.</li>
+      <li>Bloom = bright-pass → downsample + blur chain → upsample + add → composite before tonemapping.</li>
+      <li>AA: SSAA (shade every sample, expensive), MSAA (coverage per sample, shading per pixel), FXAA (post-process edge blur), TAA (jittered samples accumulated over frames, watch for ghosting).</li>
+      <li>Next, chapter 08 looks at the graphics APIs that issue all of these passes to the GPU.</li>
+    </ul>
+  </section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const { clamp, lerp } = RP;
+  const toSRGB = (x) => { x = clamp(x); return x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055; };
+  const toLin = (x) => (x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4));
+  const TM = {
+    clamp: (x) => clamp(x),
+    reinhard: (x) => x / (1 + x),
+    aces: (x) => clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)),
+  };
+  const FONT = "12px ui-monospace, 'JetBrains Mono', Consolas, monospace";
+  function text(ctx, s, x, y, col, align, base) {
+    ctx.font = FONT; ctx.fillStyle = col; ctx.textAlign = align || "left"; ctx.textBaseline = base || "alphabetic"; ctx.fillText(s, x, y);
+  }
+  function rng(seed) { let s = seed >>> 0; return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; }; }
+  const lum = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  const css8 = (r, g, b) => `rgb(${Math.round(clamp(r) * 255)},${Math.round(clamp(g) * 255)},${Math.round(clamp(b) * 255)})`;
+  const cssLin = (c) => css8(toSRGB(c[0]), toSRGB(c[1]), toSRGB(c[2]));
+  function fit(iw, ih, x, y, bw, bh) { const s = Math.min(bw / iw, bh / ih); const w = iw * s, h = ih * s; return { x: x + (bw - w) / 2, y: y + (bh - h) / 2, w, h, s }; }
+  const D_ggx = (NoH, a) => { const a2 = a * a, d = NoH * NoH * (a2 - 1) + 1; return a2 / (Math.PI * d * d); };
+  const G1 = (NoX, k) => NoX / (NoX * (1 - k) + k);
+  const schlick = (c, f0) => f0 + (1 - f0) * Math.pow(1 - c, 5);
+  const $ = (id) => document.getElementById(id);
+
+  /* ======================= STEP 1: microfacets ======================= */
+  const F0S = { diel: [0.04, 0.04, 0.04], gold: [1.0, 0.766, 0.336], copper: [0.955, 0.638, 0.538], iron: [0.56, 0.57, 0.58] };
+  const F0N = { diel: "dielectric", gold: "gold", copper: "copper", iron: "iron" };
+  const s1 = { rough: 0.35, ang: 35, f0: F0S.diel, name: "diel" };
+  const waves = (() => { const r = rng(11); const a = []; for (let k = 0; k < 7; k++) a.push({ f: 3 + r() * (k + 1) * 3, p: r() * Math.PI * 2 }); return a; })();
+  function surf(x, W, rough) {
+    let h = 0, d = 0; const K = Math.sqrt(waves.length);
+    for (const wv of waves) { const om = (2 * Math.PI * wv.f) / W; const amp = (0.9 * rough) / (om * K); h += amp * Math.sin(om * x + wv.p); d += amp * om * Math.cos(om * x + wv.p); }
+    return [h, d];
+  }
+  const mf = RP.canvas("#mf", (s) => {
+    const { ctx, w, h, c } = s; ctx.clearRect(0, 0, w, h);
+    const base = h * 0.68, r = s1.rough;
+    const Y = (x) => base - surf(x, w, r)[0];
+    ctx.beginPath(); ctx.moveTo(0, h);
+    for (let x = 0; x <= w; x += 2) ctx.lineTo(x, Y(x));
+    ctx.lineTo(w, h); ctx.closePath(); ctx.fillStyle = RP.alpha(c.muted, 0.18); ctx.fill();
+    ctx.beginPath(); for (let x = 0; x <= w; x += 2) { if (x) ctx.lineTo(x, Y(x)); else ctx.moveTo(x, Y(x)); }
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5; ctx.stroke();
+    const th = (s1.ang * Math.PI) / 180, I = [Math.sin(th), Math.cos(th)];
+    const blocked = (x0, y0, dx, dy) => {
+      for (let t = 3; t < 420; t += 2) { const x = x0 + dx * t, y = y0 + dy * t; if (x < 0 || x > w || y < 0) return false; if (y > Y(x) + 0.5) return true; }
+      return false;
+    };
+    // mirror direction for a perfectly flat surface
+    const mx = w * 0.5;
+    ctx.setLineDash([6, 5]); ctx.strokeStyle = RP.alpha(c.muted, 0.9); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(mx, base); ctx.lineTo(mx + I[0] * 130, base - I[1] * 130); ctx.stroke(); ctx.setLineDash([]);
+    text(ctx, "mirror dir.", mx + I[0] * 130 + 4, base - I[1] * 130, c.muted);
+    const n = 15; let shadowed = 0, masked = 0;
+    for (let i = 0; i < n; i++) {
+      const x = w * 0.18 + (w * 0.64 * i) / (n - 1), y = Y(x);
+      const shad = blocked(x, y, -I[0], -I[1]);
+      ctx.strokeStyle = RP.alpha(c.warn, shad ? 0.4 : 0.9); ctx.lineWidth = 1.2; ctx.setLineDash(shad ? [3, 3] : []);
+      ctx.beginPath(); ctx.moveTo(x - I[0] * 170, y - I[1] * 170); ctx.lineTo(x, y); ctx.stroke(); ctx.setLineDash([]);
+      if (shad) { shadowed++; ctx.fillStyle = c.bad; ctx.beginPath(); ctx.arc(x, y, 3, 0, 7); ctx.fill(); continue; }
+      const dyd = -surf(x, w, r)[1]; let nx = dyd, ny = -1; const nl = Math.hypot(nx, ny); nx /= nl; ny /= nl;
+      const d = I[0] * nx + I[1] * ny; const rx = I[0] - 2 * d * nx, ry = I[1] - 2 * d * ny;
+      const m = ry >= 0 || blocked(x, y, rx, ry);
+      ctx.strokeStyle = RP.alpha(c.muted, 0.9); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + nx * 12, y + ny * 12); ctx.stroke();
+      ctx.strokeStyle = m ? RP.alpha(c.bad, 0.8) : c.frag; ctx.lineWidth = 1.6; ctx.setLineDash(m ? [4, 3] : []);
+      const RL = m ? 28 : 120; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + rx * RL, y + ry * RL); ctx.stroke(); ctx.setLineDash([]);
+      if (m) masked++;
+    }
+    text(ctx, "light", 12, h - 12, c.warn);
+    text(ctx, "reflected", 60, h - 12, c.frag);
+    text(ctx, "blocked (G)", 140, h - 12, c.bad);
+    $("mf-hud").textContent = `roughness ${r.toFixed(2)}  α = r² = ${(r * r).toFixed(3)}\nshadowed: ${shadowed}  masked: ${masked}`;
+  });
+
+  const lobe = RP.canvas("#lobe", (s) => {
+    const { ctx, w, h, c } = s; ctx.clearRect(0, 0, w, h);
+    const a = Math.max(0.0004, s1.rough * s1.rough);
+    const topH = h * 0.52;
+    const ox = w / 2, oy = topH - 14, R = Math.max(30, Math.min(w / 2 - 26, topH - 46));
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1;
+    for (const f of [0.5, 1]) { ctx.beginPath(); ctx.arc(ox, oy, R * f, Math.PI, 2 * Math.PI); ctx.stroke(); }
+    for (const deg of [-60, -30, 0, 30, 60]) { const t = (deg * Math.PI) / 180; ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + Math.sin(t) * R, oy - Math.cos(t) * R); ctx.stroke(); }
+    ctx.strokeStyle = c.muted; ctx.beginPath(); ctx.moveTo(ox - R - 10, oy); ctx.lineTo(ox + R + 10, oy); ctx.stroke();
+    const D0 = D_ggx(1, a);
+    ctx.beginPath();
+    for (let i = 0; i <= 180; i++) {
+      const t = ((-90 + i) * Math.PI) / 180; const rr = (R * D_ggx(Math.cos(t), a) * Math.cos(t)) / D0;
+      const px = ox + Math.sin(t) * rr, py = oy - Math.cos(t) * rr; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+    }
+    ctx.closePath(); ctx.fillStyle = RP.alpha(c.frag, 0.2); ctx.fill(); ctx.strokeStyle = c.frag; ctx.lineWidth = 2; ctx.stroke();
+    text(ctx, "GGX D(h)·cos θh, scaled to peak", 12, 40, c.ink);
+    text(ctx, `peak D = ${D0 < 100 ? D0.toFixed(2) : Math.round(D0)}`, 12, 56, c.muted);
+    text(ctx, "n", ox, oy - R - 6, c.muted, "center");
+    // Fresnel graph
+    const fx0 = 40, fx1 = w - 14, fy0 = topH + 34, fy1 = h - 26;
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1;
+    for (const v of [0, 0.25, 0.5, 0.75, 1]) { const y = fy1 - (fy1 - fy0) * v; ctx.beginPath(); ctx.moveTo(fx0, y); ctx.lineTo(fx1, y); ctx.stroke(); if (v % 0.5 === 0) text(ctx, v.toFixed(1), fx0 - 6, y + 4, c.muted, "right"); }
+    for (const d of [0, 30, 60, 90]) { const x = fx0 + ((fx1 - fx0) * d) / 90; text(ctx, d + "°", x, fy1 + 15, c.muted, "center"); }
+    text(ctx, `Schlick F(θ) for ${F0N[s1.name]}`, fx0, fy0 - 10, c.ink);
+    const f0 = s1.f0, same = f0[0] === f0[1] && f0[1] === f0[2];
+    const chans = same ? [[0, c.frag]] : [[0, "#e5484d"], [1, "#30a46c"], [2, "#3e63dd"]];
+    for (const [ch, col] of chans) {
+      ctx.beginPath();
+      for (let d = 0; d <= 90; d++) { const F = schlick(Math.cos((d * Math.PI) / 180), f0[ch]); const x = fx0 + ((fx1 - fx0) * d) / 90, y = fy1 - (fy1 - fy0) * F; if (d) ctx.lineTo(x, y); else ctx.moveTo(x, y); }
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+    }
+    const lx = fx0 + ((fx1 - fx0) * s1.ang) / 90;
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = c.warn; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(lx, fy0); ctx.lineTo(lx, fy1); ctx.stroke(); ctx.setLineDash([]);
+    const ct = Math.cos((s1.ang * Math.PI) / 180);
+    const Fa = f0.map((v) => schlick(ct, v));
+    // swatches
+    const sw = 18, sx = fx1 - 2 * sw - 70, sy = fy1 - (fy1 - fy0) * 0.72;
+    ctx.fillStyle = cssLin(f0); ctx.fillRect(sx, sy, sw, sw); ctx.strokeStyle = c.ink; ctx.strokeRect(sx, sy, sw, sw);
+    text(ctx, "F0", sx + sw / 2, sy + sw + 13, c.muted, "center");
+    ctx.fillStyle = cssLin(Fa); ctx.fillRect(sx + sw + 30, sy, sw, sw); ctx.strokeRect(sx + sw + 30, sy, sw, sw);
+    text(ctx, `F(${s1.ang}°)`, sx + sw * 1.5 + 30, sy + sw + 13, c.muted, "center");
+    text(ctx, `F(θ) = ${lum(Fa[0], Fa[1], Fa[2]).toFixed(3)}`, lx + 6, fy0 + 12, c.warn, lx > (fx0 + fx1) / 2 ? "right" : "left");
+  });
+
+  RP.slider("#r1", (v) => { s1.rough = v; mf.draw(); lobe.draw(); });
+  RP.slider("#ang1", (v) => { s1.ang = v; mf.draw(); lobe.draw(); }, { fmt: (v) => v + "°" });
+  RP.toggleGroup("#f0", (v) => { s1.name = v; s1.f0 = F0S[v]; lobe.draw(); });
+
+  /* ======================= STEP 2: material grid ======================= */
+  const BASES = { copper: [0.955, 0.638, 0.538], gold: [1.0, 0.766, 0.336], red: [0.7, 0.04, 0.03], white: [0.8, 0.8, 0.8] };
+  const s2 = { lp: [0.28, 0.22], base: BASES.copper, env: true };
+  const lightDir = () => { const v = [(s2.lp[0] * 2 - 1) * 1.6, -(s2.lp[1] * 2 - 1) * 1.6, 0.8]; return RP.v3.norm(v); };
+  const VS = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
+  const FS = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec2 uRes; uniform vec3 uL; uniform vec3 uBase; uniform vec3 uBg; uniform float uEnv;
+const float PI = 3.14159265;
+const float GRID = 5.0;
+float D_GGX(float NoH, float a){ float a2 = a*a; float d = NoH*NoH*(a2-1.0)+1.0; return a2/(PI*d*d); }
+float G1(float NoX, float k){ return NoX/(NoX*(1.0-k)+k); }
+vec3 envCol(vec3 d, float blur){
+  vec3 sky = vec3(0.35,0.5,0.85), hor = vec3(1.0,0.85,0.65), gnd = vec3(0.10,0.08,0.06);
+  float b = 0.04 + blur*0.8;
+  vec3 up = mix(hor, sky, smoothstep(0.0, 0.5+blur, d.y));
+  return mix(gnd, up, smoothstep(-b, b, d.y));
+}
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
+vec3 encode(vec3 c){ return mix(c*12.92, 1.055*pow(c, vec3(1.0/2.4))-0.055, step(vec3(0.0031308), c)); }
+void main(){
+  vec2 fc = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
+  float cell = min(uRes.x, uRes.y)/GRID;
+  vec2 org = (uRes - vec2(cell*GRID))*0.5;
+  vec2 g = (fc - org)/cell;
+  if (g.x < 0.0 || g.y < 0.0 || g.x >= GRID || g.y >= GRID) { gl_FragColor = vec4(uBg, 1.0); return; }
+  vec2 id = floor(g);
+  vec2 p = (fract(g) - 0.5)*2.0/0.88; p.y = -p.y;
+  float r2 = dot(p, p);
+  if (r2 > 1.0) { gl_FragColor = vec4(uBg, 1.0); return; }
+  float rough = mix(0.08, 1.0, id.x/(GRID-1.0));
+  float metal = id.y/(GRID-1.0);
+  vec3 N = vec3(p, sqrt(1.0 - r2)); vec3 V = vec3(0.0, 0.0, 1.0); vec3 L = uL; vec3 H = normalize(L + V);
+  float NoL = max(dot(N,L), 0.0), NoV = max(dot(N,V), 1e-4), NoH = max(dot(N,H), 0.0), VoH = max(dot(V,H), 0.0);
+  float a = rough*rough, k = (rough+1.0)*(rough+1.0)/8.0;
+  vec3 F0 = mix(vec3(0.04), uBase, metal);
+  vec3 F = F0 + (1.0 - F0)*pow(1.0 - VoH, 5.0);
+  vec3 spec = D_GGX(NoH, a)*G1(NoL, k)*G1(NoV, k)*F/(4.0*NoL*NoV + 1e-4);
+  vec3 kd = (1.0 - F)*(1.0 - metal);
+  vec3 col = (kd*uBase/PI + spec)*NoL*6.0;
+  if (uEnv > 0.5) {
+    vec3 R = reflect(-V, N);
+    vec3 Fr = F0 + (max(vec3(1.0 - rough), F0) - F0)*pow(1.0 - NoV, 5.0);
+    col += ((1.0 - Fr)*(1.0 - metal)*uBase*envCol(N, 1.0) + Fr*envCol(R, rough))*0.7;
+  }
+  gl_FragColor = vec4(encode(aces(col)), 1.0);
+}`;
+  // CPU mirror of the shader (fallback when WebGL is unavailable)
+  const sstep = (a, b, x) => RP.smoothstep(a, b, x);
+  function envJS(d, blur) {
+    const sky = [0.35, 0.5, 0.85], hor = [1.0, 0.85, 0.65], gnd = [0.1, 0.08, 0.06];
+    const b = 0.04 + blur * 0.8, t1 = sstep(0, 0.5 + blur, d[1]), t2 = sstep(-b, b, d[1]);
+    return [0, 1, 2].map((i) => lerp(gnd[i], lerp(hor[i], sky[i], t1), t2));
+  }
+  function shadeJS(N, rough, metal, base, L, env) {
+    const V = [0, 0, 1], H = RP.v3.norm([L[0], L[1], L[2] + 1]);
+    const NoL = Math.max(RP.v3.dot(N, L), 0), NoV = Math.max(N[2], 1e-4), NoH = Math.max(RP.v3.dot(N, H), 0), VoH = Math.max(H[2], 0);
+    const a = rough * rough, k = ((rough + 1) * (rough + 1)) / 8;
+    const D = D_ggx(NoH, a), G = G1(NoL, k) * G1(NoV, k);
+    const R = [2 * N[2] * N[0], 2 * N[2] * N[1], 2 * N[2] * N[2] - 1];
+    const eD = env ? envJS(N, 1) : null, eS = env ? envJS(R, rough) : null;
+    const out = [0, 0, 0];
+    for (let i = 0; i < 3; i++) {
+      const F0 = lerp(0.04, base[i], metal), F = schlick(VoH, F0);
+      const spec = (D * G * F) / (4 * NoL * NoV + 1e-4);
+      let col = ((1 - F) * (1 - metal) * base[i] / Math.PI + spec) * NoL * 6;
+      if (env) { const Fr = F0 + (Math.max(1 - rough, F0) - F0) * Math.pow(1 - NoV, 5); col += ((1 - Fr) * (1 - metal) * base[i] * eD[i] + Fr * eS[i]) * 0.7; }
+      out[i] = toSRGB(TM.aces(col));
+    }
+    return out;
+  }
+  let glState = null, useCPU = false, gridCPU = null;
+  function placeDot() { const d = $("ldot"); d.style.left = s2.lp[0] * 100 + "%"; d.style.top = s2.lp[1] * 100 + "%"; }
+  function drawGL(s) {
+    const gl = s.ctx;
+    if (!glState) {
+      try {
+        const prog = RP.glProgram(gl, VS, FS); const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        glState = { prog, buf, loc: gl.getAttribLocation(prog, "p"), u: {} };
+        for (const n of ["uRes", "uL", "uBase", "uBg", "uEnv"]) glState.u[n] = gl.getUniformLocation(prog, n);
+      } catch (e) { startCPU(); return; }
+    }
+    const { prog, buf, loc, u } = glState;
+    gl.viewport(0, 0, s.el.width, s.el.height); gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    const L = lightDir(), bg = RP.hex2rgb(s.c.surface2);
+    gl.uniform2f(u.uRes, s.el.width, s.el.height); gl.uniform3f(u.uL, L[0], L[1], L[2]);
+    gl.uniform3f(u.uBase, s2.base[0], s2.base[1], s2.base[2]); gl.uniform3f(u.uBg, bg[0], bg[1], bg[2]); gl.uniform1f(u.uEnv, s2.env ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  const off2 = document.createElement("canvas");
+  function drawCPU(s) {
+    const { ctx, w, h, c } = s; ctx.clearRect(0, 0, w, h);
+    const sc = 3, W = Math.max(1, Math.floor(w / sc)), H = Math.max(1, Math.floor(h / sc));
+    off2.width = W; off2.height = H; const octx = off2.getContext("2d"); const im = octx.createImageData(W, H);
+    const bg = RP.hex2rgb(c.surface2), L = lightDir(), cell = Math.min(W, H) / 5, ox = (W - cell * 5) / 2, oy = (H - cell * 5) / 2;
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const gx = (i + 0.5 - ox) / cell, gy = (j + 0.5 - oy) / cell; let col = bg;
+      if (gx >= 0 && gy >= 0 && gx < 5 && gy < 5) {
+        const ix = Math.floor(gx), iy = Math.floor(gy);
+        const px = ((gx - ix - 0.5) * 2) / 0.88, py = -((gy - iy - 0.5) * 2) / 0.88, r2 = px * px + py * py;
+        if (r2 <= 1) col = shadeJS([px, py, Math.sqrt(1 - r2)], lerp(0.08, 1, ix / 4), iy / 4, s2.base, L, s2.env);
+      }
+      const o = (j * W + i) * 4; im.data[o] = col[0] * 255; im.data[o + 1] = col[1] * 255; im.data[o + 2] = col[2] * 255; im.data[o + 3] = 255;
+    }
+    octx.putImageData(im, 0, 0); ctx.imageSmoothingEnabled = true; ctx.drawImage(off2, 0, 0, W * sc, H * sc);
+  }
+  function startCPU() {
+    if (useCPU) return; useCPU = true;
+    $("grid").hidden = true; $("grid2d").hidden = false;
+    gridCPU = RP.canvas("#grid2d", drawCPU);
+    if (!gridCPU.ctx) { RP.fallback($("grid2d")); return; }
+    $("grid-hud").textContent += "\n(WebGL unavailable: CPU render, low res)";
+  }
+  const grid = RP.canvas("#grid", drawGL, { webgl: 1 });
+  if (!grid.ctx) startCPU();
+  const redrawGrid = () => { placeDot(); if (useCPU) { if (gridCPU) gridCPU.draw(); } else grid.draw(); };
+  for (const el of [$("grid"), $("grid2d")]) {
+    const setL = (x, y) => { const r = el.getBoundingClientRect(); s2.lp = [clamp(x / r.width), clamp(y / r.height)]; redrawGrid(); };
+    RP.drag(el, { down: (x, y) => { setL(x, y); return true; }, move: setL });
+    el.addEventListener("keydown", (e) => {
+      const d = { ArrowLeft: [-0.04, 0], ArrowRight: [0.04, 0], ArrowUp: [0, -0.04], ArrowDown: [0, 0.04] }[e.key];
+      if (!d) return; e.preventDefault(); s2.lp = [clamp(s2.lp[0] + d[0]), clamp(s2.lp[1] + d[1])]; redrawGrid();
+    });
+  }
+  RP.toggleGroup("#base", (v) => { s2.base = BASES[v]; redrawGrid(); });
+  $("basepick").addEventListener("input", (e) => {
+    const c = RP.hex2rgb(e.target.value); s2.base = c.map(toLin);
+    document.querySelectorAll("#base .btn").forEach((b) => b.setAttribute("aria-pressed", "false")); redrawGrid();
+  });
+  RP.toggleGroup("#env", (v) => { s2.env = v === "on"; redrawGrid(); });
+  placeDot();
+
+  /* ======================= STEP 3: linear vs sRGB ======================= */
+  const s3 = { ang: -35, I: 1 };
+  const ALB = [0.9, 0.6, 0.35]; // sRGB-encoded albedo, as stored in a texture
+  const gm = RP.canvas("#gm", (s) => {
+    const { ctx, w, h, c, dpr } = s; ctx.clearRect(0, 0, w, h);
+    const pad = 16, sw = w - 2 * pad, compact = h < 420, sh = compact ? 20 : 28, steps = 16;
+    let y = 20;
+    const strip = (label, valFn, markT) => {
+      text(ctx, label, pad, y, c.ink); y += 6;
+      for (let k = 0; k < steps; k++) { const v = valFn(k / (steps - 1)); ctx.fillStyle = css8(v, v, v); ctx.fillRect(pad + (sw * k) / steps, y, sw / steps + 0.6, sh); }
+      ctx.strokeStyle = c.line; ctx.strokeRect(pad, y, sw, sh);
+      const mx = pad + sw * markT; ctx.fillStyle = c.accent; ctx.beginPath(); ctx.moveTo(mx, y + sh + 1); ctx.lineTo(mx - 5, y + sh + 9); ctx.lineTo(mx + 5, y + sh + 9); ctx.fill();
+      text(ctx, "50% of the light", mx, y + sh + 21, c.accent, markT > 0.6 ? "right" : "center");
+      y += sh + 34;
+    };
+    strip("A · evenly spaced sRGB codes (looks even to the eye)", (t) => t, toSRGB(0.5));
+    strip("B · evenly spaced linear light, then encoded", (t) => toSRGB(t), 0.5);
+    // patches
+    const ph = compact ? 34 : 52, gap = 10, pw = Math.min(150, (sw - 2 * gap) / 3);
+    const px0 = pad;
+    const pxs = [px0, px0 + pw + gap, px0 + 2 * (pw + gap)];
+    // stripes at device-pixel resolution
+    const dx = Math.round(pxs[0] * dpr), dy = Math.round(y * dpr), dw = Math.max(1, Math.round(pw * dpr)), dh = Math.max(1, Math.round(ph * dpr));
+    const im = ctx.createImageData(dw, dh);
+    for (let j = 0; j < dh; j++) { const v = j % 2 ? 255 : 0; for (let i = 0; i < dw; i++) { const o = (j * dw + i) * 4; im.data[o] = im.data[o + 1] = im.data[o + 2] = v; im.data[o + 3] = 255; } }
+    ctx.putImageData(im, dx, dy);
+    ctx.fillStyle = css8(128 / 255, 128 / 255, 128 / 255); ctx.fillRect(pxs[1], y, pw, ph);
+    ctx.fillStyle = css8(188 / 255, 188 / 255, 188 / 255); ctx.fillRect(pxs[2], y, pw, ph);
+    const labs = pw < 130 ? ["1px lines", "code 128", "code 188"] : ["1px black/white lines", "code 128 (0.50)", "code 188 (0.74)"];
+    labs.forEach((l, i) => text(ctx, l, pxs[i] + pw / 2, y + ph + 14, c.muted, "center"));
+    y += ph + 30;
+    // spheres
+    const top = y, avail = h - top - 22, D = Math.max(40, Math.min(avail, sw / 2 - 20));
+    const a = (s3.ang * Math.PI) / 180, L = RP.v3.norm([Math.sin(a), 0.35, Math.cos(a)]);
+    const alin = ALB.map(toLin);
+    const centers = [pad + sw * 0.25, pad + sw * 0.75];
+    const Dd = Math.max(2, Math.round(D * dpr));
+    for (let sidx = 0; sidx < 2; sidx++) {
+      const img = ctx.createImageData(Dd, Dd);
+      for (let j = 0; j < Dd; j++) for (let i = 0; i < Dd; i++) {
+        const nx = ((i + 0.5) / Dd) * 2 - 1, ny = -(((j + 0.5) / Dd) * 2 - 1), r2 = nx * nx + ny * ny; const o = (j * Dd + i) * 4;
+        if (r2 > 1) { img.data[o + 3] = 0; continue; }
+        const ndl = Math.max(0, nx * L[0] + ny * L[1] + Math.sqrt(1 - r2) * L[2]);
+        for (let ch = 0; ch < 3; ch++) {
+          const v = sidx === 0 ? clamp(ALB[ch] * s3.I * ndl) : toSRGB(alin[ch] * s3.I * ndl);
+          img.data[o + ch] = Math.round(v * 255);
+        }
+        img.data[o + 3] = 255;
+      }
+      ctx.putImageData(img, Math.round((centers[sidx] - D / 2) * dpr), Math.round(top * dpr));
+    }
+    const nar = sw < 520;
+    text(ctx, nar ? "sRGB math ✗" : "math on sRGB values (wrong)", centers[0], top + D + 15, c.bad, "center");
+    text(ctx, nar ? "linear → encode ✓" : "linear math → encode (right)", centers[1], top + D + 15, c.good, "center");
+  });
+  RP.slider("#gl-ang", (v) => { s3.ang = v; gm.draw(); }, { fmt: (v) => v + "°" });
+  RP.slider("#gl-int", (v) => { s3.I = v; gm.draw(); });
+
+  /* ======================= STEP 4: HDR & tonemapping ======================= */
+  function hdrScene(W, H) {
+    const d = new Float32Array(W * H * 3), asp = W / H, hor = 0.64, sun = [0.7, 0.5], sunR = 0.04;
+    const lamps = [[0.1, 30], [0.27, 20], [0.44, 12]], groundY = 0.88, bulbY = 0.6;
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const u = (i + 0.5) / W, v = (j + 0.5) / H; let r, g, b;
+      if (v < hor) {
+        const t = v / hor, t2 = t * t;
+        r = lerp(0.08, 1.9, t2); g = lerp(0.14, 1.0, t2); b = lerp(0.5, 0.5, t);
+        const dd = Math.hypot((u - sun[0]) * asp, v - sun[1]);
+        if (dd < sunR) { r = 50; g = 42; b = 30; } else { const e = Math.exp(-(dd - sunR) * 16); r += 6 * e; g += 3.5 * e; b += 1.4 * e; }
+      } else {
+        const t = (v - hor) / (1 - hor), dx = (u - sun[0]) * asp, refl = Math.exp(-dx * dx * 300) * (1 - t) * (1 - t);
+        r = 0.04 * (1 - t) + 0.012 + 2.5 * refl; g = 0.035 * (1 - t) + 0.012 + 1.6 * refl; b = 0.04 * (1 - t) + 0.018 + 0.8 * refl;
+        for (const [lx, I] of lamps) { const ex = (u - lx) * asp, ey = (v - groundY) * 2.5; const e = I * 0.012 * Math.exp(-(ex * ex + ey * ey) * 50); r += e; g += e * 0.75; b += e * 0.4; }
+      }
+      // house silhouette with lit windows
+      if (u > 0.8 && u < 0.97 && v > 0.47 && v < hor + 0.02) {
+        r = g = b = 0.02;
+        const wx = (u - 0.8) / 0.17, wy = (v - 0.47) / 0.19;
+        if (((wx > 0.15 && wx < 0.35) || (wx > 0.6 && wx < 0.8)) && wy > 0.3 && wy < 0.6) { r = 3; g = 2; b = 0.9; }
+      }
+      // roof
+      if (u > 0.78 && u < 0.99 && v <= 0.47 && v > 0.47 - (0.105 - Math.abs(u - 0.885)) * 0.9) { r = g = b = 0.02; }
+      for (const [lx, I] of lamps) {
+        if (Math.abs(u - lx) < 0.004 && v > bulbY && v < groundY) { r = g = b = 0.015; }
+        const dd = Math.hypot((u - lx) * asp, v - bulbY);
+        if (dd < 0.016) { r = I; g = I * 0.75; b = I * 0.4; } else { const e = I * 0.05 * Math.exp(-dd * 45); r += e; g += e * 0.75; b += e * 0.4; }
+      }
+      const o = (j * W + i) * 3; d[o] = r; d[o + 1] = g; d[o + 2] = b;
+    }
+    return { w: W, h: H, d };
+  }
+  const HDR = hdrScene(240, 150);
+  const s4 = { ev: 0, op: "aces", hover: null };
+  const offH = document.createElement("canvas"); offH.width = HDR.w; offH.height = HDR.h;
+  let hdrRect = null;
+  const hdrimg = RP.canvas("#hdrimg", (s) => {
+    const { ctx, w, h } = s; ctx.clearRect(0, 0, w, h);
+    const octx = offH.getContext("2d"), im = octx.createImageData(HDR.w, HDR.h), e = Math.pow(2, s4.ev), f = TM[s4.op];
+    let clipped = 0; const N = HDR.w * HDR.h;
+    for (let k = 0; k < N; k++) {
+      let cl = false;
+      for (let ch = 0; ch < 3; ch++) { const x = HDR.d[k * 3 + ch] * e; if (x >= 1) cl = true; im.data[k * 4 + ch] = Math.round(toSRGB(f(x)) * 255); }
+      im.data[k * 4 + 3] = 255; if (cl) clipped++;
+    }
+    octx.putImageData(im, 0, 0);
+    hdrRect = fit(HDR.w, HDR.h, 0, 0, w, h);
+    ctx.imageSmoothingEnabled = true; ctx.drawImage(offH, hdrRect.x, hdrRect.y, hdrRect.w, hdrRect.h);
+    let msg = `exposure ×${e < 1 ? e.toFixed(3) : e.toFixed(2)}  (${s4.op})\n≥1.0 before tonemap: ${((100 * clipped) / N).toFixed(0)}% of pixels`;
+    if (s4.op === "clamp") msg += "  ← all clipped to white";
+    if (s4.hover) msg += `\nHDR here: ${s4.hover.map((v) => (v >= 10 ? v.toFixed(0) : v.toFixed(2))).join(", ")}`;
+    $("hdr-hud").textContent = msg;
+  });
+  RP.drag($("hdrimg"), {
+    down: () => false,
+    hover: (x, y) => {
+      if (!hdrRect) return;
+      const i = Math.floor(((x - hdrRect.x) / hdrRect.w) * HDR.w), j = Math.floor(((y - hdrRect.y) / hdrRect.h) * HDR.h);
+      s4.hover = i >= 0 && j >= 0 && i < HDR.w && j < HDR.h ? [0, 1, 2].map((ch) => HDR.d[(j * HDR.w + i) * 3 + ch]) : null;
+      hdrimg.draw();
+    },
+  });
+  $("hdrimg").addEventListener("pointerleave", () => { s4.hover = null; hdrimg.draw(); });
+  const tmc = RP.canvas("#tmc", (s) => {
+    const { ctx, w, h, c } = s; ctx.clearRect(0, 0, w, h);
+    const x0 = 40, x1 = w - 16, y0 = 60, y1 = h - 34, XM = 10;
+    const X = (v) => x0 + ((x1 - x0) * v) / XM, Yp = (v) => y1 - (y1 - y0) * v;
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1;
+    for (let v = 0; v <= XM; v += 1) { ctx.beginPath(); ctx.moveTo(X(v), y0); ctx.lineTo(X(v), y1); ctx.stroke(); if (v % 2 === 0) text(ctx, String(v), X(v), y1 + 15, c.muted, "center"); }
+    for (const v of [0, 0.5, 1]) { ctx.beginPath(); ctx.moveTo(x0, Yp(v)); ctx.lineTo(x1, Yp(v)); ctx.stroke(); text(ctx, v.toFixed(1), x0 - 6, Yp(v) + 4, c.muted, "right"); }
+    text(ctx, "exposed scene value →", x1, y1 + 28, c.muted, "right");
+    text(ctx, "display value (before sRGB encode)", 12, y0 - 26, c.muted);
+    for (const op of ["clamp", "reinhard", "aces"]) {
+      const sel = op === s4.op; ctx.beginPath();
+      for (let k = 0; k <= 200; k++) { const v = (k / 200) * XM; const yy = Yp(TM[op](v)); if (k) ctx.lineTo(X(v), yy); else ctx.moveTo(X(v), yy); }
+      ctx.strokeStyle = sel ? c.frag : RP.alpha(c.muted, 0.6); ctx.lineWidth = sel ? 3 : 1.2; ctx.setLineDash(sel ? [] : [4, 4]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    text(ctx, "clamp", X(1.1), Yp(1) - 6, c.muted);
+    text(ctx, "Reinhard", X(7), Yp(TM.reinhard(7)) + 16, c.muted, "center");
+    text(ctx, "ACES fit", X(9.5), Yp(1) - 6, c.muted, "right");
+    const e = Math.pow(2, s4.ev);
+    const marks = [["sky", 1.2], ["window", 3], ["lamp", 20], ["sun", 50]];
+    marks.forEach(([n, v], i) => {
+      const xv = v * e, f = TM[s4.op];
+      if (xv <= XM) {
+        const yy = Yp(f(xv)); ctx.fillStyle = c.warn; ctx.beginPath(); ctx.arc(X(xv), yy, 4, 0, 7); ctx.fill();
+        text(ctx, n, X(xv) + 6, yy + 14 + (i % 2) * 12, c.warn);
+      } else {
+        const yy = Yp(0.15 + i * 0.1); ctx.fillStyle = c.warn;
+        ctx.beginPath(); ctx.moveTo(x1, yy); ctx.lineTo(x1 - 8, yy - 5); ctx.lineTo(x1 - 8, yy + 5); ctx.fill();
+        text(ctx, `${n} → ${xv.toFixed(xv < 100 ? 1 : 0)}`, x1 - 12, yy + 4, c.warn, "right");
+      }
+    });
+  });
+  RP.slider("#ev", (v) => { s4.ev = v; hdrimg.draw(); tmc.draw(); }, { fmt: (v) => (v > 0 ? "+" : "") + v.toFixed(1) });
+  RP.toggleGroup("#op", (v) => { s4.op = v; hdrimg.draw(); tmc.draw(); });
+
+  /* ======================= STEP 5: bloom ======================= */
+  function nightScene(W, H) {
+    const d = new Float32Array(W * H * 3), asp = W / H, r = rng(5);
+    const bld = []; let x = 0; while (x < 1) { const bw = 0.05 + r() * 0.07; bld.push([x, x + bw, 0.35 + r() * 0.35, r()]); x += bw + 0.005; }
+    const lamps = [0.12, 0.4, 0.86];
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const u = (i + 0.5) / W, v = (j + 0.5) / H;
+      let R = 0.01 + 0.03 * v, G = 0.012 + 0.03 * v, B = 0.04 + 0.05 * v;
+      const md = Math.hypot((u - 0.18) * asp, v - 0.17);
+      if (md < 0.06) { R = 4; G = 4; B = 3.6; } else { const e = 0.3 * Math.exp(-(md - 0.06) * 20); R += e; G += e; B += e; }
+      for (const [a, b, top, seed] of bld) {
+        if (u >= a && u < b && v > 1 - top && v < 0.86) {
+          R = 0.012; G = 0.012; B = 0.02;
+          const cx = Math.floor((u - a) / 0.018), cy = Math.floor((v - (1 - top)) / 0.04), fx = ((u - a) / 0.018) % 1, fy = ((v - (1 - top)) / 0.04) % 1;
+          const hsh = Math.sin(cx * 12.9898 + cy * 78.233 + seed * 43.1) * 43758.5453;
+          if (hsh - Math.floor(hsh) > 0.62 && fx > 0.25 && fx < 0.75 && fy > 0.3 && fy < 0.7) { R = 1.6; G = 1.2; B = 0.6; }
+        }
+      }
+      // neon ring sign
+      const rd = Math.abs(Math.hypot((u - 0.62) * asp, v - 0.42) - 0.11);
+      if (rd < 0.014) { R = 9; G = 1.2; B = 6; }
+      if (v >= 0.86) { R = 0.01; G = 0.01; B = 0.015; }
+      for (const lx of lamps) {
+        if (Math.abs(u - lx) < 0.004 && v > 0.62 && v < 0.88) { R = G = B = 0.01; }
+        const dd = Math.hypot((u - lx) * asp, v - 0.61);
+        if (dd < 0.018) { R = 22; G = 16; B = 8; }
+        if (v > 0.86) { const ex = (u - lx) * asp; const e = 0.25 * Math.exp(-ex * ex * 80); R += e * 1.2; G += e; B += e * 0.5; }
+      }
+      const o = (j * W + i) * 3; d[o] = R; d[o + 1] = G; d[o + 2] = B;
+    }
+    return { w: W, h: H, d };
+  }
+  const NIGHT = nightScene(192, 108);
+  const img = (w, h) => ({ w, h, d: new Float32Array(w * h * 3) });
+  function brightPass(src, T) {
+    const o = img(src.w, src.h);
+    for (let k = 0; k < src.w * src.h; k++) {
+      const r = src.d[k * 3], g = src.d[k * 3 + 1], b = src.d[k * 3 + 2], L = lum(r, g, b), f = Math.max(0, L - T) / Math.max(L, 1e-4);
+      o.d[k * 3] = r * f; o.d[k * 3 + 1] = g * f; o.d[k * 3 + 2] = b * f;
+    }
+    return o;
+  }
+  function down(src) {
+    const W = Math.max(1, Math.ceil(src.w / 2)), H = Math.max(1, Math.ceil(src.h / 2)), o = img(W, H);
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) for (let ch = 0; ch < 3; ch++) {
+      let s = 0, n = 0;
+      for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) { const x = i * 2 + dx, y = j * 2 + dy; if (x < src.w && y < src.h) { s += src.d[(y * src.w + x) * 3 + ch]; n++; } }
+      o.d[(j * W + i) * 3 + ch] = s / n;
+    }
+    return o;
+  }
+  function blur(src) {
+    const K = [1, 4, 6, 4, 1].map((v) => v / 16), { w, h } = src, t = img(w, h), o = img(w, h);
+    const ix = (x, m) => Math.min(m - 1, Math.max(0, x));
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) for (let ch = 0; ch < 3; ch++) { let s = 0; for (let k = -2; k <= 2; k++) s += K[k + 2] * src.d[(j * w + ix(i + k, w)) * 3 + ch]; t.d[(j * w + i) * 3 + ch] = s; }
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) for (let ch = 0; ch < 3; ch++) { let s = 0; for (let k = -2; k <= 2; k++) s += K[k + 2] * t.d[(ix(j + k, h) * w + i) * 3 + ch]; o.d[(j * w + i) * 3 + ch] = s; }
+    return o;
+  }
+  function up(src, W, H) {
+    const o = img(W, H);
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const fx = clamp(((i + 0.5) / W) * src.w - 0.5, 0, src.w - 1), fy = clamp(((j + 0.5) / H) * src.h - 0.5, 0, src.h - 1);
+      const x0 = Math.floor(fx), y0 = Math.floor(fy), x1 = Math.min(src.w - 1, x0 + 1), y1 = Math.min(src.h - 1, y0 + 1), tx = fx - x0, ty = fy - y0;
+      for (let ch = 0; ch < 3; ch++) {
+        const a = src.d[(y0 * src.w + x0) * 3 + ch], b = src.d[(y0 * src.w + x1) * 3 + ch], c2 = src.d[(y1 * src.w + x0) * 3 + ch], d2 = src.d[(y1 * src.w + x1) * 3 + ch];
+        o.d[(j * W + i) * 3 + ch] = lerp(lerp(a, b, tx), lerp(c2, d2, tx), ty);
+      }
+    }
+    return o;
+  }
+  const s5 = { T: 1.5, I: 0.6, L: 5 };
+  const offs = []; const offCanvas = (k) => offs[k] || (offs[k] = document.createElement("canvas"));
+  function toCanvas(k, im, map) {
+    const cv = offCanvas(k); cv.width = im.w; cv.height = im.h; const cx = cv.getContext("2d"), id = cx.createImageData(im.w, im.h);
+    for (let p = 0; p < im.w * im.h; p++) { for (let ch = 0; ch < 3; ch++) id.data[p * 4 + ch] = Math.round(toSRGB(map(im.d[p * 3 + ch])) * 255); id.data[p * 4 + 3] = 255; }
+    cx.putImageData(id, 0, 0); return cv;
+  }
+  const bl = RP.canvas("#bl", (s) => {
+    const { ctx, w, h, c } = s; ctx.clearRect(0, 0, w, h);
+    const bp = brightPass(NIGHT, s5.T), mips = []; let cur = bp;
+    for (let i = 0; i < s5.L; i++) { cur = blur(down(cur)); mips.push(cur); }
+    let acc = mips[mips.length - 1];
+    for (let i = mips.length - 2; i >= 0; i--) { const u2 = up(acc, mips[i].w, mips[i].h); for (let k = 0; k < u2.d.length; k++) u2.d[k] += mips[i].d[k]; acc = u2; }
+    const bloom = up(acc, NIGHT.w, NIGHT.h); for (let k = 0; k < bloom.d.length; k++) bloom.d[k] /= mips.length;
+    const comp = img(NIGHT.w, NIGHT.h); for (let k = 0; k < comp.d.length; k++) comp.d[k] = NIGHT.d[k] + s5.I * bloom.d[k];
+    // layout
+    const pad = 10, narrow = w < 560, topH = h * (narrow ? 0.5 : 0.58);
+    const pw = (w - 3 * pad) / 2;
+    const panes = [["without bloom", NIGHT], ["with bloom", comp]];
+    panes.forEach(([lab, im], i) => {
+      const r = fit(im.w, im.h, pad + i * (pw + pad), pad + 16, pw, topH - pad - 16);
+      ctx.imageSmoothingEnabled = true; ctx.drawImage(toCanvas(i, im, TM.aces), r.x, r.y, r.w, r.h);
+      text(ctx, lab, r.x, pad + 10, c.ink);
+    });
+    const perRow = narrow ? 4 : mips.length + 2;
+    const tw = (w - (perRow + 1) * pad) / perRow, short = tw < 120;
+    const thumbs = [[short ? "bright" : "bright-pass", bp]].concat(mips.map((m, i) => [short ? `1/${2 << i}` : `1/${2 << i} (${m.w}×${m.h})`, m])).concat([[short ? "sum" : "upsampled sum", bloom]]);
+    const rows = Math.ceil(thumbs.length / perRow), th = (h - topH - pad) / rows - 18;
+    thumbs.forEach(([lab, im], i) => {
+      const col = i % perRow, row = Math.floor(i / perRow), bx = pad + col * (tw + pad), by = topH + row * (th + 18) + 14;
+      const r = fit(im.w, im.h, bx, by, tw, th);
+      ctx.imageSmoothingEnabled = false; ctx.drawImage(toCanvas(2 + i, im, (x) => TM.reinhard(x * 2)), r.x, r.y, r.w, r.h);
+      ctx.strokeStyle = c.line; ctx.strokeRect(r.x, r.y, r.w, r.h);
+      text(ctx, lab, bx, by - 4, c.muted);
+      if (i < thumbs.length - 1 && !narrow) text(ctx, "→", bx + tw + pad / 2, by + th / 2, c.muted, "center", "middle");
+    });
+  });
+  RP.slider("#bth", (v) => { s5.T = v; bl.draw(); });
+  RP.slider("#bint", (v) => { s5.I = v; bl.draw(); });
+  RP.slider("#blev", (v) => { s5.L = v; bl.draw(); });
+
+  /* ======================= STEP 6: anti-aliasing ======================= */
+  const s6 = { mode: "none", moving: false, clampH: true, paused: RP.reduced, t: 0, frame: 0, hist: null, key: "" };
+  const BG = [0.012, 0.016, 0.03];
+  const SAMPLES = [[0.375, 0.125], [0.875, 0.375], [0.125, 0.625], [0.625, 0.875]]; // standard 4x rotated-grid pattern
+  function halton(i, b) { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; }
+  function makeTri(t, cols, rows) {
+    const cx = cols / 2 + (s6.moving ? Math.sin(t * 1.3) * cols * 0.22 : 0), cy = rows / 2 - 1, R = Math.min(rows * 0.42, cols * 0.4);
+    const th = t * 0.25, rad = [1, 0.78, 0.92];
+    const v = [0, 1, 2].map((k) => [cx + Math.cos(th + (k * 2 * Math.PI) / 3) * R * rad[k], cy + Math.sin(th + (k * 2 * Math.PI) / 3) * R * rad[k]]);
+    const sgn = (v[1][0] - v[0][0]) * (v[2][1] - v[0][1]) - (v[1][1] - v[0][1]) * (v[2][0] - v[0][0]);
+    return { v, s: sgn >= 0 ? 1 : -1, cx, R };
+  }
+  function inside(T, x, y) {
+    const [a, b, c] = T.v, e = (p, q) => ((q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0])) * T.s;
+    return e(a, b) >= 0 && e(b, c) >= 0 && e(c, a) >= 0;
+  }
+  function shadeTri(T, x, y) { const t = clamp((x - (T.cx - T.R)) / (2 * T.R)); return [lerp(1.0, 0.1, t), lerp(0.35, 0.6, t), lerp(0.05, 0.95, t)]; }
+  const sampleAt = (T, x, y) => (inside(T, x, y) ? shadeTri(T, x, y) : BG);
+  function fxaaPass(src, cols, rows) {
+    const out = new Float32Array(src.length), L = new Float32Array(cols * rows);
+    for (let k = 0; k < cols * rows; k++) L[k] = Math.sqrt(toSRGB(lum(src[k * 3], src[k * 3 + 1], src[k * 3 + 2])));
+    const id = (i, j) => Math.min(rows - 1, Math.max(0, j)) * cols + Math.min(cols - 1, Math.max(0, i));
+    for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+      const k = id(i, j), lc = L[k], n = L[id(i, j - 1)], so = L[id(i, j + 1)], e = L[id(i + 1, j)], we = L[id(i - 1, j)];
+      const mx = Math.max(lc, n, so, e, we), mn = Math.min(lc, n, so, e, we), range = mx - mn;
+      if (range < Math.max(0.03, 0.125 * mx)) { for (let ch = 0; ch < 3; ch++) out[k * 3 + ch] = src[k * 3 + ch]; continue; }
+      const horiz = Math.abs(n + so - 2 * lc) >= Math.abs(e + we - 2 * lc);
+      const g1 = horiz ? Math.abs(n - lc) : Math.abs(we - lc), g2 = horiz ? Math.abs(so - lc) : Math.abs(e - lc);
+      const nk = horiz ? (g1 >= g2 ? id(i, j - 1) : id(i, j + 1)) : (g1 >= g2 ? id(i - 1, j) : id(i + 1, j));
+      let b = clamp(Math.abs((n + so + e + we) / 4 - lc) / range); b = b * b * (3 - 2 * b); b = b * b * 0.75;
+      for (let ch = 0; ch < 3; ch++) out[k * 3 + ch] = lerp(src[k * 3 + ch], src[nk * 3 + ch], Math.max(b, 0.25));
+    }
+    return out;
+  }
+  const AAINFO = {
+    none: "1 sample at the pixel center\nshading: 1× per pixel",
+    ssaa: "4 samples, each shaded\nshading: 4× per pixel",
+    msaa: "4 coverage/depth samples\nshading: 1× per pixel (at center)",
+    fxaa: "1 sample + post-process pass\nblends across detected edges",
+    taa: "1 jittered sample per frame\nblended into history (10%/frame)",
+  };
+  const aa = RP.canvas("#aa", (s) => {
+    const { ctx, w, h, c } = s; ctx.clearRect(0, 0, w, h);
+    const cols = w < 520 ? 20 : 32, cell = w / cols, rows = Math.max(8, Math.floor(h / cell)), oy = (h - rows * cell) / 2;
+    const T = makeTri(s6.t, cols, rows), N = cols * rows; let px = new Float32Array(N * 3);
+    const cov = new Uint8Array(N), mode = s6.mode;
+    for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+      const k = j * cols + i; let col;
+      if (mode === "ssaa" || mode === "msaa") {
+        let n = 0; const acc = [0, 0, 0];
+        for (const [sx, sy] of SAMPLES) { const inS = inside(T, i + sx, j + sy); if (inS) n++; if (mode === "ssaa") { const v = inS ? shadeTri(T, i + sx, j + sy) : BG; acc[0] += v[0] / 4; acc[1] += v[1] / 4; acc[2] += v[2] / 4; } }
+        cov[k] = n;
+        if (mode === "ssaa") col = acc; else { const sc = shadeTri(T, i + 0.5, j + 0.5), f = n / 4; col = [0, 1, 2].map((ch) => lerp(BG[ch], sc[ch], f)); }
+      } else if (mode === "taa") {
+        const hi = (s6.frame % 8) + 1; col = sampleAt(T, i + halton(hi, 2), j + halton(hi, 3));
+      } else col = sampleAt(T, i + 0.5, j + 0.5);
+      px[k * 3] = col[0]; px[k * 3 + 1] = col[1]; px[k * 3 + 2] = col[2];
+    }
+    if (mode === "fxaa") px = fxaaPass(px, cols, rows);
+    if (mode === "taa") {
+      const key = cols + "x" + rows;
+      if (!s6.hist || s6.key !== key) { s6.hist = px.slice(); s6.key = key; }
+      const H = s6.hist;
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        const k = j * cols + i;
+        for (let ch = 0; ch < 3; ch++) {
+          let hv = H[k * 3 + ch];
+          if (s6.clampH) {
+            let mn = 1e9, mx = -1e9;
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const ii = Math.min(cols - 1, Math.max(0, i + dx)), jj = Math.min(rows - 1, Math.max(0, j + dy)); const v = px[(jj * cols + ii) * 3 + ch]; if (v < mn) mn = v; if (v > mx) mx = v; }
+            hv = clamp(hv, mn, mx);
+          }
+          H[k * 3 + ch] = lerp(hv, px[k * 3 + ch], 0.1);
+        }
+      }
+      px = H;
+    }
+    for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+      const k = (j * cols + i) * 3; ctx.fillStyle = css8(toSRGB(px[k]), toSRGB(px[k + 1]), toSRGB(px[k + 2]));
+      ctx.fillRect(i * cell, oy + j * cell, cell + 0.5, cell + 0.5);
+    }
+    if (cell >= 8) {
+      ctx.strokeStyle = RP.alpha(c.muted, 0.35); ctx.lineWidth = 1; ctx.beginPath();
+      for (let i = 0; i <= cols; i++) { ctx.moveTo(i * cell, oy); ctx.lineTo(i * cell, oy + rows * cell); }
+      for (let j = 0; j <= rows; j++) { ctx.moveTo(0, oy + j * cell); ctx.lineTo(w, oy + j * cell); }
+      ctx.stroke();
+    }
+    if ((mode === "ssaa" || mode === "msaa") && cell >= 14) {
+      const rr = Math.max(1.8, cell * 0.08);
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        const k = j * cols + i; if (cov[k] === 0 || cov[k] === 4) continue;
+        for (const [sx, sy] of SAMPLES) {
+          const x = (i + sx) * cell, y = oy + (j + sy) * cell, inS = inside(T, i + sx, j + sy);
+          ctx.beginPath(); ctx.arc(x, y, rr, 0, 7);
+          if (inS) { ctx.fillStyle = c.surface; ctx.fill(); } ctx.strokeStyle = c.ink; ctx.lineWidth = 1; ctx.stroke();
+        }
+        if (mode === "msaa") { const x = (i + 0.5) * cell, y = oy + (j + 0.5) * cell, q = rr * 1.4; ctx.strokeStyle = c.warn; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x - q, y - q); ctx.lineTo(x + q, y + q); ctx.moveTo(x + q, y - q); ctx.lineTo(x - q, y + q); ctx.stroke(); }
+      }
+    }
+    ctx.strokeStyle = RP.alpha(c.accent, 0.9); ctx.lineWidth = 1.2; ctx.beginPath();
+    T.v.forEach((p, i) => { const X = p[0] * cell, Y = oy + p[1] * cell; if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
+    ctx.closePath(); ctx.stroke();
+    let hud = `${mode.toUpperCase()}: ${AAINFO[mode]}`;
+    if (w >= 520) {
+      hud += "\nthin blue line = true edge";
+      if (mode === "msaa") hud += "\n● covered sample  ✕ shading point";
+      if (mode === "ssaa") hud += "\n● covered sample (each one shaded)";
+    }
+    if (mode === "taa" && !aaAnim.running) hud += "\npress Play to accumulate frames";
+    $("aa-hud").textContent = hud;
+  });
+  const aaAnim = RP.loop($("aa"), (t, dt) => { if (!s6.paused) s6.t += dt; s6.frame++; aa.draw(); });
+  const playBtn = $("aa-play");
+  const syncPlay = () => { playBtn.textContent = s6.paused || !aaAnim.running ? "Play" : "Pause"; playBtn.setAttribute("aria-pressed", String(!s6.paused && aaAnim.running)); };
+  playBtn.addEventListener("click", () => {
+    if (!aaAnim.running) { s6.paused = false; aaAnim.start(); } else s6.paused = !s6.paused;
+    syncPlay(); aa.draw();
+  });
+  syncPlay();
+  const moveBtn = $("aa-move"), clampBtn = $("aa-clamp");
+  moveBtn.addEventListener("click", () => { s6.moving = !s6.moving; moveBtn.setAttribute("aria-pressed", String(s6.moving)); aa.draw(); });
+  clampBtn.addEventListener("click", () => { s6.clampH = !s6.clampH; clampBtn.setAttribute("aria-pressed", String(s6.clampH)); aa.draw(); });
+  RP.toggleGroup("#aam", (v) => { s6.mode = v; s6.hist = null; aa.draw(); });
+})();
+</script>
+</body>
+</html>

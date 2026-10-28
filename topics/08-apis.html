@@ -1,0 +1,1032 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Modern Graphics APIs · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .note { font-size: 0.92rem; color: var(--muted); min-height: 3.2em; }
+  .note b { color: var(--ink); }
+  .viz .note { padding: 12px 16px; border-top: 1px solid var(--line); }
+  .control select { width: 100%; }
+  .note.stat { white-space: pre-line; font: 400 0.8rem/1.5 var(--font-mono); color: var(--ink); min-height: 0; }
+  .note.stat.bad { color: var(--bad); }
+  .code-tabs { display: grid; gap: 10px; }
+  .code-tabs pre { max-height: 460px; }
+  #conv { height: 460px; }
+  @media (max-width: 720px) { #conv { height: 560px; } }
+  .step p code, .callout code { overflow-wrap: anywhere; }
+  .tbl-api td:first-child { font-weight: 600; }
+  .tbl-api code { font-size: 0.8em; white-space: nowrap; }
+  .lin-wrap { display: grid; gap: 14px; }
+</style>
+</head>
+<body data-topic="08">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 08 · APIs</p>
+    <h1>Modern Graphics APIs</h1>
+    <p class="lede">Everything so far happened on the GPU. This chapter is about the conversation that gets it there: how your program describes work, and why Vulkan, Direct3D 12, Metal and WebGPU ask you to say so much more than OpenGL ever did.</p>
+    <div class="stage-band"><span class="on app">Application</span><span class="vtx">Vertex</span><span class="ras">Rasterize</span><span class="frag">Fragment</span><span class="out">Output</span></div>
+  </section>
+
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>Where the APIs came from, from IRIS GL to WebGPU</li>
+    <li>Why OpenGL's hidden global state makes the driver work hard, and why that causes stutters</li>
+    <li>The explicit object model: device, queue, command buffers, pipeline state objects, bind groups</li>
+    <li>How frames in flight, fences and barriers keep the CPU and GPU busy without corrupting data</li>
+    <li>The convention traps between APIs: depth range, Vulkan's y-flip, reverse-Z</li>
+    <li>What a minimal "hello triangle" looks like in OpenGL, WebGPU and Vulkan</li>
+  </ul></aside>
+
+  <section class="lin-wrap" aria-labelledby="lin-h">
+    <h2 id="lin-h">A short family tree</h2>
+    <p>A graphics API is a contract between your program and the GPU driver. The first popular one, <b>IRIS GL</b>, ran on Silicon Graphics workstations in the 1980s. SGI opened it up as <b>OpenGL</b> in 1992. Microsoft answered with <b>Direct3D</b> in 1996. Phones got <b>OpenGL ES</b> and browsers got <b>WebGL</b>. Then, in the 2010s, a new family appeared. AMD's <b>Mantle</b> (2013) showed that a thinner, more explicit API could cut CPU cost dramatically, and it was followed by <b>Metal</b> (2014), <b>Direct3D 12</b> (2015), <b>Vulkan</b> (2016, built on Mantle's foundations) and finally <b>WebGPU</b> for the web.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="lin" class="short" aria-label="Timeline of graphics APIs from IRIS GL in the 1980s to WebGPU in 2023. Click a dot to read about that API."></canvas></div>
+      <div class="controls">
+        <div class="btn-row"><button class="btn" id="lin-prev" type="button">◀ Previous</button><button class="btn" id="lin-next" type="button">Next ▶</button></div>
+        <div class="legend"><span><i style="background:var(--accent)"></i>SGI / Khronos</span><span><i style="background:var(--good)"></i>Microsoft</span><span><i style="background:var(--ink)"></i>Apple</span><span><i style="background:var(--muted)"></i>AMD / W3C</span></div>
+      </div>
+      <p class="note" id="lin-note" aria-live="polite"></p>
+    </figure>
+  </section>
+
+  <section class="step" id="objects">
+    <h2><span class="step-no">STEP 1</span>A global state machine vs explicit objects</h2>
+    <p>OpenGL is a <b>state machine</b>. There is one hidden "current state" per context: the current program, the bound vertex array, which texture sits on each texture unit, whether blending is on, and hundreds more switches. Every call like <code>glBindTexture</code> or <code>glEnable</code> just flips one of those switches. Nothing is checked until you call <code>glDrawArrays</code>. Only then does the driver look at the whole state and work out what the GPU must actually do.</p>
+    <p>This is easy to start with, and it is the root of OpenGL's problems. State "leaks" from one draw into the next. The driver must re-check everything on every draw. And because the final GPU configuration is only known at draw time, the driver sometimes has to compile a shader variant right then, in the middle of your frame.</p>
+    <p>Explicit APIs replace the global state with <b>objects you build up front</b>. You create a <i>device</i>, bake a <i>pipeline</i> containing shaders and fixed-function settings, group resources into a <i>bind group</i>, record commands into a <i>command buffer</i>, and submit it to a <i>queue</i>. Each object is validated once, when you create it.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="glstate" aria-label="OpenGL call log above a table of the context's current state. Stepping highlights which state field each call changes; a draw call reads all fields."></canvas><span class="pane-label">OpenGL context</span></div>
+        <div class="viz-stage"><canvas id="objgraph" aria-label="Object graph of an explicit API, WebGPU naming: device, queue, shader module, bind group layout, buffers and textures, render pipeline, bind group, command encoder and command buffer. Click a node to read about it."></canvas><span class="pane-label">Explicit (WebGPU names)</span></div>
+      </div>
+      <div class="controls">
+        <div class="btn-row"><button class="btn primary" id="gl-step" type="button">Step: next GL call ▶</button><button class="btn" id="gl-reset" type="button">Reset</button></div>
+        <div class="control"><label for="obj-sel">Explicit object</label><select id="obj-sel"></select></div>
+      </div>
+      <p class="note" id="gl-note" aria-live="polite"></p>
+      <p class="note" id="obj-note" aria-live="polite"></p>
+      <figcaption><b>Try it:</b> step through the OpenGL calls and watch the last draw inherit blending it never asked for. Then click nodes on the right (or use the menu) to see how each explicit object is named in Vulkan, Direct3D 12 and Metal.</figcaption>
+    </figure>
+    <div class="callout"><strong>Key idea.</strong> OpenGL asks "what is the state right now?" at every draw. Explicit APIs ask "which pre-built object do you want?" The work of checking and compiling moves from draw time to load time, where you control it.</div>
+  </section>
+
+  <section class="step" id="timeline">
+    <h2><span class="step-no">STEP 2</span>Where the CPU time goes</h2>
+    <p>Picture a scene with 3,000 draw calls. In OpenGL, each draw costs the driver a few microseconds of validation, hazard tracking (does this texture still have pending writes?) and translation into GPU commands. At 3 µs per draw that is 9 ms, more than half of a 16.6 ms frame, and it all happens on the one thread that owns the GL context. Some drivers move part of it to a hidden worker thread, but you can't control that.</p>
+    <p>Worse is the <b>hitch</b>. When a draw uses a state combination the driver hasn't seen before, it may need to compile or patch a shader on the spot. That can take tens of milliseconds, and the player sees a stutter.</p>
+    <p>In an explicit API, recording a draw is cheap because the pipeline was already validated and compiled. Better still, <b>command buffers can be recorded on many threads at once</b>, and the main thread just submits them to the queue.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="tl" class="tall" aria-label="Swim-lane timeline of five frames: CPU thread lanes on top, the GPU lane at the bottom. In OpenGL mode one thread does app work plus driver overhead, with an optional shader-compile hitch. In explicit mode several worker threads record commands in parallel."></canvas></div>
+      <p class="note stat" id="tl-hud"></p>
+      <div class="controls">
+        <div class="btn-row" id="tl-mode"><button class="btn" data-value="gl" aria-pressed="true">OpenGL-style</button><button class="btn" data-value="ex">Explicit</button></div>
+        <div class="btn-row" id="tl-hitch"><button class="btn" data-value="on" aria-pressed="true">New material appears</button><button class="btn" data-value="off">No new material</button></div>
+        <div class="control"><label for="tl-threads">Recording threads <output for="tl-threads"></output></label><input type="range" id="tl-threads" min="1" max="8" value="4"></div>
+        <div class="control"><label for="tl-draws">Draw calls <output for="tl-draws"></output></label><input type="range" id="tl-draws" min="500" max="6000" step="500" value="3000"></div>
+        <button class="btn" id="tl-play" type="button">Pause</button>
+        <div class="legend"><span><i style="background:var(--accent)"></i>app logic</span><span><i style="background:var(--warn)"></i>driver work</span><span><i style="background:var(--bad)"></i>shader compile</span><span><i style="background:var(--good)"></i>command recording</span><span><i style="background:var(--out)"></i>GPU executes</span></div>
+      </div>
+      <figcaption><b>Try it:</b> compare the two modes at 3,000 draws, then push the draw count up. In OpenGL mode the frame time follows the CPU; in explicit mode, add threads until the GPU becomes the limit. The costs are illustrative round numbers, not measurements of a specific driver.</figcaption>
+    </figure>
+    <div class="callout warn"><strong>Key idea.</strong> Explicit APIs don't make the GPU faster. They make the CPU side cheaper and parallel, and they let you compile pipelines at load time. Forget to pre-build a pipeline and an explicit API will hitch too; the difference is that it is now <i>your</i> choice when that cost is paid.</div>
+  </section>
+
+  <section class="step" id="inflight">
+    <h2><span class="step-no">STEP 3</span>Frames in flight, fences and semaphores</h2>
+    <p>The CPU and GPU are two separate processors. If the CPU waited for the GPU to finish every frame before starting the next, each would sit idle half the time. So engines keep several <b>frames in flight</b>: while the GPU draws frame N, the CPU is already recording frame N+1.</p>
+    <p>That raises a safety question. Each frame writes into its own copy of per-frame data (a uniform buffer of camera matrices, a command buffer). Before the CPU reuses frame slot 0, it must know the GPU has finished reading it. That is what a <b>fence</b> is for: the GPU signals it when a submission completes, and the CPU waits on it (<code>vkWaitForFences</code>, <code>ID3D12Fence</code>). A <b>semaphore</b> is the GPU-to-GPU version: "don't start rendering until the swapchain image is acquired", "don't present until rendering is done". The CPU never waits on those.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="fif" class="tall" aria-label="Scrolling timeline in slow motion. Top lane shows the CPU recording frames, bottom lane the GPU executing them, colored by frame slot. Hatched segments are CPU waits on a fence; diamonds mark fence signals. A row of slot boxes shows which slots are busy."></canvas></div>
+      <p class="note stat" id="fif-hud"></p>
+      <div class="controls">
+        <div class="control"><label for="fif-n">Frames in flight <output for="fif-n"></output></label><input type="range" id="fif-n" min="1" max="3" value="2"></div>
+        <div class="control"><label for="fif-cpu">CPU ms / frame <output for="fif-cpu"></output></label><input type="range" id="fif-cpu" min="2" max="16" value="6"></div>
+        <div class="control"><label for="fif-gpu">GPU ms / frame <output for="fif-gpu"></output></label><input type="range" id="fif-gpu" min="2" max="16" value="10"></div>
+        <button class="btn" id="fif-play" type="button">Pause</button>
+      </div>
+      <figcaption><b>Try it:</b> with 1 frame in flight, CPU and GPU take turns and the frame rate drops. With 2, both stay busy. With 3 and a GPU-bound load, throughput doesn't improve but latency (time from reading input to finished image) grows by a whole frame.</figcaption>
+    </figure>
+    <div class="callout"><strong>Key idea.</strong> More frames in flight hide CPU/GPU hiccups and keep both processors busy, but each extra frame adds latency. Two is the common default; three smooths out spiky workloads.</div>
+  </section>
+
+  <section class="step" id="barriers">
+    <h2><span class="step-no">STEP 4</span>Barriers and layout transitions</h2>
+    <p>GPUs run thousands of threads, out of order, through layers of caches. A texture you just rendered may still be half in flight, sitting in a cache, or stored in a compressed layout that only the render-target hardware understands. OpenGL's driver tracks all this for you. Vulkan and Direct3D 12 make you say it with a <b>barrier</b>: "wait until writes from the color-output stage finish, make them visible, then convert the image into a layout the texture sampler can read".</p>
+    <p>In Vulkan, a barrier recorded with <code>vkCmdPipelineBarrier</code> also performs an <b>image layout transition</b>, such as <code>COLOR_ATTACHMENT_OPTIMAL</code> → <code>SHADER_READ_ONLY_OPTIMAL</code>, and later the swapchain image goes to <code>PRESENT_SRC_KHR</code>. Direct3D 12 does the same with <code>ResourceBarrier</code> and states like <code>D3D12_RESOURCE_STATE_RENDER_TARGET</code> → <code>D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE</code> → <code>D3D12_RESOURCE_STATE_PRESENT</code>. Metal and WebGPU track most hazards automatically.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="bar" class="tall" aria-label="Left grid: an offscreen texture filled tile by tile in scattered order by pass A. Right grid: the swapchain image produced by pass B sampling that texture row by row. Below, a timeline of passes, barriers and the current layout of each image. Without the barrier, pass B reads unwritten tiles, shown as red stale tiles."></canvas></div>
+      <p class="note stat" id="bar-hud"></p>
+      <div class="controls">
+        <div class="btn-row" id="bar-mode"><button class="btn" data-value="on" aria-pressed="true">With barrier</button><button class="btn" data-value="off">Forget the barrier</button></div>
+        <div class="control"><label for="bar-t">Time <output for="bar-t"></output></label><input type="range" id="bar-t" min="0" max="100" value="0"></div>
+        <button class="btn" id="bar-play" type="button">Pause</button>
+      </div>
+      <figcaption><b>Try it:</b> play it with the barrier, then choose "Forget the barrier". Pass B now starts while pass A is still writing (the GPU had no reason to wait), so it samples tiles that don't exist yet. Drag the time slider to scrub.</figcaption>
+    </figure>
+    <div class="callout warn"><strong>Key idea.</strong> A barrier is a promise about ordering and visibility: "these writes happen before those reads." Leave one out and the bug is timing-dependent. It may look fine on your GPU and flicker on another. The validation layers (Vulkan) and debug layer (D3D12) catch many of these.</div>
+  </section>
+
+  <section class="step" id="conventions">
+    <h2><span class="step-no">STEP 5</span>Same scene, different conventions</h2>
+    <p>This tutorial uses OpenGL's clip space, where NDC depth runs from −1 at the near plane to +1 at the far plane. Direct3D, Vulkan, Metal and WebGPU all use <b>z ∈ [0, 1]</b> instead, so their projection matrices are slightly different. Vulkan has a second trap: its <b>NDC y axis points down</b>, so y = −1 is the top of the image. Feed Vulkan an OpenGL projection matrix unchanged and the picture comes out upside down, with the closest part of the scene clipped away. The usual fixes are to flip the sign of the y scale in the projection matrix, or to use a negative viewport height (allowed since Vulkan 1.1).</p>
+    <p>Many modern engines also use <b>reverse-Z</b>: map the near plane to 1 and the far plane to 0. Floating-point numbers are densest near zero, and that density cancels out the way perspective crowds distant depths together. The result is far less z-fighting in the distance.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="conv" aria-label="Three panels: OpenGL, Direct3D 12/Metal/WebGPU, and Vulkan. Each shows a point in the framebuffer with that API's +y axis direction, and a depth bar showing the point's NDC depth in that API's range, with tick marks for distances 0.2 to 100."></canvas></div>
+      <div class="controls">
+        <div class="control"><label for="cv-y">Point height <output for="cv-y"></output></label><input type="range" id="cv-y" min="-0.9" max="0.9" step="0.05" value="0.5"></div>
+        <div class="control"><label for="cv-d">Distance from camera <output for="cv-d"></output></label><input type="range" id="cv-d" min="0" max="1" step="0.005" value="0.3"></div>
+        <div class="btn-row" id="cv-mat"><button class="btn" data-value="native" aria-pressed="true">Native matrix per API</button><button class="btn" data-value="gl">OpenGL matrix everywhere</button></div>
+        <div class="btn-row" id="cv-rz"><button class="btn" data-value="std" aria-pressed="true">Standard depth</button><button class="btn" data-value="rev">Reverse-Z</button></div>
+      </div>
+      <figcaption><b>Try it:</b> slide the point close to the camera, then switch to "OpenGL matrix everywhere". The Vulkan image flips, and in all the [0, 1] APIs points nearer than about twice the near plane get clipped. Toggle reverse-Z and watch the distance ticks move toward 0. (Near plane 0.1, far plane 100, 60° field of view.)</figcaption>
+    </figure>
+    <div class="table-wrap">
+      <table class="tbl-api">
+        <thead><tr><th>Concept</th><th>Vulkan</th><th>Direct3D 12</th><th>Metal</th><th>WebGPU</th><th>OpenGL</th></tr></thead>
+        <tbody>
+          <tr><td>GPU handle</td><td><code>VkDevice</code></td><td><code>ID3D12Device</code></td><td><code>MTLDevice</code></td><td><code>GPUDevice</code></td><td>the context</td></tr>
+          <tr><td>Submission queue</td><td><code>VkQueue</code></td><td><code>ID3D12CommandQueue</code></td><td><code>MTLCommandQueue</code></td><td><code>GPUQueue</code></td><td>implicit</td></tr>
+          <tr><td>Recorded commands</td><td><code>VkCommandBuffer</code></td><td><code>ID3D12GraphicsCommandList</code></td><td><code>MTLCommandBuffer</code></td><td><code>GPUCommandBuffer</code></td><td>implicit</td></tr>
+          <tr><td>Render pass recorder</td><td><code>vkCmdBeginRendering</code> / <code>vkCmdBeginRenderPass</code></td><td><code>OMSetRenderTargets</code> / <code>BeginRenderPass</code></td><td><code>MTLRenderCommandEncoder</code></td><td><code>GPURenderPassEncoder</code></td><td><code>glBindFramebuffer</code></td></tr>
+          <tr><td>Baked pipeline</td><td><code>VkPipeline</code></td><td><code>ID3D12PipelineState</code></td><td><code>MTLRenderPipelineState</code></td><td><code>GPURenderPipeline</code></td><td>program + loose state</td></tr>
+          <tr><td>Binding layout</td><td><code>VkDescriptorSetLayout</code> + <code>VkPipelineLayout</code></td><td>root signature</td><td>argument buffer layout</td><td><code>GPUBindGroupLayout</code></td><td>binding indices</td></tr>
+          <tr><td>Bound resources</td><td><code>VkDescriptorSet</code></td><td>descriptor heap + tables</td><td>argument buffer</td><td><code>GPUBindGroup</code></td><td><code>glBindTexture</code> etc.</td></tr>
+          <tr><td>Draw</td><td><code>vkCmdDraw</code></td><td><code>DrawInstanced</code></td><td><code>drawPrimitives</code></td><td><code>draw()</code></td><td><code>glDrawArrays</code></td></tr>
+          <tr><td>Barrier</td><td><code>vkCmdPipelineBarrier</code></td><td><code>ResourceBarrier</code></td><td>mostly automatic</td><td>automatic</td><td>automatic</td></tr>
+          <tr><td>CPU waits on GPU</td><td><code>VkFence</code></td><td><code>ID3D12Fence</code></td><td><code>MTLSharedEvent</code> / completion handler</td><td><code>onSubmittedWorkDone()</code></td><td><code>glFenceSync</code></td></tr>
+          <tr><td>GPU waits on GPU</td><td><code>VkSemaphore</code></td><td><code>ID3D12Fence</code> (queue <code>Wait</code>)</td><td><code>MTLEvent</code></td><td>implicit</td><td>implicit</td></tr>
+          <tr><td>Shading language</td><td>GLSL/HLSL → SPIR-V</td><td>HLSL → DXIL</td><td>MSL</td><td>WGSL</td><td>GLSL</td></tr>
+          <tr><td>NDC depth</td><td>[0, 1], y down</td><td>[0, 1]</td><td>[0, 1]</td><td>[0, 1]</td><td>[−1, 1]</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>About shading languages: <b>GLSL</b> belongs to OpenGL, <b>HLSL</b> to Direct3D, <b>MSL</b> (C++-based) to Metal and <b>WGSL</b> to WebGPU. Vulkan's driver doesn't read source text at all. It consumes <b>SPIR-V</b>, a binary intermediate representation that you compile offline from GLSL or HLSL. Tools such as SPIRV-Cross and Tint translate between these, which is how one engine's shaders reach every API.</p>
+    <div class="callout"><strong>Key idea.</strong> The concepts are the same across all four explicit APIs; only the names change. Learn one well and the others become a translation exercise. Just watch the depth range and the y direction.</div>
+  </section>
+
+  <section class="step" id="code">
+    <h2><span class="step-no">STEP 6</span>Hello triangle, three ways</h2>
+    <p>Here is the smallest program that puts one orange triangle on screen. In OpenGL, most of the setup is loose state that only comes together at <code>glDrawArrays</code>. In WebGPU, the setup builds one pipeline object, and each frame records a command buffer and submits it. The Vulkan version shows only the call sequence, because the full program, with every create-info struct filled in, runs to several hundred lines. Error handling and window creation are left out everywhere.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="codeviz" class="short" aria-label="Left: the rendered triangle in normalized device coordinates. Right: bars counting lines of one-time setup, per-frame work and shader code in the selected listing."></canvas></div>
+      <div class="controls">
+        <div class="btn-row" id="code-tabs"><button class="btn" data-value="gl" aria-pressed="true">OpenGL 3.3 (C)</button><button class="btn" data-value="wgsl">WebGPU · WGSL</button><button class="btn" data-value="js">WebGPU · JS</button><button class="btn" data-value="vk">Vulkan outline</button></div>
+      </div>
+      <figcaption><b>Try it:</b> switch listings and compare how much code runs once against how much runs every frame. All of them draw the same triangle, with vertices (0, 0.5), (−0.5, −0.5) and (0.5, −0.5) in NDC.</figcaption>
+    </figure>
+    <div class="code-tabs">
+<pre id="code-gl"><code>// ---- once at startup ----
+const char *vsSrc = "#version 330 core\n"
+  "layout(location = 0) in vec2 aPos;\n"
+  "void main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+const char *fsSrc = "#version 330 core\n"
+  "out vec4 color;\n"
+  "void main() { color = vec4(1.0, 0.5, 0.2, 1.0); }\n";
+GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+glShaderSource(vs, 1, &amp;vsSrc, NULL);
+glCompileShader(vs);
+GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+glShaderSource(fs, 1, &amp;fsSrc, NULL);
+glCompileShader(fs);
+GLuint prog = glCreateProgram();
+glAttachShader(prog, vs);
+glAttachShader(prog, fs);
+glLinkProgram(prog);
+float verts[] = { 0.0f, 0.5f,  -0.5f, -0.5f,  0.5f, -0.5f };
+GLuint vao, vbo;
+glGenVertexArrays(1, &amp;vao);
+glBindVertexArray(vao);
+glGenBuffers(1, &amp;vbo);
+glBindBuffer(GL_ARRAY_BUFFER, vbo);
+glBufferData(GL_ARRAY_BUFFER, sizeof verts, verts, GL_STATIC_DRAW);
+glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
+glEnableVertexAttribArray(0);
+
+// ---- every frame ----
+glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+glClear(GL_COLOR_BUFFER_BIT);
+glUseProgram(prog);              // sets global state...
+glBindVertexArray(vao);          // ...more global state...
+glDrawArrays(GL_TRIANGLES, 0, 3); // ...validated here, at draw time
+glfwSwapBuffers(window);         // platform call (GLFW here)</code></pre>
+<pre id="code-wgsl" hidden><code>// Shader module source (WGSL), shared by both entry points
+@vertex
+fn vs_main(@builtin(vertex_index) i : u32) -&gt; @builtin(position) vec4f {
+  var pos = array&lt;vec2f, 3&gt;(
+    vec2f( 0.0,  0.5),
+    vec2f(-0.5, -0.5),
+    vec2f( 0.5, -0.5));
+  return vec4f(pos[i], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -&gt; @location(0) vec4f {
+  return vec4f(1.0, 0.5, 0.2, 1.0);
+}</code></pre>
+<pre id="code-js" hidden><code>// ---- once at startup ----
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice();
+const context = canvas.getContext("webgpu");
+const format = navigator.gpu.getPreferredCanvasFormat();
+context.configure({ device, format });
+const module = device.createShaderModule({ code: wgslSource });
+const pipeline = device.createRenderPipeline({   // the baked PSO
+  layout: "auto",
+  vertex: { module, entryPoint: "vs_main" },
+  fragment: { module, entryPoint: "fs_main", targets: [{ format }] },
+  primitive: { topology: "triangle-list" },
+});
+
+// ---- every frame ----
+function frame() {
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: context.getCurrentTexture().createView(),
+      clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1 },
+      loadOp: "clear", storeOp: "store",
+    }],
+  });
+  pass.setPipeline(pipeline);
+  pass.draw(3);                                  // GPURenderPassEncoder.draw
+  pass.end();
+  device.queue.submit([encoder.finish()]);       // command buffer -&gt; queue
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);</code></pre>
+<pre id="code-vk" hidden><code>// ---- once at startup ----
+vkCreateInstance(&amp;instanceInfo, NULL, &amp;instance);
+vkEnumeratePhysicalDevices(instance, &amp;gpuCount, gpus);  // pick a GPU
+vkCreateDevice(gpu, &amp;deviceInfo, NULL, &amp;device);
+vkGetDeviceQueue(device, graphicsFamily, 0, &amp;queue);
+vkCreateSwapchainKHR(device, &amp;swapchainInfo, NULL, &amp;swapchain);
+vkGetSwapchainImagesKHR(device, swapchain, &amp;imageCount, images);
+vkCreateImageView(device, &amp;viewInfo, NULL, &amp;views[i]); // per image
+vkCreateShaderModule(device, &amp;spirvInfo, NULL, &amp;shaderModule); // SPIR-V
+vkCreatePipelineLayout(device, &amp;layoutInfo, NULL, &amp;pipelineLayout);
+vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &amp;psoInfo, NULL, &amp;pipeline);
+vkCreateCommandPool(device, &amp;poolInfo, NULL, &amp;pool);
+vkAllocateCommandBuffers(device, &amp;allocInfo, &amp;cmd);
+vkCreateSemaphore(device, &amp;semInfo, NULL, &amp;imageReady);
+vkCreateSemaphore(device, &amp;semInfo, NULL, &amp;renderDone);
+vkCreateFence(device, &amp;fenceInfo, NULL, &amp;inFlight);  // one set per frame in flight
+
+// ---- every frame ----
+vkWaitForFences(device, 1, &amp;inFlight, VK_TRUE, UINT64_MAX);
+vkResetFences(device, 1, &amp;inFlight);
+vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageReady, VK_NULL_HANDLE, &amp;img);
+vkResetCommandBuffer(cmd, 0);
+vkBeginCommandBuffer(cmd, &amp;beginInfo);
+vkCmdPipelineBarrier(cmd, /* ... */);       // UNDEFINED -&gt; COLOR_ATTACHMENT_OPTIMAL
+vkCmdBeginRendering(cmd, &amp;renderingInfo);   // Vulkan 1.3 dynamic rendering; clear here
+vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+vkCmdSetViewport(cmd, 0, 1, &amp;viewport);
+vkCmdSetScissor(cmd, 0, 1, &amp;scissor);
+vkCmdDraw(cmd, 3, 1, 0, 0);                 // 3 vertices, 1 instance
+vkCmdEndRendering(cmd);
+vkCmdPipelineBarrier(cmd, /* ... */);       // COLOR_ATTACHMENT_OPTIMAL -&gt; PRESENT_SRC_KHR
+vkEndCommandBuffer(cmd);
+vkQueueSubmit(queue, 1, &amp;submitInfo, inFlight);  // waits imageReady, signals renderDone
+vkQueuePresentKHR(queue, &amp;presentInfo);          // waits renderDone</code></pre>
+    </div>
+    <p>The Direct3D 12 and Metal versions have the same shape. You create a device and queue, build a pipeline state, record into an <code>ID3D12GraphicsCommandList</code> (ending in <code>DrawInstanced(3, 1, 0, 0)</code>) or an <code>MTLRenderCommandEncoder</code> (ending in <code>drawPrimitives:vertexStart:vertexCount:</code>), then execute or commit it on the queue.</p>
+    <div class="callout"><strong>Key idea.</strong> Explicit code is longer, but the extra lines are mostly one-time setup. The per-frame part, "record, submit, present", stays short, predictable and parallel-friendly.</div>
+  </section>
+
+  <section class="step" id="recap"><h2><span class="step-no">RECAP</span>What to remember</h2><ul>
+    <li><b>Lineage:</b> IRIS GL → OpenGL (1992) → OpenGL ES / WebGL; Direct3D alongside; Mantle (2013) inspired Metal (2014), Direct3D 12 (2015) and Vulkan (2016); WebGPU shipped in Chrome in 2023.</li>
+    <li><b>OpenGL</b> is a global state machine. The driver validates, tracks hazards and sometimes compiles shaders at draw time, which costs CPU and causes hitches.</li>
+    <li><b>Explicit APIs</b> use objects: device and queue, pipeline state objects baked ahead of time, descriptor sets / root signatures / argument buffers / bind groups for resources, and command buffers recorded on many threads.</li>
+    <li><b>Synchronization is your job:</b> fences let the CPU wait for the GPU, semaphores order GPU work, and barriers (with layout transitions) order writes before reads.</li>
+    <li><b>Frames in flight</b> (usually 2–3) keep CPU and GPU both busy; each extra frame adds latency.</li>
+    <li><b>Conventions:</b> depth is [0, 1] in D3D/Vulkan/Metal/WebGPU and [−1, 1] in OpenGL; Vulkan's NDC y points down; reverse-Z improves depth precision.</li>
+    <li><b>Shaders:</b> GLSL, HLSL, MSL and WGSL are source languages; SPIR-V is the intermediate form Vulkan consumes.</li>
+  </ul>
+  <p>Further reading: the <a href="https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html">Vulkan specification</a>, <a href="https://www.w3.org/TR/webgpu/">WebGPU</a> and <a href="https://www.w3.org/TR/WGSL/">WGSL</a> at the W3C, and Microsoft's <a href="https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-programming-guide">Direct3D 12 programming guide</a>.</p>
+  </section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const MONO = "'JetBrains Mono', ui-monospace, Consolas, monospace";
+  const SANS = "'IBM Plex Sans', system-ui, sans-serif";
+  function font(ctx, px, weight, mono) { ctx.font = (weight || 400) + " " + px + "px " + (mono ? MONO : SANS); }
+  function rr(ctx, x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, w / 2, h / 2));
+    ctx.beginPath(); ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+  function line(ctx, x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+  // shrink font until text fits; returns px used
+  function fit(ctx, text, maxW, px, weight, mono, minPx) {
+    let p = px; font(ctx, p, weight, mono);
+    while (p > (minPx || 8) && ctx.measureText(text).width > maxW) { p -= 0.5; font(ctx, p, weight, mono); }
+    return p;
+  }
+  function playButton(btn, anim) {
+    const sync = () => { btn.textContent = anim.running ? "Pause" : "Play"; btn.setAttribute("aria-label", anim.running ? "Pause animation" : "Play animation"); };
+    btn.addEventListener("click", () => { if (anim.running) anim.stop(); else anim.start(); sync(); });
+    sync();
+    return sync;
+  }
+  function hatch(ctx, x, y, w, h, color) {
+    ctx.save(); ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    for (let k = -h; k < w; k += 6) line(ctx, x + k, y + h, x + k + h, y);
+    ctx.restore();
+  }
+
+  /* ================= Lineage timeline ================= */
+  const LIN = [
+    { yr: "1980s", name: "IRIS GL", fam: 0, note: "Silicon Graphics' proprietary API for its IRIS workstations. Its ideas (immediate-mode calls, a matrix stack, one global state) carried straight into OpenGL." },
+    { yr: "1992", name: "OpenGL 1.0", fam: 0, note: "An open, cross-vendor standard derived from IRIS GL. Fixed-function at first; GLSL shaders arrived with OpenGL 2.0 (2004). Run by the ARB, then by the Khronos Group from 2006." },
+    { yr: "1996", name: "Direct3D", fam: 1, note: "Microsoft's 3D API, first shipped with DirectX 2.0. It evolved through Direct3D 9, 10 (immutable state objects) and 11 (2009), still widely used today." },
+    { yr: "2003", name: "OpenGL ES", fam: 0, note: "A slimmed-down OpenGL for phones and embedded devices. ES 2.0 (2007) dropped fixed function for shaders and powered the smartphone era." },
+    { yr: "2011", name: "WebGL", fam: 0, note: "OpenGL ES 2.0 exposed to JavaScript through the HTML canvas. WebGL 2 (2017) corresponds to OpenGL ES 3.0." },
+    { yr: "2013", name: "Mantle", fam: 3, note: "AMD's low-overhead API, designed with game developers. It proved the explicit model on PC, and AMD later contributed it to Khronos as a starting point for Vulkan." },
+    { yr: "2014", name: "Metal", fam: 2, note: "Apple's explicit API, first on iOS 8 and then on macOS. Shaders are written in the Metal Shading Language (MSL), which is based on C++." },
+    { yr: "2015", name: "Direct3D 12", fam: 1, note: "Shipped with Windows 10: command lists, pipeline state objects, root signatures, descriptor heaps and explicit resource barriers." },
+    { yr: "2016", name: "Vulkan 1.0", fam: 0, note: "Khronos' cross-platform explicit API (Windows, Linux, Android and more), built on Mantle's foundations. Drivers consume shaders as SPIR-V bytecode." },
+    { yr: "2023", name: "WebGPU", fam: 3, note: "A W3C web API that runs on top of Vulkan, Direct3D 12 or Metal, with its own shading language, WGSL. Shipped in Chrome 113 in 2023; Safari and Firefox followed in 2025." },
+  ];
+  let linSel = 8;
+  const linNote = document.getElementById("lin-note");
+  function linGeom(s) {
+    const pad = 34, n = LIN.length;
+    return LIN.map((it, i) => {
+      const x = pad + i * (s.w - 2 * pad) / (n - 1);
+      const lvl = i % 4, up = lvl < 2, len = (lvl % 2 === 0 ? 0.34 : 0.17) * s.h;
+      return { x, up, ty: up ? s.h / 2 - len : s.h / 2 + len };
+    });
+  }
+  const lin = RP.canvas("#lin", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const fam = [c.accent, c.good, c.ink, c.muted];
+    const y0 = h / 2, G = linGeom(s);
+    ctx.strokeStyle = c.line; ctx.lineWidth = 2; line(ctx, 14, y0, w - 14, y0);
+    ctx.textAlign = "center";
+    LIN.forEach((it, i) => {
+      const g = G[i], sel = i === linSel;
+      ctx.strokeStyle = sel ? fam[it.fam] : c.line; ctx.lineWidth = sel ? 2 : 1;
+      line(ctx, g.x, y0, g.x, g.ty);
+      ctx.fillStyle = fam[it.fam];
+      ctx.beginPath(); ctx.arc(g.x, y0, sel ? 7 : 5, 0, Math.PI * 2); ctx.fill();
+      if (sel) { ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke(); }
+      const nameY = g.up ? g.ty - 4 : g.ty + 12, yrY = g.up ? g.ty - 17 : g.ty + 25;
+      fit(ctx, it.name, 80, w < 500 ? 10 : 12, sel ? 700 : 600, false);
+      ctx.fillStyle = sel ? c.ink : c.muted; ctx.fillText(it.name, g.x, nameY);
+      font(ctx, 10, 400, true); ctx.fillStyle = c.muted; ctx.fillText(it.yr, g.x, yrY);
+    });
+    ctx.textAlign = "left";
+  });
+  function linUpdate() {
+    const it = LIN[linSel];
+    linNote.innerHTML = "<b>" + it.name + " (" + it.yr + ").</b> ";
+    linNote.appendChild(document.createTextNode(it.note));
+    lin.draw();
+  }
+  RP.drag(lin.el, {
+    down(x) {
+      const G = linGeom(lin); let best = 0, bd = 1e9;
+      G.forEach((g, i) => { const d = Math.abs(g.x - x); if (d < bd) { bd = d; best = i; } });
+      linSel = best; linUpdate(); return false;
+    },
+  });
+  document.getElementById("lin-prev").addEventListener("click", () => { linSel = (linSel + LIN.length - 1) % LIN.length; linUpdate(); });
+  document.getElementById("lin-next").addEventListener("click", () => { linSel = (linSel + 1) % LIN.length; linUpdate(); });
+  linUpdate();
+
+  /* ================= Step 1a: OpenGL state machine ================= */
+  const FIELDS = [
+    ["fbo", "GL_DRAW_FRAMEBUFFER_BINDING"], ["prog", "GL_CURRENT_PROGRAM"], ["vao", "GL_VERTEX_ARRAY_BINDING"],
+    ["unit", "GL_ACTIVE_TEXTURE"], ["tex0", "unit 0: GL_TEXTURE_2D"], ["depth", "GL_DEPTH_TEST"], ["blend", "GL_BLEND"],
+  ];
+  const GL_INIT = { fbo: "0", prog: "0", vao: "0", unit: "GL_TEXTURE0", tex0: "0", depth: "disabled", blend: "disabled" };
+  const GL_CALLS = [
+    { call: "glBindFramebuffer(GL_FRAMEBUFFER, 0)", set: { fbo: "0 (window)" }, note: "Selects the default framebuffer (the window) as the render target. Nothing is drawn yet; one field of global state changed." },
+    { call: "glUseProgram(litProgram)", set: { prog: "litProgram" }, note: "Makes litProgram the current shader program. Every later draw uses it until someone changes it." },
+    { call: "glBindVertexArray(crateVAO)", set: { vao: "crateVAO" }, note: "Binds the vertex array object that describes where the crate's vertex data lives." },
+    { call: "glActiveTexture(GL_TEXTURE0)", set: { unit: "GL_TEXTURE0" }, note: "Chooses which texture unit the next glBindTexture affects. A hidden selector for other hidden state: this is classic OpenGL." },
+    { call: "glBindTexture(GL_TEXTURE_2D, crateTex)", set: { tex0: "crateTex" }, note: "Binds crateTex to the active unit (0)." },
+    { call: "glEnable(GL_DEPTH_TEST)", set: { depth: "enabled" }, note: "Turns on the z-buffer test (chapter 02)." },
+    { call: "glEnable(GL_BLEND)", set: { blend: "enabled" }, note: "Turns on alpha blending, because the crate has a semi-transparent decal." },
+    { call: "glDrawArrays(GL_TRIANGLES, 0, 36)", draw: true, note: "<b>Draw.</b> Only now does the driver read every field, validate the combination, check for pending writes to crateTex, maybe patch a shader variant, then emit GPU commands." },
+    { call: "glBindTexture(GL_TEXTURE_2D, grassTex)", set: { tex0: "grassTex" }, note: "Swaps the texture for the grass. Everything else stays exactly as the previous draw left it." },
+    { call: "glDrawArrays(GL_TRIANGLES, 36, 6)", draw: true, leak: true, note: "<b>Draw, with a leak.</b> Nobody disabled GL_BLEND, so the opaque grass is blended too. In an explicit API, blending lives inside the pipeline object you chose for this draw, so it can't leak in from a previous one." },
+  ];
+  let glIdx = 0, glState = Object.assign({}, GL_INIT);
+  const glNote = document.getElementById("gl-note");
+  const glv = RP.canvas("#glstate", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const pad = 12, rowH = Math.min(20, (h - 70) / 13);
+    let y = 30;
+    font(ctx, 10, 600, true); ctx.fillStyle = c.muted; ctx.fillText("CALL LOG", pad, y - 8);
+    const start = Math.max(0, glIdx - 5);
+    for (let i = start; i < Math.min(GL_CALLS.length, start + 5); i++) {
+      const cur = i === glIdx - 1, done = i < glIdx, cl = GL_CALLS[i];
+      if (cur) { ctx.fillStyle = RP.alpha(cl.draw ? c.ras : c.accent, 0.16); rr(ctx, pad - 4, y, w - 2 * pad + 8, rowH, 4); ctx.fill(); }
+      fit(ctx, (done ? "› " : "  ") + cl.call, w - 2 * pad, 11, cur ? 600 : 400, true);
+      ctx.fillStyle = done ? (cur ? c.ink : c.muted) : RP.alpha(c.muted, 0.5);
+      ctx.fillText((done ? "› " : "  ") + cl.call, pad, y + rowH * 0.7);
+      y += rowH;
+    }
+    y += 26;
+    font(ctx, 10, 600, true); ctx.fillStyle = c.muted; ctx.fillText("CURRENT CONTEXT STATE (global)", pad, y - 8);
+    const last = GL_CALLS[glIdx - 1];
+    const changed = last && last.set ? Object.keys(last.set) : [];
+    const split = Math.min(w * 0.58, 230);
+    FIELDS.forEach(([k, label]) => {
+      const isCh = changed.indexOf(k) >= 0, read = last && last.draw;
+      const leak = last && last.leak && k === "blend";
+      ctx.fillStyle = isCh ? RP.alpha(c.accent, 0.18) : leak ? RP.alpha(c.bad, 0.18) : c.surface;
+      rr(ctx, pad - 4, y, w - 2 * pad + 8, rowH - 2, 4); ctx.fill();
+      if (read) { ctx.strokeStyle = leak ? c.bad : c.ras; ctx.lineWidth = 1.5; ctx.stroke(); }
+      fit(ctx, label, split - 10, 10.5, 400, true);
+      ctx.fillStyle = c.muted; ctx.fillText(label, pad, y + rowH * 0.66);
+      const val = glState[k] + (leak ? "  ← leaked!" : "");
+      fit(ctx, val, w - split - pad - 4, 11, 600, true);
+      ctx.fillStyle = leak ? c.bad : isCh ? c.accent : c.ink; ctx.fillText(val, split, y + rowH * 0.66);
+      y += rowH;
+    });
+    if (last && last.draw) {
+      font(ctx, 10.5, 600, false); ctx.fillStyle = c.ras;
+      ctx.fillText("draw → driver reads & validates ALL state", pad, Math.min(h - 8, y + 14));
+    }
+  });
+  function glUpdate() {
+    const last = GL_CALLS[glIdx - 1];
+    glNote.innerHTML = last ? "<b>" + (glIdx) + "/" + GL_CALLS.length + "</b> · " + last.note : "Press <b>Step</b> to issue the first OpenGL call. Each call edits one field of the context's hidden global state.";
+    document.getElementById("gl-step").disabled = glIdx >= GL_CALLS.length;
+    glv.draw();
+  }
+  document.getElementById("gl-step").addEventListener("click", () => {
+    if (glIdx >= GL_CALLS.length) return;
+    const cl = GL_CALLS[glIdx++];
+    if (cl.set) Object.assign(glState, cl.set);
+    glUpdate();
+  });
+  document.getElementById("gl-reset").addEventListener("click", () => { glIdx = 0; glState = Object.assign({}, GL_INIT); glUpdate(); });
+  glUpdate();
+
+  /* ================= Step 1b: explicit object graph ================= */
+  const NODES = [
+    { id: "device", label: "GPUDevice", x: 0.5, y: 0.1, d: "The logical connection to one GPU. Every other object is created from it. Vulkan: VkDevice (chosen via VkPhysicalDevice). D3D12: ID3D12Device. Metal: MTLDevice. In WebGPU you get it from adapter.requestDevice()." },
+    { id: "queue", label: "GPUQueue", x: 0.83, y: 0.86, d: "Where finished command buffers are submitted for execution, in order. Vulkan: VkQueue + vkQueueSubmit. D3D12: ID3D12CommandQueue::ExecuteCommandLists. Metal: MTLCommandQueue (you commit buffers made from it). WebGPU: device.queue.submit()." },
+    { id: "shader", label: "ShaderModule", x: 0.15, y: 0.34, d: "Compiled shader code. Vulkan: VkShaderModule from SPIR-V. D3D12: DXIL bytecode blobs. Metal: MTLLibrary / MTLFunction. WebGPU: GPUShaderModule from WGSL source." },
+    { id: "bgl", label: "BindGroupLayout", x: 0.5, y: 0.34, d: "The shape of the resources a shader expects: 'binding 0 is a uniform buffer, binding 1 a texture'. Vulkan: VkDescriptorSetLayout (+ VkPipelineLayout). D3D12: root signature. Metal: argument buffer layout. WebGPU: GPUBindGroupLayout." },
+    { id: "res", label: "Buffer / Texture", x: 0.85, y: 0.34, d: "The actual memory: vertex buffers, uniform buffers, textures. In Vulkan and D3D12 you also choose and bind the memory heap yourself (VkDeviceMemory, ID3D12Heap), or use a helper library. WebGPU: GPUBuffer, GPUTexture." },
+    { id: "pso", label: "RenderPipeline", x: 0.22, y: 0.6, d: "The pipeline state object (PSO): shaders + vertex layout + blend, depth and raster settings + target formats, baked and compiled ahead of time. Vulkan: VkPipeline. D3D12: ID3D12PipelineState. Metal: MTLRenderPipelineState. WebGPU: GPURenderPipeline." },
+    { id: "bg", label: "BindGroup", x: 0.72, y: 0.6, d: "A concrete set of resources that matches a layout, bound with one call. Vulkan: VkDescriptorSet (vkCmdBindDescriptorSets). D3D12: descriptors in a descriptor heap, referenced by root parameters. Metal: an argument buffer. WebGPU: GPUBindGroup (setBindGroup)." },
+    { id: "enc", label: "CommandEncoder", x: 0.17, y: 0.86, d: "Records commands. Nothing executes yet. You can have one per thread. Vulkan: vkBeginCommandBuffer + vkCmd*. D3D12: ID3D12GraphicsCommandList (+ command allocator). Metal: MTLRenderCommandEncoder. WebGPU: GPUCommandEncoder → GPURenderPassEncoder." },
+    { id: "cmd", label: "CommandBuffer", x: 0.5, y: 0.86, d: "The finished, immutable list of GPU commands, ready to submit. Vulkan: VkCommandBuffer after vkEndCommandBuffer. D3D12: a closed command list. Metal: MTLCommandBuffer. WebGPU: encoder.finish() → GPUCommandBuffer." },
+  ];
+  const EDGES = [["device", "shader"], ["device", "bgl"], ["device", "res"], ["device", "queue"], ["shader", "pso"], ["bgl", "pso"], ["bgl", "bg"], ["res", "bg"], ["pso", "enc"], ["bg", "enc"], ["enc", "cmd"], ["cmd", "queue"]];
+  const EDGE_LBL = { "pso>enc": "setPipeline", "bg>enc": "setBindGroup", "enc>cmd": "finish()", "cmd>queue": "submit()" };
+  let objSel = "pso";
+  const objNote = document.getElementById("obj-note");
+  const objSelEl = document.getElementById("obj-sel");
+  NODES.forEach((n) => { const o = document.createElement("option"); o.value = n.id; o.textContent = n.label; objSelEl.appendChild(o); });
+  function nodeBox(s, n) {
+    const bw = Math.min(150, s.w * 0.29), bh = 30;
+    const cx = RP.clamp(n.x * s.w, bw / 2 + 4, s.w - bw / 2 - 4);
+    return { x: cx - bw / 2, y: n.y * s.h - bh / 2 + 6, w: bw, h: bh, cx, cy: n.y * s.h + 6 };
+  }
+  const og = RP.canvas("#objgraph", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const B = {}; NODES.forEach((n) => { B[n.id] = nodeBox(s, n); });
+    EDGES.forEach(([a, b]) => {
+      const A = B[a], Bb = B[b], hot = a === objSel || b === objSel;
+      ctx.strokeStyle = hot ? c.accent : c.line; ctx.lineWidth = hot ? 2 : 1.2;
+      const x0 = A.cx, y0 = A.cy, x1 = Bb.cx, y1 = Bb.cy;
+      line(ctx, x0, y0, x1, y1);
+      // arrow head at box edge
+      const ang = Math.atan2(y1 - y0, x1 - x0);
+      const tx = Math.abs(Math.cos(ang)) > 1e-3 ? (Bb.w / 2) / Math.abs(Math.cos(ang)) : 1e9;
+      const ty = Math.abs(Math.sin(ang)) > 1e-3 ? (Bb.h / 2) / Math.abs(Math.sin(ang)) : 1e9;
+      const t = Math.min(tx, ty) + 2, ax = x1 - Math.cos(ang) * t, ay = y1 - Math.sin(ang) * t;
+      ctx.fillStyle = ctx.strokeStyle; ctx.beginPath();
+      ctx.moveTo(ax, ay); ctx.lineTo(ax - 8 * Math.cos(ang - 0.4), ay - 8 * Math.sin(ang - 0.4)); ctx.lineTo(ax - 8 * Math.cos(ang + 0.4), ay - 8 * Math.sin(ang + 0.4)); ctx.fill();
+      const lbl = EDGE_LBL[a + ">" + b];
+      if (lbl && w > 300) { font(ctx, 9.5, 400, true); ctx.fillStyle = hot ? c.accent : c.muted; ctx.textAlign = "center"; ctx.fillText(lbl, (x0 + x1) / 2, (y0 + y1) / 2 - 5); ctx.textAlign = "left"; }
+    });
+    NODES.forEach((n) => {
+      const b = B[n.id], sel = n.id === objSel;
+      ctx.fillStyle = sel ? c.accent : c.surface; rr(ctx, b.x, b.y, b.w, b.h, 7); ctx.fill();
+      ctx.strokeStyle = sel ? c.accent : c.line; ctx.lineWidth = 1.5; ctx.stroke();
+      fit(ctx, n.label, b.w - 10, 11.5, 600, false);
+      ctx.fillStyle = sel ? c.surface : c.ink; ctx.textAlign = "center";
+      ctx.fillText(n.label, b.cx, b.y + b.h / 2 + 4); ctx.textAlign = "left";
+    });
+  });
+  function objUpdate() {
+    const n = NODES.find((q) => q.id === objSel);
+    objSelEl.value = objSel;
+    objNote.innerHTML = "<b>" + n.label + ".</b> ";
+    objNote.appendChild(document.createTextNode(n.d));
+    og.draw();
+  }
+  RP.drag(og.el, {
+    down(x, y) {
+      for (const n of NODES) { const b = nodeBox(og, n); if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { objSel = n.id; objUpdate(); break; } }
+      return false;
+    },
+  });
+  objSelEl.addEventListener("change", () => { objSel = objSelEl.value; objUpdate(); });
+  objUpdate();
+
+  /* ================= Step 2: CPU / driver / GPU timeline ================= */
+  const tlState = { mode: "gl", hitch: true, threads: 4, draws: 3000, play: 0 };
+  const tlHud = document.getElementById("tl-hud");
+  const TL_FRAMES = 5;
+  function simTimeline(mode, draws, threads, hitch) {
+    const segs = [], cpuEnd = [], gpuEnd = [];
+    const app = 1.5, drv = draws * 0.003, rec = draws * 0.0008 / threads + 0.1, sub = 0.2, gpu = 3 + draws * 0.001, compile = 28;
+    const lanes = mode === "gl" ? ["Main thread", "GPU"] : ["Main thread"].concat(Array.from({ length: threads }, (_, i) => "Worker " + (i + 1)), ["GPU"]);
+    const gl = lanes.length - 1;
+    let cpuFrame = 0;
+    for (let k = 0; k < TL_FRAMES; k++) {
+      let tt = k === 0 ? 0 : cpuEnd[k - 1];
+      if (k >= 2) tt = Math.max(tt, gpuEnd[k - 2]); // at most 2 frames ahead
+      const f0 = tt;
+      segs.push({ lane: 0, t0: tt, t1: tt + app, kind: "app", label: "app" }); tt += app;
+      if (mode === "gl") {
+        if (hitch && k === 2) {
+          segs.push({ lane: 0, t0: tt, t1: tt + drv * 0.4, kind: "drv", label: "driver" }); tt += drv * 0.4;
+          segs.push({ lane: 0, t0: tt, t1: tt + compile, kind: "cmp", label: "shader compile at draw time!" }); tt += compile;
+          segs.push({ lane: 0, t0: tt, t1: tt + drv * 0.6, kind: "drv", label: "driver" }); tt += drv * 0.6;
+        } else {
+          segs.push({ lane: 0, t0: tt, t1: tt + drv, kind: "drv", label: "driver: validate + translate" }); tt += drv;
+        }
+      } else {
+        for (let i = 0; i < threads; i++) segs.push({ lane: 1 + i, t0: tt, t1: tt + rec, kind: "rec", label: "record" });
+        tt += rec;
+        segs.push({ lane: 0, t0: tt, t1: tt + sub, kind: "sub", label: "submit" }); tt += sub;
+      }
+      cpuEnd[k] = tt;
+      if (k === 0) cpuFrame = tt - f0;
+      const g0 = Math.max(tt, k ? gpuEnd[k - 1] : 0);
+      gpuEnd[k] = g0 + gpu;
+      segs.push({ lane: gl, t0: g0, t1: gpuEnd[k], kind: "gpu", label: "GPU frame " + k });
+    }
+    return { segs, lanes, cpuEnd, gpuEnd, cpuFrame, gpuMs: gpu };
+  }
+  const tl = RP.canvas("#tl", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const st = tlState;
+    const sim = simTimeline(st.mode, st.draws, st.threads, st.hitch);
+    const ref = simTimeline("gl", st.draws, st.threads, st.hitch);
+    const ex = simTimeline("ex", st.draws, st.threads, st.hitch);
+    const span = Math.max(ref.gpuEnd[TL_FRAMES - 1], ex.gpuEnd[TL_FRAMES - 1]) * 1.03;
+    const gut = w < 480 ? 66 : 92, top = 92, bot = 30;
+    const laneH = Math.min(46, (h - top - bot) / sim.lanes.length);
+    const X = (t) => gut + (t / span) * (w - gut - 12);
+    const tPlay = RP.reduced && !tlAnim.running ? span : st.play * span;
+    // lanes
+    sim.lanes.forEach((name, i) => {
+      const y = top + i * laneH;
+      ctx.fillStyle = i % 2 ? RP.alpha(c.surface, 0.35) : RP.alpha(c.surface, 0.7);
+      ctx.fillRect(gut, y, w - gut - 12, laneH - 2);
+      fit(ctx, name, gut - 10, 11, 600, false);
+      ctx.fillStyle = name === "GPU" ? c.out : c.ink; ctx.fillText(name, 8, y + laneH / 2 + 4);
+    });
+    // time axis
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; font(ctx, 9.5, 400, true); ctx.fillStyle = c.muted;
+    const tickStep = span > 120 ? 20 : span > 50 ? 10 : 5;
+    for (let t = 0; t <= span; t += tickStep) {
+      const x = X(t); line(ctx, x, top - 4, x, top + sim.lanes.length * laneH);
+      ctx.fillText(t + " ms", x + 2, top + sim.lanes.length * laneH + 14);
+    }
+    // frame boundaries (present) on GPU lane
+    const col = { app: c.accent, drv: c.warn, cmp: c.bad, rec: c.good, sub: c.ink, gpu: c.out };
+    sim.segs.forEach((g) => {
+      if (g.t0 >= tPlay) return;
+      const t1 = Math.min(g.t1, tPlay);
+      const y = top + g.lane * laneH + 4, x0 = X(g.t0), x1 = X(t1), hh = laneH - 10;
+      ctx.fillStyle = col[g.kind]; rr(ctx, x0, y, Math.max(1.5, x1 - x0 - 1), hh, 3); ctx.fill();
+      font(ctx, 10, 600, false);
+      if (x1 - x0 > ctx.measureText(g.label).width + 8) { ctx.fillStyle = c.surface; ctx.fillText(g.label, x0 + 4, y + hh / 2 + 4); }
+    });
+    // playhead
+    if (tPlay < span) { ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5; line(ctx, X(tPlay), top - 8, X(tPlay), top + sim.lanes.length * laneH); }
+    // vsync-ish frame markers
+    ctx.strokeStyle = c.muted; ctx.setLineDash([3, 3]);
+    sim.gpuEnd.forEach((t) => { if (t <= tPlay) line(ctx, X(t), top - 10, X(t), top + sim.lanes.length * laneH); });
+    ctx.setLineDash([]);
+    // frame time bars at top
+    const ft = sim.gpuEnd.map((t, i) => (i ? t - sim.gpuEnd[i - 1] : t));
+    font(ctx, 10, 600, true); ctx.fillStyle = c.muted; ctx.fillText("FRAME TIMES", gut, 18);
+    const bw = Math.min(70, (w - gut - 20) / TL_FRAMES - 6);
+    ft.forEach((v, i) => {
+      const x = gut + i * (bw + 6), done = sim.gpuEnd[i] <= tPlay;
+      const bh = Math.min(48, v / 40 * 48);
+      ctx.fillStyle = done ? (v > 16.7 ? c.bad : c.good) : RP.alpha(c.muted, 0.25);
+      ctx.fillRect(x, 74 - bh, bw, bh);
+      if (done) { font(ctx, 9.5, 600, true); ctx.fillStyle = c.ink; ctx.fillText(v.toFixed(1), x + 2, 74 - bh - 3); }
+    });
+    ctx.strokeStyle = c.warn; ctx.setLineDash([4, 3]); const y16 = 74 - 16.7 / 40 * 48; line(ctx, gut - 4, y16, gut + TL_FRAMES * (bw + 6), y16); ctx.setLineDash([]);
+    font(ctx, 9, 400, true); ctx.fillStyle = c.warn; ctx.fillText("16.7", gut + TL_FRAMES * (bw + 6) + 2, y16 + 3);
+    // HUD
+    const steady = Math.max(sim.cpuFrame, sim.gpuMs);
+    tlHud.textContent = (st.mode === "gl" ? "OpenGL-style: 1 thread" : "Explicit: " + st.threads + " recording thread" + (st.threads > 1 ? "s" : "")) +
+      "\nCPU " + sim.cpuFrame.toFixed(1) + " ms · GPU " + sim.gpuMs.toFixed(1) + " ms" +
+      "\nsteady frame ≈ " + steady.toFixed(1) + " ms (" + (sim.cpuFrame > sim.gpuMs ? "CPU-bound" : "GPU-bound") + ")" +
+      (st.hitch ? (st.mode === "gl" ? "\nframe 2 hitch: " + ft[2].toFixed(1) + " ms" : "\nPSO pre-built at load: no hitch") : "");
+  });
+  const tlAnim = RP.loop(tl.el, (t, dt) => { tlState.play += dt / 5; if (tlState.play > 1.25) tlState.play = 0; tl.draw(); });
+  const tlSync = playButton(document.getElementById("tl-play"), tlAnim);
+  if (RP.reduced) tlState.play = 1;
+  RP.toggleGroup("#tl-mode", (v) => { tlState.mode = v; tlState.play = tlAnim.running ? 0 : 1; tl.draw(); });
+  RP.toggleGroup("#tl-hitch", (v) => { tlState.hitch = v === "on"; tl.draw(); });
+  RP.slider("#tl-threads", (v) => { tlState.threads = v; tl.draw(); });
+  RP.slider("#tl-draws", (v) => { tlState.draws = v; tl.draw(); });
+  document.getElementById("tl-play").addEventListener("click", () => { if (!tlAnim.running) { tlState.play = 1; tl.draw(); } tlSync(); });
+
+  /* ================= Step 3: frames in flight ================= */
+  const fif = { N: 2, c: 6, g: 10, now: 0, cs: [], ce: [], gs: [], ge: [] };
+  const fifHud = document.getElementById("fif-hud");
+  const SLOW = 0.05; // 1 s real = 50 ms simulated (×20 slow motion)
+  function fifReset() {
+    fif.cs = []; fif.ce = []; fif.gs = []; fif.ge = [];
+    fif.now = fifWindow() * 0.85;
+  }
+  function fifWindow() { return Math.max(50, 3.2 * (fif.c + fif.g)); }
+  function fifEnsure(tmax) {
+    const { N, c, g, cs, ce, gs, ge } = fif;
+    while (!cs.length || cs[cs.length - 1] < tmax) {
+      const k = cs.length;
+      cs[k] = Math.max(k ? ce[k - 1] : 0, k >= N ? ge[k - N] : 0);
+      ce[k] = cs[k] + c;
+      gs[k] = Math.max(ce[k], k ? ge[k - 1] : 0);
+      ge[k] = gs[k] + g;
+    }
+  }
+  function fifSteady() {
+    // closed-form check by simulation on a scratch copy
+    const N = fif.N, c = fif.c, g = fif.g, cs = [], ce = [], ge = [];
+    for (let k = 0; k <= 40; k++) {
+      cs[k] = Math.max(k ? ce[k - 1] : 0, k >= N ? ge[k - N] : 0); ce[k] = cs[k] + c;
+      ge[k] = Math.max(ce[k], k ? ge[k - 1] : 0) + g;
+    }
+    return { period: ge[40] - ge[39], latency: ge[40] - cs[40] };
+  }
+  const fv = RP.canvas("#fif", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const W = fifWindow(), now = fif.now;
+    fifEnsure(now + 5);
+    const slotCol = [c.accent, c.good, c.frag];
+    const gut = w < 480 ? 50 : 70, right = 14, nowX = gut + (w - gut - right) * 0.9;
+    const pxPerMs = (nowX - gut) / W;
+    const X = (t) => nowX - (now - t) * pxPerMs;
+    const yC = 50, yG = 150, lh = 52;
+    // lane backgrounds
+    [[yC, "CPU"], [yG, "GPU"]].forEach(([y, name]) => {
+      ctx.fillStyle = RP.alpha(c.surface, 0.7); ctx.fillRect(gut, y, w - gut - right, lh);
+      font(ctx, 12, 700, false); ctx.fillStyle = name === "GPU" ? c.out : c.ink; ctx.fillText(name, 10, y + lh / 2 + 4);
+    });
+    ctx.save(); ctx.beginPath(); ctx.rect(gut, 0, w - gut - right, h); ctx.clip();
+    const { cs, ce, gs, ge, N } = fif;
+    for (let k = 0; k < cs.length; k++) {
+      if (cs[k] > now) break;
+      if (ge[k] < now - W - 5) continue;
+      const col = slotCol[k % N];
+      // CPU wait (fence) before cs[k]
+      const prevEnd = k ? ce[k - 1] : 0;
+      if (cs[k] - prevEnd > 0.05) {
+        const x0 = X(prevEnd), x1 = X(Math.min(cs[k], now));
+        hatch(ctx, x0, yC + 6, x1 - x0, lh - 12, c.bad);
+        if (x1 - x0 > 60) { font(ctx, 10, 600, false); ctx.fillStyle = c.bad; ctx.fillText("wait fence", x0 + 4, yC + lh - 9); }
+        if (k >= N && Math.abs(cs[k] - ge[k - N]) < 1e-6) {
+          ctx.strokeStyle = c.bad; ctx.setLineDash([3, 3]); ctx.lineWidth = 1.2;
+          line(ctx, X(ge[k - N]), yG + 2, X(cs[k]), yC + lh); ctx.setLineDash([]);
+        }
+      }
+      // CPU record segment
+      const cx0 = X(cs[k]), cx1 = X(Math.min(ce[k], now));
+      ctx.fillStyle = col; rr(ctx, cx0, yC + 6, Math.max(1, cx1 - cx0 - 1), lh - 12, 4); ctx.fill();
+      font(ctx, 11, 700, false);
+      if (cx1 - cx0 > 30) { ctx.fillStyle = c.surface; ctx.fillText("F" + k, cx0 + 5, yC + lh / 2 + 4); }
+      // GPU segment
+      if (gs[k] <= now) {
+        const gx0 = X(gs[k]), gx1 = X(Math.min(ge[k], now));
+        ctx.fillStyle = col; rr(ctx, gx0, yG + 6, Math.max(1, gx1 - gx0 - 1), lh - 12, 4); ctx.fill();
+        if (gx1 - gx0 > 30) { ctx.fillStyle = c.surface; ctx.fillText("F" + k, gx0 + 5, yG + lh / 2 + 4); }
+        // submit arrow CPU -> GPU
+        ctx.strokeStyle = RP.alpha(c.muted, 0.7); ctx.lineWidth = 1; line(ctx, X(ce[k]), yC + lh - 6, X(gs[k]), yG + 6);
+      }
+      // fence signal diamond
+      if (ge[k] <= now) {
+        const x = X(ge[k]), y = yG + lh + 8;
+        ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(x, y - 6); ctx.lineTo(x + 6, y); ctx.lineTo(x, y + 6); ctx.lineTo(x - 6, y); ctx.closePath(); ctx.fill();
+      }
+    }
+    ctx.restore();
+    // now line
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5; line(ctx, nowX, yC - 12, nowX, yG + lh + 16);
+    font(ctx, 10, 600, true); ctx.fillStyle = c.ink; ctx.textAlign = "center"; ctx.fillText("now", nowX, yC - 16); ctx.textAlign = "left";
+    // scale bar
+    const ms10 = 10 * pxPerMs; ctx.strokeStyle = c.muted; line(ctx, gut, yG + lh + 30, gut + ms10, yG + lh + 30);
+    font(ctx, 9.5, 400, true); ctx.fillStyle = c.muted; ctx.fillText("10 ms (slow motion ×20)", gut + ms10 + 6, yG + lh + 33);
+    // fence slots
+    const sy = yG + lh + 52;
+    font(ctx, 10, 600, true); ctx.fillStyle = c.muted; ctx.fillText("FRAME SLOTS (per-frame buffers + fence)", 10, sy);
+    const sw = Math.min(200, (w - 20 - (N - 1) * 10) / N), shh = 50;
+    for (let sl = 0; sl < N; sl++) {
+      let k = -1;
+      for (let q = sl; q < cs.length && cs[q] <= now; q += N) k = q;
+      let state = "free", busy = false;
+      if (k >= 0) {
+        if (now < ce[k]) { state = "CPU recording F" + k; busy = true; }
+        else if (now < ge[k]) { state = "GPU owns F" + k + " · fence unsignaled"; busy = true; }
+        else state = "F" + k + " done · fence signaled";
+      }
+      const x = 10 + sl * (sw + 10), y = sy + 8;
+      ctx.fillStyle = busy ? RP.alpha(slotCol[sl], 0.22) : c.surface; rr(ctx, x, y, sw, shh, 6); ctx.fill();
+      ctx.strokeStyle = slotCol[sl]; ctx.lineWidth = 2; ctx.stroke();
+      font(ctx, 11, 700, false); ctx.fillStyle = slotCol[sl]; ctx.fillText("slot " + sl, x + 8, y + 17);
+      fit(ctx, state, sw - 16, 10.5, 400, false); ctx.fillStyle = c.ink; ctx.fillText(state, x + 8, y + 36);
+    }
+    const st = fifSteady();
+    fifHud.textContent = fif.N + " frame" + (fif.N > 1 ? "s" : "") + " in flight\nframe time " + st.period.toFixed(1) + " ms (" + (1000 / st.period).toFixed(0) + " fps)\nlatency " + st.latency.toFixed(1) + " ms (input → image done)";
+  });
+  const fifAnim = RP.loop(fv.el, (t, dt) => {
+    fif.now += dt * 1000 * SLOW;
+    if (fif.cs.length > 4000) fifReset();
+    fv.draw();
+  });
+  playButton(document.getElementById("fif-play"), fifAnim);
+  RP.slider("#fif-n", (v) => { fif.N = v; fifReset(); fv.draw(); });
+  RP.slider("#fif-cpu", (v) => { fif.c = v; fifReset(); fv.draw(); });
+  RP.slider("#fif-gpu", (v) => { fif.g = v; fifReset(); fv.draw(); });
+
+  /* ================= Step 4: barriers ================= */
+  const GRID = 10, NT = GRID * GRID;
+  const order = (() => { // deterministic scattered write order
+    const a = Array.from({ length: NT }, (_, i) => i); let seed = 7;
+    for (let i = NT - 1; i > 0; i--) { seed = (seed * 16807) % 2147483647; const j = seed % (i + 1); const t = a[i]; a[i] = a[j]; a[j] = t; }
+    const when = new Array(NT); a.forEach((tile, idx) => { when[tile] = idx; }); return when;
+  })();
+  const bar = { on: true, t: 0 };
+  const BAR_TOTAL = 2.75;
+  function barSchedule(on) {
+    const A = [0, 1];
+    const B1 = on ? [1, 1.15] : null;
+    const B = on ? [1.15, 2.15] : [0.3, 1.3];
+    const B2 = [B[1], B[1] + 0.15];
+    const P = [B2[1], B2[1] + 0.3];
+    return { A, B1, B, B2, P };
+  }
+  function tileValue(i, c) {
+    const x = i % GRID, y = Math.floor(i / GRID);
+    const dx = x - 4.5, dy = y - 4.5;
+    if (dx * dx + dy * dy < 9) return c.vtx;
+    return (x + y) % 2 ? c.ras : c.out;
+  }
+  const barHud = document.getElementById("bar-hud");
+  let barSlider = null;
+  const bv = RP.canvas("#bar", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const S = barSchedule(bar.on), t = bar.t;
+    const narrow = w < 520;
+    const tlH = 150;
+    const gs = Math.min((w - 60) / 2, h - tlH - 70);
+    const gx0 = (w - 2 * gs - 30) / 2, gx1 = gx0 + gs + 30, gy = 40;
+    const cell = gs / GRID;
+    const writtenAt = (i) => S.A[0] + (order[i] + 1) / NT * (S.A[1] - S.A[0]);
+    const readAt = (i) => S.B[0] + (i + 1) / NT * (S.B[1] - S.B[0]);
+    let bad = 0, readN = 0;
+    for (let i = 0; i < NT; i++) {
+      const x = i % GRID, y = Math.floor(i / GRID);
+      // texture
+      const wr = t >= writtenAt(i);
+      if (wr) { ctx.fillStyle = tileValue(i, c); ctx.fillRect(gx0 + x * cell, gy + y * cell, cell - 1, cell - 1); }
+      else { ctx.fillStyle = c.surface; ctx.fillRect(gx0 + x * cell, gy + y * cell, cell - 1, cell - 1); hatch(ctx, gx0 + x * cell, gy + y * cell, cell - 1, cell - 1, RP.alpha(c.muted, 0.35)); }
+      // output
+      const ox = gx1 + x * cell, oy = gy + y * cell;
+      if (t >= readAt(i)) {
+        readN++;
+        const valid = readAt(i) >= writtenAt(i);
+        if (valid) { ctx.fillStyle = tileValue(i, c); ctx.fillRect(ox, oy, cell - 1, cell - 1); }
+        else {
+          bad++;
+          ctx.fillStyle = RP.alpha(c.bad, 0.25); ctx.fillRect(ox, oy, cell - 1, cell - 1);
+          hatch(ctx, ox, oy, cell - 1, cell - 1, c.bad);
+        }
+      } else { ctx.fillStyle = c.surface; ctx.fillRect(ox, oy, cell - 1, cell - 1); }
+    }
+    // read cursor
+    if (t > S.B[0] && t < S.B[1]) {
+      const i = Math.min(NT - 1, Math.floor((t - S.B[0]) / (S.B[1] - S.B[0]) * NT));
+      const x = i % GRID, y = Math.floor(i / GRID);
+      ctx.strokeStyle = c.ink; ctx.lineWidth = 2;
+      ctx.strokeRect(gx0 + x * cell, gy + y * cell, cell - 1, cell - 1);
+      ctx.strokeRect(gx1 + x * cell, gy + y * cell, cell - 1, cell - 1);
+    }
+    // titles and layout states
+    const texState = t < S.A[0] + 0.001 ? "UNDEFINED" : (S.B1 && t >= S.B1[1]) ? "SHADER_READ_ONLY_OPTIMAL" : (S.B1 && t >= S.B1[0]) ? "→ transitioning…" : "COLOR_ATTACHMENT_OPTIMAL";
+    const scState = t < S.B[0] ? "UNDEFINED" : t >= S.B2[1] ? "PRESENT_SRC_KHR" : t >= S.B2[0] ? "→ transitioning…" : "COLOR_ATTACHMENT_OPTIMAL";
+    ctx.textAlign = "center";
+    fit(ctx, "Offscreen texture (written by pass A)", gs, 11.5, 700, false); ctx.fillStyle = c.ink; ctx.fillText("Offscreen texture (written by pass A)", gx0 + gs / 2, gy - 22);
+    fit(ctx, "Swapchain image (pass B samples the texture)", gs, 11.5, 700, false); ctx.fillText("Swapchain image (pass B samples the texture)", gx1 + gs / 2, gy - 22);
+    fit(ctx, "layout: " + texState, gs, 10.5, 600, true); ctx.fillStyle = (!bar.on && t > S.B[0]) ? c.bad : c.accent; ctx.fillText("layout: " + texState, gx0 + gs / 2, gy - 7);
+    fit(ctx, "layout: " + scState, gs, 10.5, 600, true); ctx.fillStyle = c.accent; ctx.fillText("layout: " + scState, gx1 + gs / 2, gy - 7);
+    ctx.textAlign = "left";
+    // arrow between grids
+    ctx.strokeStyle = c.muted; ctx.lineWidth = 1.5; const ay = gy + gs / 2;
+    line(ctx, gx0 + gs + 5, ay, gx1 - 5, ay); ctx.fillStyle = c.muted; ctx.beginPath(); ctx.moveTo(gx1 - 5, ay); ctx.lineTo(gx1 - 12, ay - 5); ctx.lineTo(gx1 - 12, ay + 5); ctx.fill();
+    // timeline
+    const ty = h - tlH + 10, lx = narrow ? 70 : 120, lw = w - lx - 14, rowH = 26;
+    const X = (v) => lx + v / BAR_TOTAL * lw;
+    const rows = [["Pass A: draw", S.A ? [S.A] : [], c.ras], ["Barrier", [S.B1, S.B2].filter(Boolean), c.warn], ["Pass B: sample", [S.B], c.frag], ["Present", [S.P], c.out]];
+    rows.forEach(([name, spans, col], r) => {
+      const y = ty + r * rowH;
+      ctx.fillStyle = RP.alpha(c.surface, 0.7); ctx.fillRect(lx, y, lw, rowH - 4);
+      fit(ctx, name, lx - 12, 11, 600, false); ctx.fillStyle = c.ink; ctx.fillText(name, 8, y + rowH / 2 + 2);
+      spans.forEach((sp) => {
+        const x0 = X(sp[0]), x1 = X(Math.min(sp[1], Math.max(sp[0], t)));
+        ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.strokeRect(X(sp[0]) + 0.5, y + 2.5, X(sp[1]) - X(sp[0]) - 1, rowH - 9);
+        if (t > sp[0]) { ctx.fillStyle = col; ctx.fillRect(x0, y + 2, x1 - x0, rowH - 8); }
+      });
+      if (r === 1 && !bar.on) { font(ctx, 10.5, 700, false); ctx.fillStyle = c.bad; ctx.fillText("missing: A's writes → B's reads", X(0.25), y + rowH / 2 + 2); }
+    });
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5; line(ctx, X(t), ty - 6, X(t), ty + rows.length * rowH);
+    if (!bar.on) {
+      ctx.fillStyle = RP.alpha(c.bad, 0.12); ctx.fillRect(X(S.B[0]), ty, X(S.A[1]) - X(S.B[0]), 3 * rowH - 4);
+      font(ctx, 10, 700, false); ctx.fillStyle = c.bad; ctx.fillText("overlap = hazard", X(S.B[0]) + 3, ty + 3 * rowH + 10);
+    }
+    barHud.textContent = (bar.on ? "barrier: A writes → visible → B reads" : "NO barrier: B may run before A finishes") +
+      "\ntiles read " + readN + "/" + NT + " · corrupted " + bad;
+    barHud.classList.toggle("bad", bad > 0);
+  });
+  const barAnim = RP.loop(bv.el, (tt, dt) => {
+    bar.t += dt * 0.35;
+    if (bar.t > BAR_TOTAL + 0.5) bar.t = 0;
+    barSetSlider();
+    bv.draw();
+  });
+  const barEl = document.getElementById("bar-t"), barOut = document.querySelector('output[for="bar-t"]');
+  function barSetSlider() { const v = Math.round(Math.min(1, bar.t / BAR_TOTAL) * 100); barEl.value = v; if (barOut) barOut.textContent = (v / 100 * BAR_TOTAL).toFixed(2) + " units"; }
+  const barSync = playButton(document.getElementById("bar-play"), barAnim);
+  barSlider = RP.slider("#bar-t", (v) => { bar.t = v / 100 * BAR_TOTAL; bv.draw(); }, { fmt: (v) => (v / 100 * BAR_TOTAL).toFixed(2) + " units" });
+  document.getElementById("bar-t").addEventListener("input", () => { if (barAnim.running) { barAnim.stop(); barSync(); } });
+  RP.toggleGroup("#bar-mode", (v) => { bar.on = v === "on"; if (barAnim.running) bar.t = 0; bv.draw(); });
+  if (RP.reduced) { barSlider.value = 100; }
+
+  /* ================= Step 5: conventions ================= */
+  const NEAR = 0.1, FAR = 100, TANH = Math.tan(Math.PI / 6);
+  const cv = { y: 0.5, d: 1, mat: "native", rz: "std" };
+  const distFromSlider = (u) => NEAR * Math.pow(FAR / NEAR, u);
+  const zGL = (d) => (FAR + NEAR) / (FAR - NEAR) - 2 * FAR * NEAR / ((FAR - NEAR) * d);
+  const z01 = (d) => FAR / (FAR - NEAR) - FAR * NEAR / ((FAR - NEAR) * d);
+  const zRev = (d) => NEAR / (FAR - NEAR) * (FAR / d - 1);
+  function apiNdc(api, d, s) {
+    // returns {x,y,z,range:[lo,hi], depthFn, yDown, clipped, flipped}
+    const x = 0.3;
+    if (api === "gl") return { x, y: s, z: zGL(d), lo: -1, hi: 1, fn: zGL, yDown: false };
+    const rev = cv.rz === "rev";
+    const useGL = cv.mat === "gl";
+    const fn = useGL ? zGL : rev ? zRev : z01;
+    const z = fn(d);
+    let y = s;
+    if (api === "vk" && !useGL) y = -s;
+    return { x, y, z, lo: 0, hi: 1, fn, yDown: api === "vk", clipped: z < 0 || z > 1, rev: rev && !useGL, flipped: api === "vk" && useGL };
+  }
+  const APIS = [["gl", "OpenGL"], ["dx", "D3D12 · Metal · WebGPU"], ["vk", "Vulkan"]];
+  const TICKS = [0.2, 0.5, 1, 2, 5, 10, 100];
+  const cvv = RP.canvas("#conv", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const wide = w >= 620;
+    const d = cv.d;
+    APIS.forEach(([api, name], i) => {
+      const px = wide ? i * w / 3 : 0, py = wide ? 0 : i * h / 3;
+      const pw = wide ? w / 3 : w, ph = wide ? h : h / 3;
+      if (i) { ctx.strokeStyle = c.line; ctx.lineWidth = 1; if (wide) line(ctx, px, 10, px, h - 10); else line(ctx, 10, py, w - 10, py); }
+      const n = apiNdc(api, d, cv.y);
+      // layout
+      let sq, sx, sy, bx, by, bw;
+      if (wide) {
+        sq = Math.min(pw - 50, ph - 130); sx = px + (pw - sq) / 2; sy = py + 34;
+        bx = px + 22; bw = pw - 44; by = sy + sq + 28;
+      } else {
+        sq = Math.min(ph - 40, pw * 0.42); sx = px + 22; sy = py + 26;
+        bx = sx + sq + 26; bw = pw - bx - 14; by = sy + 34;
+      }
+      fit(ctx, name, pw - 20, 12.5, 700, false); ctx.fillStyle = c.ink; ctx.fillText(name, px + 12, py + 18);
+      // framebuffer square (top = top of the image)
+      ctx.fillStyle = c.surface; ctx.fillRect(sx, sy, sq, sq);
+      ctx.strokeStyle = c.line; ctx.strokeRect(sx + 0.5, sy + 0.5, sq - 1, sq - 1);
+      ctx.strokeStyle = RP.alpha(c.muted, 0.4); line(ctx, sx + sq / 2, sy, sx + sq / 2, sy + sq); line(ctx, sx, sy + sq / 2, sx + sq, sy + sq / 2);
+      // +y arrow
+      const ax = sx + sq / 2, ay0 = sy + sq / 2, ay1 = n.yDown ? sy + sq - 6 : sy + 6;
+      ctx.strokeStyle = c.accent; ctx.lineWidth = 2; line(ctx, ax, ay0, ax, ay1);
+      ctx.fillStyle = c.accent; ctx.beginPath(); const dir = n.yDown ? 1 : -1;
+      ctx.moveTo(ax, ay1); ctx.lineTo(ax - 5, ay1 - dir * 8); ctx.lineTo(ax + 5, ay1 - dir * 8); ctx.fill();
+      font(ctx, 10, 600, true); ctx.fillText("+y", ax + 6, n.yDown ? ay1 - 4 : ay1 + 10);
+      line(ctx, ax, ay0, sx + sq - 6, ay0); ctx.fillText("+x", sx + sq - 20, ay0 - 5);
+      // point: screen position
+      const screenYfrac = n.yDown ? (n.y + 1) / 2 : (1 - n.y) / 2;
+      const ptx = sx + (n.x + 1) / 2 * sq, pty = sy + screenYfrac * sq;
+      const refY = sy + (1 - cv.y) / 2 * sq;
+      if (n.flipped) {
+        ctx.strokeStyle = c.muted; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.arc(ptx, refY, 7, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+      }
+      if (n.clipped) {
+        ctx.strokeStyle = c.bad; ctx.lineWidth = 2.5; line(ctx, ptx - 6, pty - 6, ptx + 6, pty + 6); line(ctx, ptx + 6, pty - 6, ptx - 6, pty + 6);
+      } else {
+        ctx.fillStyle = n.flipped ? c.bad : c.frag; ctx.beginPath(); ctx.arc(ptx, pty, 6, 0, Math.PI * 2); ctx.fill();
+      }
+      const warnTxt = n.clipped ? "clipped: z outside [0,1]" : n.flipped ? "upside down!" : "";
+      if (warnTxt) { fit(ctx, warnTxt, sq - 8, 10.5, 700, false); ctx.fillStyle = c.bad; ctx.fillText(warnTxt, sx + 4, sy + sq - 6); }
+      // depth bar
+      ctx.fillStyle = RP.alpha(c.muted, 0.18); ctx.fillRect(bx, by, bw, 10);
+      const V = (z) => bx + (z - n.lo) / (n.hi - n.lo) * bw;
+      font(ctx, 9.5, 400, true); ctx.fillStyle = c.muted;
+      ctx.fillText(String(n.lo), bx, by + 24); ctx.textAlign = "right"; ctx.fillText(String(n.hi), bx + bw, by + 24); ctx.textAlign = "left";
+      const rl = api === "gl" ? "NDC depth z ∈ [−1, 1]" : n.rev ? "z ∈ [0, 1], near = 1 (reverse-Z)" : "NDC depth z ∈ [0, 1]";
+      fit(ctx, rl, bw, 9.5, 400, true); ctx.fillText(rl, bx, by - 6);
+      TICKS.forEach((td) => {
+        const z = n.fn(td); if (z < n.lo - 1e-9 || z > n.hi + 1e-9) return;
+        const x = V(z); ctx.strokeStyle = c.muted; ctx.lineWidth = 1; line(ctx, x, by, x, by + 10);
+      });
+      // near/far labels for ticks: show 'near' and 'far' ends
+      const nz = n.fn(NEAR), fz = n.fn(FAR);
+      font(ctx, 9, 600, true); ctx.fillStyle = c.ras;
+      if (nz >= n.lo - 1e-9 && nz <= n.hi + 1e-9) { ctx.textAlign = nz > fz ? "right" : "left"; ctx.fillText("near", V(nz), by + 36); }
+      ctx.textAlign = fz > nz ? "right" : "left"; ctx.fillText("far", V(fz), by + 36); ctx.textAlign = "left";
+      // marker
+      const mz = RP.clamp(n.z, n.lo, n.hi), mx = V(mz);
+      ctx.fillStyle = n.clipped ? c.bad : c.frag; ctx.beginPath(); ctx.moveTo(mx, by - 1); ctx.lineTo(mx - 5, by - 9); ctx.lineTo(mx + 5, by - 9); ctx.fill();
+      ctx.fillRect(mx - 1, by, 2, 10);
+      const ro = "ndc = (" + n.x.toFixed(2) + ", " + n.y.toFixed(2) + ", " + n.z.toFixed(4) + ")";
+      fit(ctx, ro, bw, 10.5, 600, true); ctx.fillStyle = n.clipped ? c.bad : c.ink; ctx.fillText(ro, bx, by + 52);
+    });
+  });
+  RP.slider("#cv-y", (v) => { cv.y = v; cvv.draw(); }, { fmt: (v) => v.toFixed(2) });
+  RP.slider("#cv-d", (v) => { cv.d = distFromSlider(v); cvv.draw(); }, { fmt: (v) => distFromSlider(v).toFixed(distFromSlider(v) < 1 ? 2 : 1) });
+  RP.toggleGroup("#cv-mat", (v) => { cv.mat = v; cvv.draw(); });
+  RP.toggleGroup("#cv-rz", (v) => { cv.rz = v; cvv.draw(); });
+
+  /* ================= Step 6: code tabs ================= */
+  const CODE_IDS = ["gl", "wgsl", "js", "vk"];
+  let codeSel = "gl";
+  function countLines(id) {
+    const txt = document.getElementById("code-" + id).textContent.split("\n");
+    const r = { setup: 0, frame: 0, shader: 0 };
+    let sec = id === "wgsl" ? "shader" : "setup";
+    txt.forEach((ln) => {
+      const t = ln.trim();
+      if (/once at startup/.test(t)) { sec = "setup"; return; }
+      if (/every frame/.test(t)) { sec = "frame"; return; }
+      if (!t || t.indexOf("//") === 0) return;
+      r[sec]++;
+    });
+    return r;
+  }
+  const COUNTS = {}; CODE_IDS.forEach((id) => { COUNTS[id] = countLines(id); });
+  const cdv = RP.canvas("#codeviz", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    // rendered triangle (physical colors from the listing: clear 0.1 grey, triangle 1.0/0.5/0.2)
+    const vs = Math.min(h - 40, w * 0.4), vx = 16, vy = (h - vs) / 2 + 6;
+    ctx.fillStyle = "rgb(26,26,26)"; ctx.fillRect(vx, vy, vs, vs);
+    const P = (x, y) => [vx + (x + 1) / 2 * vs, vy + (1 - y) / 2 * vs];
+    const tri = [P(0, 0.5), P(-0.5, -0.5), P(0.5, -0.5)];
+    ctx.fillStyle = "rgb(255,128,51)"; ctx.beginPath(); ctx.moveTo(tri[0][0], tri[0][1]); ctx.lineTo(tri[1][0], tri[1][1]); ctx.lineTo(tri[2][0], tri[2][1]); ctx.closePath(); ctx.fill();
+    font(ctx, 10, 600, true); ctx.fillStyle = c.muted; ctx.fillText("output (NDC −1…1)", vx, vy - 8);
+    // bars
+    const bx = vx + vs + 28, bw = w - bx - 16;
+    const cnt = COUNTS[codeSel];
+    const max = Math.max.apply(null, CODE_IDS.map((id) => Math.max(COUNTS[id].setup, COUNTS[id].frame, COUNTS[id].shader)));
+    const rows = [["one-time setup", cnt.setup, c.accent], ["every frame", cnt.frame, c.good], ["shader code", cnt.shader, c.frag]];
+    font(ctx, 10, 600, true); ctx.fillStyle = c.muted; ctx.fillText("LINES OF CODE IN THIS LISTING", bx, vy - 8);
+    rows.forEach(([name, v, col], i) => {
+      const y = vy + 8 + i * Math.min(52, (vs - 10) / 3);
+      fit(ctx, name, bw, 11, 600, false); ctx.fillStyle = c.ink; ctx.fillText(name, bx, y + 10);
+      ctx.fillStyle = RP.alpha(c.muted, 0.15); ctx.fillRect(bx, y + 16, bw, 14);
+      ctx.fillStyle = col; ctx.fillRect(bx, y + 16, Math.max(v ? 3 : 0, bw * v / max), 14);
+      font(ctx, 10.5, 600, true); ctx.fillStyle = c.ink; ctx.fillText(String(v), bx + Math.min(bw - 22, bw * v / max + 6), y + 27);
+    });
+  });
+  RP.toggleGroup("#code-tabs", (v) => {
+    codeSel = v;
+    CODE_IDS.forEach((id) => { document.getElementById("code-" + id).hidden = id !== v; });
+    cdv.draw();
+  });
+})();
+</script>
+</body>
+</html>

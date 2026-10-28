@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lighting & Shading · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .swatch { display: inline-block; width: 0.8em; height: 0.8em; border-radius: 2px; vertical-align: -1px; margin-right: 4px; }
+  .sw-n { background: var(--ink); } .sw-l { background: var(--warn); } .sw-v { background: var(--out); }
+  .sw-r { background: var(--frag); } .sw-h { background: var(--ras); } .sw-good { background: var(--good); } .sw-bad { background: var(--bad); }
+  .viz .legend { padding: 0 16px 12px; }
+  .history { display: grid; gap: 8px; }
+</style>
+</head>
+<body data-topic="03">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 03 · Foundations</p>
+    <h1>Lighting & Shading</h1>
+    <p class="lede">Rasterization tells us <em>which</em> pixels a triangle covers. Shading decides <em>what color</em> each one gets. This chapter builds the classic lighting model piece by piece: normals, diffuse, specular, and where in the pipeline you evaluate them.</p>
+    <div class="stage-band"><span class="app">Application</span><span class="vtx">Vertex</span><span class="ras">Rasterize</span><span class="on frag">Fragment</span><span class="out">Output</span></div>
+  </section>
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>What a surface normal is, face vs vertex normals, and why normals need the inverse-transpose matrix</li>
+    <li>Directional and point lights, and Lambert's cosine law <code>N·L</code></li>
+    <li>Phong <code>(R·V)ⁿ</code> vs Blinn-Phong <code>(N·H)ⁿ</code> specular highlights and the shininess exponent</li>
+    <li>How ambient, diffuse and specular terms add up to the final color</li>
+    <li>Flat vs Gouraud vs per-pixel (Phong) shading, and why Gouraud misses highlights</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="normals">
+    <h2><span class="step-no">STEP 1</span>Normals: which way does the surface face?</h2>
+    <p>Every lighting formula in this chapter starts from one vector: the <b>surface normal</b> <code>N</code>, a unit-length arrow pointing straight out of the surface. Light that hits a surface head-on (along the normal) is brighter than light that grazes it, so the normal is how the shader knows the surface's orientation.</p>
+    <p>A triangle mesh is only an approximation of a smooth shape. A <b>face normal</b> is perpendicular to one flat triangle, computed with a cross product of two edges. Use it and every facet looks flat. A <b>vertex normal</b> is shared by all triangles that meet at a vertex, usually the normalized average of their face normals (or the exact normal of the original curved surface). Blending vertex normals across a triangle makes the faceted mesh <em>look</em> curved.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="nrm-a" aria-label="Cross-section of a curved surface approximated by straight segments, showing face normals or smoothed vertex normals"></canvas><div class="hud" id="nrm-a-hud"></div><span class="pane-label">Face vs vertex</span></div>
+        <div class="viz-stage"><canvas id="nrm-b" aria-label="A circle stretched horizontally into an ellipse, with normals transformed by the model matrix (wrong) and by its inverse-transpose (correct)"></canvas><div class="hud" id="nrm-b-hud"></div><span class="pane-label">Non-uniform scale</span></div>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="nrm-seg">Segments <output for="nrm-seg"></output></label><input type="range" id="nrm-seg" min="3" max="24" value="6"></div>
+        <div class="btn-row" id="nrm-mode" role="group" aria-label="Normal type"><button class="btn" data-value="face" aria-pressed="true">Face normals</button><button class="btn" data-value="vertex">Vertex normals</button></div>
+        <div class="control"><label for="nrm-sx">Scale X <output for="nrm-sx"></output></label><input type="range" id="nrm-sx" min="0.3" max="3" step="0.05" value="2.2"></div>
+        <div class="btn-row" id="nrm-show" role="group" aria-label="Which transformed normals to show"><button class="btn" data-value="both" aria-pressed="true">Both</button><button class="btn" data-value="naive">M · n</button><button class="btn" data-value="correct">M⁻ᵀ · n</button></div>
+      </div>
+      <div class="legend"><span><i class="sw-bad" style="background:var(--bad)"></i>M · n (wrong)</span><span><i style="background:var(--good)"></i>(M⁻¹)ᵀ · n (correct)</span><span><i style="background:var(--muted)"></i>tangent</span></div>
+      <figcaption><b>Try it:</b> switch to vertex normals and watch the small in-between arrows sweep smoothly along each flat segment. Then stretch the circle: the red normals lean toward the stretch and stop being perpendicular to the surface; the green ones stay correct.</figcaption>
+    </figure>
+    <p>Positions transform with the model matrix <code>M</code>. Normals cannot, as soon as <code>M</code> contains a <b>non-uniform scale</b>. Stretch a circle 2× in x and a tangent direction stretches with it, but if you also stretch the normal it tilts toward the x axis and is no longer perpendicular. The fix is to transform normals with the <b>inverse-transpose</b> of the upper-left 3×3 of the matrix, then renormalize:</p>
+    <div class="math">tangent:  t' = M · t
+normal:   n' = normalize( (M⁻¹)ᵀ · n )
+check:    n'ᵀ t' = nᵀ M⁻¹ M t = nᵀ t = 0   ✓</div>
+    <p>For pure rotations (and uniform scale) <code>(M⁻¹)ᵀ</code> equals <code>M</code> up to a scale factor, which is why the mistake often goes unnoticed. Old OpenGL called this matrix <code>gl_NormalMatrix</code>; today you compute it yourself and pass it to the shader.</p>
+    <div class="callout vtx"><strong>Key idea.</strong> Normals are not positions. Interpolate vertex normals to fake smoothness, and transform them with <code>(M⁻¹)ᵀ</code> so they stay perpendicular under any scale.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="lambert">
+    <h2><span class="step-no">STEP 2</span>Lights and Lambert's cosine law</h2>
+    <p>The classic model uses two kinds of light. A <b>directional light</b> is infinitely far away, like the sun: every point sees the same direction <code>L</code> and the same brightness. A <b>point light</b> sits at a position; <code>L</code> points from the surface toward it and changes across the surface, and its brightness falls off with distance <code>d</code>:</p>
+    <div class="math">attenuation = 1 / (k_c + k_l·d + k_q·d²)
+here: k_c = 1, k_l = 0.1, k_q = 0.25
+d = 2  →  1 / (1 + 0.2 + 1.0) = 0.45</div>
+    <p>A matte surface (paper, chalk, unpolished clay) scatters incoming light equally in all directions, so it looks equally bright from any viewpoint. How bright depends only on the angle <code>θ</code> between the normal and the light. Picture a beam of fixed width: when it arrives at an angle, its energy spreads over a footprint <code>1/cos θ</code> times wider, so each patch of surface receives <code>cos θ</code> as much. That is <b>Lambert's cosine law</b> (Johann Lambert, 1760). Since <code>N</code> and <code>L</code> are unit vectors, <code>cos θ</code> is just a dot product:</p>
+    <div class="math">diffuse = k_d · albedo · light_color · max(N·L, 0)
+θ = 0°  → N·L = 1.00     θ = 60° → N·L = 0.50
+θ = 90° → N·L = 0.00     θ > 90°: light is behind → clamp to 0</div>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="lam-a" aria-label="Side view of a surface with its normal N, a light direction L you can drag, the beam footprint and a cosine bar"></canvas><div class="hud" id="lam-a-hud"></div><span class="pane-label">The cosine law</span></div>
+        <div class="viz-stage"><canvas id="lam-b" aria-label="A matte sphere lit by a light you can drag or move with arrow keys; hover to read N·L at a point" tabindex="0"></canvas><div class="hud" id="lam-b-hud"></div><span class="pane-label">Diffuse sphere</span></div>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="lam-th">Light angle θ <output for="lam-th"></output></label><input type="range" id="lam-th" min="-120" max="120" value="40"></div>
+        <div class="btn-row" id="lam-type" role="group" aria-label="Light type"><button class="btn" data-value="dir" aria-pressed="true">Directional</button><button class="btn" data-value="point">Point</button></div>
+        <div class="control"><label for="lam-dist">Point light distance <output for="lam-dist"></output></label><input type="range" id="lam-dist" min="1.5" max="6" step="0.1" value="2.6"></div>
+      </div>
+      <figcaption><b>Try it:</b> drag the light on the left and watch the footprint widen as the cosine bar shrinks. On the sphere, drag (or focus it and use the arrow keys) to move the light; dragging outside the sphere's rim moves the light behind it. Hover to read <code>N·L</code>. Switch to a point light and change its distance to see attenuation.</figcaption>
+    </figure>
+    <p>Notice the soft shading boundary on the sphere, called the <b>terminator</b>: it is where <code>N·L</code> crosses zero. Everything past it is black, because nothing in this model lets light bounce. That is the problem the ambient term in step 4 patches.</p>
+    <div class="callout frag"><strong>Key idea.</strong> Diffuse brightness is <code>max(N·L, 0)</code>: one dot product per shading point, independent of where the camera is.</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="specular">
+    <h2><span class="step-no">STEP 3</span>Specular highlights: Phong vs Blinn-Phong</h2>
+    <p>Shiny surfaces also show a bright <b>highlight</b>: a blurry reflection of the light. Unlike diffuse, it depends on where you look from, so we need the <b>view vector</b> <code>V</code> from the surface to the camera. In 1975 Bui Tuong Phong proposed reflecting <code>L</code> about the normal to get the mirror direction <code>R</code>, then measuring how close <code>V</code> is to it:</p>
+    <div class="math">R = 2(N·L)N − L
+Phong:        spec = max(R·V, 0)ⁿ
+Blinn-Phong:  H = normalize(L + V)
+              spec = max(N·H, 0)ⁿ</div>
+    <p>In 1977 Jim Blinn suggested the <b>half vector</b> <code>H</code>, halfway between <code>L</code> and <code>V</code>. When <code>H</code> lines up with <code>N</code>, the viewer is exactly in the mirror direction. <code>N·H</code> is cheaper when light and viewer are far away (H is then constant), it behaves better at grazing angles, and it was the form used by fixed-function OpenGL.</p>
+    <p>The exponent <code>n</code> is the <b>shininess</b>. Raising a number below 1 to a high power shrinks it quickly, so a big <code>n</code> gives a small, sharp highlight: with <code>R·V = 0.95</code>, <code>n = 8</code> gives 0.66 but <code>n = 128</code> gives 0.0014. In the plane, the angle between <code>N</code> and <code>H</code> is exactly half the angle between <code>R</code> and <code>V</code>, so Blinn-Phong's lobe is wider; you need roughly 4× the exponent to match Phong's highlight size.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="spec-a" aria-label="Diagram of the normal N, light L, view V, reflection R and half vector H; drag L or V"></canvas><div class="hud" id="spec-a-hud"></div><span class="pane-label">Vectors</span></div>
+        <div class="viz-stage"><canvas id="spec-b" aria-label="Polar plot of specular intensity for every view direction, with the current model filled and the other dashed"></canvas><div class="hud" id="spec-b-hud"></div><span class="pane-label">Highlight lobe</span></div>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="spec-l">Light angle <output for="spec-l"></output></label><input type="range" id="spec-l" min="-85" max="85" value="-40"></div>
+        <div class="control"><label for="spec-v">View angle <output for="spec-v"></output></label><input type="range" id="spec-v" min="-85" max="85" value="25"></div>
+        <div class="control"><label for="spec-n">Shininess n <output for="spec-n"></output></label><input type="range" id="spec-n" min="1" max="200" value="32"></div>
+        <div class="btn-row" id="spec-model" role="group" aria-label="Specular model"><button class="btn" data-value="phong" aria-pressed="true">Phong (R·V)ⁿ</button><button class="btn" data-value="blinn">Blinn-Phong (N·H)ⁿ</button></div>
+      </div>
+      <div class="legend"><span><i class="sw-n"></i>N normal</span><span><i class="sw-l"></i>L light</span><span><i class="sw-v"></i>V view</span><span><i class="sw-r"></i>R reflection</span><span><i class="sw-h"></i>H half vector</span></div>
+      <figcaption><b>Try it:</b> drag the tips of L and V. Put V on top of R: Phong reaches 1. The lobe plot shows the highlight for every possible view direction; raise the shininess and watch it narrow. Compare the dashed lobe of the other model.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> Specular depends on the viewer. Phong compares <code>V</code> with the mirror direction <code>R</code>; Blinn-Phong compares <code>N</code> with the half vector <code>H</code>. Shininess <code>n</code> controls how tight the highlight is.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="terms">
+    <h2><span class="step-no">STEP 4</span>Putting the terms together</h2>
+    <p>The full classic model adds three terms. The <b>ambient</b> term is a constant that stands in for all the light bouncing around the room, so shadowed sides are not pitch black. It is a crude hack (real indirect light is the subject of global illumination), but it is cheap.</p>
+    <div class="math">color = k_a · albedo · C_light                    ambient
+      + k_d · albedo · C_light · max(N·L, 0)      diffuse
+      + k_s · C_light · max(N·H, 0)ⁿ              specular
+(per light, times attenuation for point lights; sum over lights)</div>
+    <p>Notice the specular term uses the light's color but <em>not</em> the albedo: on plastic the highlight is the color of the light, not the paint. Colors here are in <b>linear</b> light, where adding and multiplying is physically meaningful. The result is encoded to sRGB only when written to the screen; chapter 07 explains why that step matters.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="terms-c" class="tall" aria-label="Four spheres showing the ambient, diffuse and specular terms separately and their sum; drag or use arrow keys to move the light" tabindex="0"></canvas><div class="hud" id="terms-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="t-ka">Ambient k_a <output for="t-ka"></output></label><input type="range" id="t-ka" min="0" max="0.5" step="0.01" value="0.08"></div>
+        <div class="control"><label for="t-kd">Diffuse k_d <output for="t-kd"></output></label><input type="range" id="t-kd" min="0" max="1" step="0.01" value="0.8"></div>
+        <div class="control"><label for="t-ks">Specular k_s <output for="t-ks"></output></label><input type="range" id="t-ks" min="0" max="1" step="0.01" value="0.5"></div>
+        <div class="control"><label for="t-n">Shininess n <output for="t-n"></output></label><input type="range" id="t-n" min="2" max="256" value="48"></div>
+        <div class="btn-row" id="t-color" role="group" aria-label="Light color"><button class="btn" data-value="white" aria-pressed="true">White light</button><button class="btn" data-value="warm">Warm</button><button class="btn" data-value="cool">Cool</button><button class="btn" data-value="magenta">Magenta</button></div>
+      </div>
+      <figcaption><b>Try it:</b> drag the light on any sphere. Turn <code>k_s</code> to 0 for chalk, raise it for plastic. Switch the light to warm and note the highlight turns warm while the blue paint stays blue-ish. Push all three coefficients up and the sum clips to white: the classic model does not conserve energy.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> Final color = ambient + diffuse + specular, computed in linear space. Each term is a simple, separable knob, which is why this model ruled real-time graphics for decades.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="frequency">
+    <h2><span class="step-no">STEP 5</span>Where to evaluate: flat, Gouraud or per-pixel</h2>
+    <p>We have a formula. The remaining question is <em>how often</em> to run it, and that is a pipeline question:</p>
+    <ul>
+      <li><b>Flat shading:</b> once per triangle, using the face normal. Cheapest; facets are obvious.</li>
+      <li><b>Gouraud shading</b> (Henri Gouraud, 1971): once per <em>vertex</em> using vertex normals, in the vertex stage. The rasterizer then interpolates the resulting <em>colors</em> across the triangle.</li>
+      <li><b>Phong shading / per-pixel lighting</b> (Phong, 1975): interpolate the <em>normals</em> instead, renormalize, and run the whole formula for every fragment. Not to be confused with the Phong <em>reflection model</em> of step 3; the same paper introduced both.</li>
+    </ul>
+    <p>Gouraud's weakness is the highlight. A specular highlight is a small, sharp feature. If it lands in the middle of a big triangle, none of the three vertices sees it, so the interpolated color has no highlight at all. When the light moves, the highlight pops on as it crosses a vertex and blurs into a star shape along edges.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="gour" class="tall" aria-label="A low-polygon sphere rendered with flat, Gouraud and per-pixel Phong shading side by side; drag or use arrow keys to move the light" tabindex="0"></canvas><div class="hud" id="gour-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="g-seg">Tessellation (segments) <output for="g-seg"></output></label><input type="range" id="g-seg" min="4" max="40" value="8"></div>
+        <div class="control"><label for="g-n">Shininess n <output for="g-n"></output></label><input type="range" id="g-n" min="4" max="200" value="80"></div>
+        <div class="btn-row" id="g-mode" role="group" aria-label="Shading mode"><button class="btn" data-value="all" aria-pressed="true">All three</button><button class="btn" data-value="flat">Flat</button><button class="btn" data-value="gouraud">Gouraud</button><button class="btn" data-value="phong">Phong</button></div>
+        <div class="btn-row"><button class="btn" id="g-wire" type="button" aria-pressed="false">Wireframe</button><button class="btn" id="g-orbit" type="button" aria-pressed="false">Orbit light</button></div>
+      </div>
+      <figcaption><b>Try it:</b> at 8 segments, drag the light slowly or press <b>Orbit light</b>: the Gouraud highlight flickers and vanishes between vertices while the Phong one glides smoothly. Turn on the wireframe to see why. Raise the tessellation and Gouraud catches up, at the cost of many more triangles.</figcaption>
+    </figure>
+    <p>The heads-up display counts lighting evaluations. Flat runs the formula once per visible triangle, Gouraud once per vertex, per-pixel once per fragment: often 50 to 100 times more work. In 1990s hardware that cost was decisive. Today fragment shaders are cheap enough that per-pixel lighting is the default.</p>
+    <details class="history"><summary>A short history</summary>
+      <p><b>1971:</b> Henri Gouraud publishes smooth shading by interpolating vertex intensities. <b>1975:</b> Bui Tuong Phong publishes both his reflection model (ambient + diffuse + <code>(R·V)ⁿ</code> specular) and normal interpolation. <b>1977:</b> Jim Blinn introduces the half-vector form <code>(N·H)ⁿ</code>.</p>
+      <p>This combination became the <b>fixed-function lighting</b> of OpenGL 1.x (<code>glLight</code>, <code>glMaterial</code>) and Direct3D's early versions: per-light ambient, diffuse and specular colors, Blinn-Phong specular, constant/linear/quadratic attenuation, all evaluated <em>per vertex</em> and then Gouraud-interpolated. Programmable shaders (chapter 05) moved lighting into the fragment shader, and physically based shading (chapter 07) replaced the ad-hoc terms.</p>
+    </details>
+    <div class="callout frag"><strong>Key idea.</strong> Where you evaluate lighting matters as much as the formula. Interpolating colors (Gouraud) loses features smaller than a triangle; interpolating normals and lighting per pixel keeps them.</div>
+  </section>
+
+  <section class="step" id="recap"><h2><span class="step-no">RECAP</span>What to remember</h2><ul>
+    <li><b>Normals</b> describe orientation. Face normals give facets; interpolated vertex normals fake smooth curves. Transform normals with <code>(M⁻¹)ᵀ</code> and renormalize.</li>
+    <li><b>Lights:</b> directional lights have one fixed <code>L</code>; point lights have a per-point <code>L</code> and attenuation <code>1/(k_c + k_l·d + k_q·d²)</code>.</li>
+    <li><b>Diffuse</b> (Lambert): <code>k_d · albedo · max(N·L, 0)</code>, independent of the viewer.</li>
+    <li><b>Specular:</b> Phong <code>(R·V)ⁿ</code> or Blinn-Phong <code>(N·H)ⁿ</code>; higher shininess means a tighter highlight. Blinn-Phong needs about 4× the exponent for a similar size.</li>
+    <li><b>Ambient</b> is a constant stand-in for bounced light. Final color = ambient + diffuse + specular, in linear space, encoded to sRGB for display.</li>
+    <li><b>Flat</b> = per triangle, <b>Gouraud</b> = per vertex with interpolated colors (misses small highlights), <b>Phong shading</b> = per fragment with interpolated normals.</li>
+    <li>This is the classic fixed-function OpenGL lighting model (Gouraud 1971, Phong 1975, Blinn 1977). Chapter 07 replaces it with physically based shading.</li>
+  </ul></section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const { v3, m4, clamp } = RP;
+  const MONO = "600 12px 'JetBrains Mono', ui-monospace, Consolas, monospace";
+  const DEG = Math.PI / 180;
+
+  /* ---------- sRGB encode (linear -> display). Chapter 07 explains why. ---------- */
+  const LUT = new Uint8ClampedArray(4097);
+  for (let i = 0; i <= 4096; i++) { const x = i / 4096; LUT[i] = Math.round(255 * (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055)); }
+  const enc = (x) => LUT[(clamp(x) * 4096) | 0];
+
+  /* ---------- Drawing helpers ---------- */
+  function arrow(ctx, x0, y0, x1, y1, col, lw, dash) {
+    lw = lw || 2;
+    ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = lw; ctx.lineCap = "round";
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); ctx.setLineDash([]);
+    const a = Math.atan2(y1 - y0, x1 - x0), s = 6 + lw * 1.5;
+    ctx.beginPath(); ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - s * Math.cos(a - 0.4), y1 - s * Math.sin(a - 0.4));
+    ctx.lineTo(x1 - s * Math.cos(a + 0.4), y1 - s * Math.sin(a + 0.4));
+    ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+  function text(ctx, t, x, y, col, align, font) {
+    ctx.font = font || MONO; ctx.fillStyle = col; ctx.textAlign = align || "left"; ctx.textBaseline = "middle"; ctx.fillText(t, x, y);
+  }
+
+  /* ---------- Offscreen pixel buffers ---------- */
+  const bufs = new Map();
+  function getBuf(key, n) {
+    let b = bufs.get(key);
+    if (!b || b.n !== n) {
+      const c = document.createElement("canvas"); c.width = c.height = n;
+      const g = c.getContext("2d");
+      b = { c, g, img: g.createImageData(n, n), n, depth: new Float32Array(n * n) };
+      bufs.set(key, b);
+    }
+    return b;
+  }
+  /* Render a unit sphere (orthographic camera on +Z looking down -Z) per pixel. fn(N) -> linear rgb. */
+  function drawSphere(ctx, key, cx, cy, R, dpr, fn, cap) {
+    const n = Math.max(16, Math.min(cap || 240, Math.round(2 * R * dpr)));
+    const b = getBuf(key, n), d = b.img.data; d.fill(0);
+    const inv = 2 / n, edge = 1 + inv;
+    for (let j = 0; j < n; j++) {
+      const y = 1 - (j + 0.5) * inv;
+      for (let i = 0; i < n; i++) {
+        const x = (i + 0.5) * inv - 1, r = Math.sqrt(x * x + y * y);
+        if (r > edge) continue;
+        const N = r < 1 ? [x, y, Math.sqrt(1 - r * r)] : [x / r, y / r, 0];
+        const col = fn(N), k = (j * n + i) * 4;
+        d[k] = enc(col[0]); d[k + 1] = enc(col[1]); d[k + 2] = enc(col[2]);
+        d[k + 3] = Math.round(255 * clamp((1 - r) * n * 0.5 + 0.5));
+      }
+    }
+    b.g.putImageData(b.img, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(b.c, cx - R, cy - R, 2 * R, 2 * R);
+  }
+
+  /* ---------- Lighting (linear space). V = (0,0,1): orthographic viewer on +Z. ---------- */
+  function padToDir(px, py) {
+    const r = Math.hypot(px, py);
+    if (r < 1e-6) return [0, 0, 1];
+    const phi = Math.min(r, 2) * Math.PI / 2, s = Math.sin(phi) / r;
+    return [px * s, py * s, Math.cos(phi)];
+  }
+  function makeLight(lp, type, dist) {
+    const dir = padToDir(lp.x, lp.y);
+    return { type: type || "dir", dir, pos: v3.scale(dir, dist || 3), power: 2.5 };
+  }
+  function shade(N, P, L, m) {
+    let l = L.dir, att = 1;
+    if (L.type === "point") {
+      const dx = L.pos[0] - P[0], dy = L.pos[1] - P[1], dz = L.pos[2] - P[2];
+      const dist = Math.hypot(dx, dy, dz) || 1;
+      l = [dx / dist, dy / dist, dz / dist];
+      att = L.power / (1 + 0.1 * dist + 0.25 * dist * dist);
+    }
+    const ndl = N[0] * l[0] + N[1] * l[1] + N[2] * l[2];
+    let sp = 0;
+    if (ndl > 0 && m.ks > 0) {
+      let c;
+      if (m.phong) c = 2 * ndl * N[2] - l[2]; // R·V with R = 2(N·L)N - L, V = (0,0,1)
+      else { const hx = l[0], hy = l[1], hz = l[2] + 1, hl = Math.hypot(hx, hy, hz) || 1; c = (N[0] * hx + N[1] * hy + N[2] * hz) / hl; }
+      sp = Math.pow(Math.max(c, 0), m.shin);
+    }
+    return { ndl, att, a: m.ka, d: m.kd * Math.max(ndl, 0) * att, s: m.ks * sp * att };
+  }
+  function litColor(t, m, lc) {
+    const k = t.a + t.d;
+    return [k * m.albedo[0] * lc[0] + t.s * lc[0], k * m.albedo[1] * lc[1] + t.s * lc[1], k * m.albedo[2] * lc[2] + t.s * lc[2]];
+  }
+  function drawLightMarker(ctx, cx, cy, R, lp, c) {
+    const x = cx + lp.x * R, y = cy - lp.y * R, behind = Math.hypot(lp.x, lp.y) > 1;
+    ctx.save();
+    ctx.strokeStyle = c.warn; ctx.fillStyle = behind ? c.surface : c.warn; ctx.lineWidth = 2;
+    if (behind) ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.setLineDash([]);
+    if (!behind) for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; ctx.beginPath(); ctx.moveTo(x + Math.cos(a) * 11, y + Math.sin(a) * 11); ctx.lineTo(x + Math.cos(a) * 15, y + Math.sin(a) * 15); ctx.stroke(); }
+    ctx.restore();
+    if (behind) text(ctx, "behind", x, y + 20, c.muted, "center");
+  }
+  /* Drag / arrow keys move a light "pad" position (sphere-radius units, |p| <= 2; > 1 means behind the sphere). */
+  function lightPad(el, getGeom, lp, onChange, hover) {
+    let geom = null;
+    const clampPad = () => { const r = Math.hypot(lp.x, lp.y); if (r > 2) { lp.x *= 2 / r; lp.y *= 2 / r; } };
+    const set = (x, y) => { lp.x = (x - geom.cx) / geom.R; lp.y = -(y - geom.cy) / geom.R; clampPad(); onChange(); };
+    RP.drag(el, { down(x, y) { geom = getGeom(x, y); if (!geom) return false; set(x, y); }, move(x, y) { if (geom) set(x, y); }, hover });
+    el.addEventListener("keydown", (e) => {
+      const d = 0.08, k = { ArrowLeft: [-d, 0], ArrowRight: [d, 0], ArrowUp: [0, d], ArrowDown: [0, -d] }[e.key];
+      if (!k) return;
+      e.preventDefault(); lp.x += k[0]; lp.y += k[1]; clampPad(); onChange();
+    });
+  }
+
+  /* =====================================================================
+     STEP 1 — normals
+     ===================================================================== */
+  const s1 = { seg: 6, mode: "face", sx: 2.2, show: "both" };
+  const nrmA = RP.canvas("#nrm-a", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const cx = w / 2, base = h * 0.84, A = w * 0.4, B = h * 0.56, nl = Math.min(34, h * 0.1);
+    const curve = (t) => [cx + A * Math.cos(t), base - B * Math.sin(t)];
+    // true smooth curve (dashed)
+    ctx.save(); ctx.strokeStyle = c.muted; ctx.setLineDash([4, 4]); ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = 0; i <= 80; i++) { const p = curve(Math.PI - Math.PI * i / 80); i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); }
+    ctx.stroke(); ctx.restore();
+    // polyline approximation
+    const pts = []; for (let i = 0; i <= s1.seg; i++) pts.push(curve(Math.PI - Math.PI * i / s1.seg));
+    ctx.beginPath(); ctx.moveTo(pts[0][0], base); pts.forEach((p) => ctx.lineTo(p[0], p[1])); ctx.lineTo(pts[pts.length - 1][0], base); ctx.closePath();
+    ctx.fillStyle = RP.alpha(c.ras, 0.14); ctx.fill();
+    ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke();
+    // face normals (screen y down: tangent (dx,dy) -> outward normal (dy,-dx))
+    const fn = [];
+    for (let i = 0; i < s1.seg; i++) {
+      const dx = pts[i + 1][0] - pts[i][0], dy = pts[i + 1][1] - pts[i][1], l = Math.hypot(dx, dy);
+      fn.push([dy / l, -dx / l]);
+    }
+    if (s1.mode === "face") {
+      for (let i = 0; i < s1.seg; i++) {
+        const mx = (pts[i][0] + pts[i + 1][0]) / 2, my = (pts[i][1] + pts[i + 1][1]) / 2;
+        arrow(ctx, mx, my, mx + fn[i][0] * nl, my + fn[i][1] * nl, c.frag, 2);
+      }
+    } else {
+      const vn = pts.map((p, i) => {
+        const a = fn[Math.max(0, i - 1)], b = fn[Math.min(s1.seg - 1, i)];
+        const x = a[0] + b[0], y = a[1] + b[1], l = Math.hypot(x, y) || 1;
+        return [x / l, y / l];
+      });
+      // interpolated normals along each segment
+      for (let i = 0; i < s1.seg; i++) for (let k = 1; k < 4; k++) {
+        const t = k / 4, x = vn[i][0] * (1 - t) + vn[i + 1][0] * t, y = vn[i][1] * (1 - t) + vn[i + 1][1] * t, l = Math.hypot(x, y) || 1;
+        const px = pts[i][0] * (1 - t) + pts[i + 1][0] * t, py = pts[i][1] * (1 - t) + pts[i + 1][1] * t;
+        arrow(ctx, px, py, px + x / l * nl * 0.7, py + y / l * nl * 0.7, RP.alpha(c.vtx, 0.55), 1.2);
+      }
+      pts.forEach((p, i) => arrow(ctx, p[0], p[1], p[0] + vn[i][0] * nl, p[1] + vn[i][1] * nl, c.vtx, 2.2));
+    }
+    pts.forEach((p) => { ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, Math.PI * 2); ctx.fillStyle = c.ink; ctx.fill(); });
+    document.getElementById("nrm-a-hud").textContent = s1.mode === "face"
+      ? `${s1.seg} face normals\none per flat segment → facets`
+      : `${s1.seg + 1} vertex normals\naveraged, then interpolated`;
+  });
+  const nrmB = RP.canvas("#nrm-b", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const sx = s1.sx, cx = w / 2, cy = h / 2 + 10, r = Math.min(h * 0.28, (w * 0.4) / Math.max(sx, 1)), nl = Math.min(40, h * 0.12);
+    ctx.beginPath(); ctx.ellipse(cx, cy, r * sx, r, 0, 0, Math.PI * 2);
+    ctx.fillStyle = RP.alpha(c.ras, 0.14); ctx.fill(); ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke();
+    let worst = 0;
+    for (let k = 0; k < 12; k++) {
+      const t = k * Math.PI / 6 + 0.26, nx = Math.cos(t), ny = Math.sin(t);
+      const px = cx + sx * nx * r, py = cy - ny * r;
+      const tx = -sx * Math.sin(t), ty = Math.cos(t), tl = Math.hypot(tx, ty);
+      ctx.strokeStyle = c.muted; ctx.lineWidth = 1; ctx.beginPath();
+      ctx.moveTo(px - tx / tl * 14, py + ty / tl * 14); ctx.lineTo(px + tx / tl * 14, py - ty / tl * 14); ctx.stroke();
+      let ax = sx * nx, ay = ny, al = Math.hypot(ax, ay); ax /= al; ay /= al;     // M · n
+      let bx = nx / sx, by = ny, bl = Math.hypot(bx, by); bx /= bl; by /= bl;     // (M^-1)^T · n
+      worst = Math.max(worst, Math.acos(clamp(ax * bx + ay * by, -1, 1)));
+      if (s1.show !== "correct") arrow(ctx, px, py, px + ax * nl, py - ay * nl, c.bad, 2);
+      if (s1.show !== "naive") arrow(ctx, px, py, px + bx * nl, py - by * nl, c.good, 2);
+    }
+    document.getElementById("nrm-b-hud").textContent = `M = scale(${sx.toFixed(2)}, 1)\nworst M·n error: ${(worst / DEG).toFixed(1)}°`;
+  });
+  RP.slider("#nrm-seg", (v) => { s1.seg = v; nrmA.draw(); });
+  RP.toggleGroup("#nrm-mode", (v) => { s1.mode = v; nrmA.draw(); });
+  RP.slider("#nrm-sx", (v) => { s1.sx = v; nrmB.draw(); });
+  RP.toggleGroup("#nrm-show", (v) => { s1.show = v; nrmB.draw(); });
+
+  /* =====================================================================
+     STEP 2 — Lambert
+     ===================================================================== */
+  const s2 = { th: 40, type: "dir", dist: 2.6, lp: { x: 0.55, y: 0.45 } };
+  let lamGeomA = null;
+  const lamA = RP.canvas("#lam-a", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const y0 = h * 0.66, ox = w / 2, Lr = Math.min(h * 0.46, w * 0.34);
+    lamGeomA = { ox, y0 };
+    const th = s2.th * DEG, ct = Math.cos(th), Ls = [Math.sin(th), -Math.cos(th)], perp = [Math.cos(th), Math.sin(th)];
+    // beam
+    if (ct > 0.12) {
+      const W = Lr * 0.42, far = Lr * 1.4;
+      const S1 = [ox + perp[0] * W / 2 + Ls[0] * far, y0 + perp[1] * W / 2 + Ls[1] * far];
+      const S2 = [ox - perp[0] * W / 2 + Ls[0] * far, y0 - perp[1] * W / 2 + Ls[1] * far];
+      const F1 = [ox + W / 2 / ct, y0], F2 = [ox - W / 2 / ct, y0];
+      ctx.beginPath(); ctx.moveTo(S1[0], S1[1]); ctx.lineTo(F1[0], F1[1]); ctx.lineTo(F2[0], F2[1]); ctx.lineTo(S2[0], S2[1]); ctx.closePath();
+      ctx.fillStyle = RP.alpha(c.warn, 0.16); ctx.fill();
+      ctx.strokeStyle = RP.alpha(c.warn, 0.6); ctx.lineWidth = 1; ctx.stroke();
+      ctx.strokeStyle = c.warn; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(F2[0], y0); ctx.lineTo(F1[0], y0); ctx.stroke();
+    }
+    // surface
+    ctx.fillStyle = c.surface; ctx.fillRect(w * 0.06, y0, w * 0.88, h * 0.06);
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(w * 0.06, y0); ctx.lineTo(w * 0.94, y0); ctx.stroke();
+    // angle arc
+    ctx.strokeStyle = c.muted; ctx.lineWidth = 1.5; ctx.beginPath();
+    ctx.arc(ox, y0, Lr * 0.32, -Math.PI / 2, -Math.PI / 2 + th, th < 0); ctx.stroke();
+    text(ctx, "θ", ox + Math.sin(th / 2) * Lr * 0.42, y0 - Math.cos(th / 2) * Lr * 0.42, c.ink, "center");
+    arrow(ctx, ox, y0, ox, y0 - Lr, c.ink, 2.5);
+    text(ctx, "N", ox + 8, y0 - Lr - 4, c.ink);
+    const lx = ox + Ls[0] * Lr, ly = y0 + Ls[1] * Lr;
+    arrow(ctx, ox, y0, lx, ly, c.warn, 2.5);
+    ctx.beginPath(); ctx.arc(lx + Ls[0] * 12, ly + Ls[1] * 12, 7, 0, Math.PI * 2); ctx.fillStyle = c.warn; ctx.fill();
+    text(ctx, "L", lx + Ls[0] * 28, ly + Ls[1] * 28, c.warn, "center");
+    // cos bar
+    const v = Math.max(ct, 0), bx = w * 0.1, bw = w * 0.8, by = h * 0.84;
+    text(ctx, `N·L = cos ${s2.th}° = ${ct.toFixed(2)}${ct < 0 ? " → clamped to 0" : ""}`, bx, by - 12, c.ink);
+    ctx.fillStyle = c.surface; ctx.fillRect(bx, by, bw, 12);
+    ctx.fillStyle = c.frag; ctx.fillRect(bx, by, bw * v, 12);
+    ctx.strokeStyle = c.line; ctx.strokeRect(bx, by, bw, 12);
+    document.getElementById("lam-a-hud").textContent = ct > 0.12
+      ? `footprint: ${(1 / ct).toFixed(2)}× wider\nenergy per area: ${ct.toFixed(2)}×`
+      : (ct > 0 ? "grazing light: footprint → ∞" : "light is behind the surface");
+  });
+  const thSlider = RP.slider("#lam-th", (v) => { s2.th = v; lamA.draw(); }, { fmt: (v) => v + "°" });
+  RP.drag(document.getElementById("lam-a"), {
+    down(x, y) { setTh(x, y); }, move(x, y) { setTh(x, y); },
+  });
+  function setTh(x, y) {
+    if (!lamGeomA) return;
+    const a = Math.atan2(x - lamGeomA.ox, lamGeomA.y0 - y) / DEG;
+    thSlider.value = Math.round(clamp(a, -120, 120));
+  }
+  const lamMat = { albedo: [0.8, 0.8, 0.8], ka: 0, kd: 1, ks: 0, shin: 1 };
+  let lamGeomB = null;
+  const lamHud = document.getElementById("lam-b-hud");
+  const lamDefaultHud = () => { lamHud.textContent = s2.type === "dir" ? "directional light\nhover the sphere" : `point light, d = ${s2.dist.toFixed(1)}\nhover the sphere`; };
+  const lamB = RP.canvas("#lam-b", (s) => {
+    const { ctx, w, h, c, dpr } = s;
+    ctx.clearRect(0, 0, w, h);
+    const R = Math.min(w, h) * 0.34, cx = w / 2, cy = h / 2 + 8;
+    lamGeomB = { cx, cy, R };
+    const L = makeLight(s2.lp, s2.type, s2.dist);
+    drawSphere(ctx, "lam", cx, cy, R, dpr, (N) => litColor(shade(N, N, L, lamMat), lamMat, [1, 1, 1]), 220);
+    drawLightMarker(ctx, cx, cy, R, s2.lp, c);
+  });
+  lightPad(document.getElementById("lam-b"), () => lamGeomB, s2.lp, () => lamB.draw(), (x, y) => {
+    if (!lamGeomB) return;
+    const px = (x - lamGeomB.cx) / lamGeomB.R, py = -(y - lamGeomB.cy) / lamGeomB.R, r = Math.hypot(px, py);
+    if (r >= 1) { lamDefaultHud(); return; }
+    const N = [px, py, Math.sqrt(1 - r * r)], t = shade(N, N, makeLight(s2.lp, s2.type, s2.dist), lamMat);
+    lamHud.textContent = `N·L = ${t.ndl.toFixed(2)}\natt = ${t.att.toFixed(2)}\nI = max(N·L,0)·att = ${t.d.toFixed(2)}`;
+  });
+  RP.toggleGroup("#lam-type", (v) => { s2.type = v; lamDefaultHud(); lamB.draw(); });
+  RP.slider("#lam-dist", (v) => { s2.dist = v; lamDefaultHud(); lamB.draw(); }, { fmt: (v) => v.toFixed(1) });
+
+  /* =====================================================================
+     STEP 3 — specular vectors and lobe
+     ===================================================================== */
+  const s3 = { a: -40, b: 25, n: 32, model: "phong" };
+  function specVal(aDeg, bDeg, n, model) {
+    if (Math.cos(aDeg * DEG) <= 0) return 0;
+    const c = model === "phong" ? Math.cos((aDeg + bDeg) * DEG) : Math.cos((aDeg + bDeg) / 2 * DEG);
+    return Math.pow(Math.max(c, 0), n);
+  }
+  let specGeom = null;
+  const specA = RP.canvas("#spec-a", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const ox = w / 2, oy = h * 0.8, Lr = Math.min(h * 0.6, w * 0.38);
+    specGeom = { ox, oy, Lr };
+    const dir = (deg) => [Math.sin(deg * DEG), -Math.cos(deg * DEG)];
+    ctx.fillStyle = c.surface; ctx.fillRect(w * 0.06, oy, w * 0.88, h * 0.06);
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(w * 0.06, oy); ctx.lineTo(w * 0.94, oy); ctx.stroke();
+    const L = dir(s3.a), V = dir(s3.b), Rr = dir(-s3.a), hDeg = (s3.a + s3.b) / 2, H = dir(hDeg);
+    const phong = s3.model === "phong";
+    // highlight the angle that matters
+    ctx.save(); ctx.strokeStyle = phong ? c.frag : c.ras; ctx.lineWidth = 3; ctx.globalAlpha = 0.6; ctx.beginPath();
+    const r0 = Lr * 0.55;
+    if (phong) { const a1 = -Math.PI / 2 - s3.a * DEG, a2 = -Math.PI / 2 + s3.b * DEG; ctx.arc(ox, oy, r0, Math.min(a1, a2), Math.max(a1, a2)); }
+    else { const a2 = -Math.PI / 2 + hDeg * DEG; ctx.arc(ox, oy, r0, Math.min(-Math.PI / 2, a2), Math.max(-Math.PI / 2, a2)); }
+    ctx.stroke(); ctx.restore();
+    arrow(ctx, ox, oy, ox, oy - Lr, c.ink, 2.5); text(ctx, "N", ox + 8, oy - Lr - 2, c.ink);
+    arrow(ctx, ox, oy, ox + Rr[0] * Lr * 0.9, oy + Rr[1] * Lr * 0.9, phong ? c.frag : RP.alpha(c.frag, 0.35), 2, [6, 4]);
+    text(ctx, "R", ox + Rr[0] * (Lr * 0.9 + 14), oy + Rr[1] * (Lr * 0.9 + 14), c.frag, "center");
+    arrow(ctx, ox, oy, ox + H[0] * Lr * 0.75, oy + H[1] * Lr * 0.75, phong ? RP.alpha(c.ras, 0.35) : c.ras, 2, [6, 4]);
+    text(ctx, "H", ox + H[0] * (Lr * 0.75 + 14), oy + H[1] * (Lr * 0.75 + 14), c.ras, "center");
+    arrow(ctx, ox, oy, ox + L[0] * Lr, oy + L[1] * Lr, c.warn, 2.5);
+    ctx.beginPath(); ctx.arc(ox + L[0] * Lr, oy + L[1] * Lr, 7, 0, Math.PI * 2); ctx.fillStyle = c.warn; ctx.fill();
+    text(ctx, "L", ox + L[0] * (Lr + 20), oy + L[1] * (Lr + 20), c.warn, "center");
+    arrow(ctx, ox, oy, ox + V[0] * Lr, oy + V[1] * Lr, c.out, 2.5);
+    ctx.beginPath(); ctx.arc(ox + V[0] * Lr, oy + V[1] * Lr, 7, 0, Math.PI * 2); ctx.fillStyle = c.out; ctx.fill();
+    text(ctx, "V", ox + V[0] * (Lr + 20), oy + V[1] * (Lr + 20), c.out, "center");
+    const rv = Math.cos((s3.a + s3.b) * DEG), nh = Math.cos(hDeg * DEG);
+    document.getElementById("spec-a-hud").textContent =
+      `${phong ? "▶ " : "  "}R·V = ${rv.toFixed(3)} → ^${s3.n} = ${specVal(s3.a, s3.b, s3.n, "phong").toFixed(3)}\n` +
+      `${phong ? "  " : "▶ "}N·H = ${nh.toFixed(3)} → ^${s3.n} = ${specVal(s3.a, s3.b, s3.n, "blinn").toFixed(3)}`;
+  });
+  const specB = RP.canvas("#spec-b", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const ox = w / 2, oy = h * 0.86, Rm = Math.min(w * 0.44, h * 0.72);
+    const dir = (deg) => [Math.sin(deg * DEG), -Math.cos(deg * DEG)];
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1;
+    for (const f of [0.25, 0.5, 0.75, 1]) { ctx.beginPath(); ctx.arc(ox, oy, Rm * f, Math.PI, 2 * Math.PI); ctx.stroke(); }
+    for (let d = -90; d <= 90; d += 30) { const p = dir(d); ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + p[0] * Rm, oy + p[1] * Rm); ctx.stroke(); }
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(ox - Rm - 10, oy); ctx.lineTo(ox + Rm + 10, oy); ctx.stroke();
+    const lobe = (model) => { ctx.beginPath(); ctx.moveTo(ox, oy); for (let d = -90; d <= 90; d += 1) { const v = specVal(s3.a, d, s3.n, model), p = dir(d); ctx.lineTo(ox + p[0] * v * Rm, oy + p[1] * v * Rm); } ctx.closePath(); };
+    const other = s3.model === "phong" ? "blinn" : "phong";
+    lobe(other); ctx.setLineDash([5, 4]); ctx.strokeStyle = c.muted; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    lobe(s3.model); ctx.fillStyle = RP.alpha(s3.model === "phong" ? c.frag : c.ras, 0.25); ctx.fill(); ctx.strokeStyle = s3.model === "phong" ? c.frag : c.ras; ctx.lineWidth = 2; ctx.stroke();
+    const Rd = dir(-s3.a);
+    ctx.setLineDash([3, 4]); ctx.strokeStyle = c.frag; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + Rd[0] * Rm, oy + Rd[1] * Rm); ctx.stroke(); ctx.setLineDash([]);
+    const Vd = dir(s3.b), vv = specVal(s3.a, s3.b, s3.n, s3.model);
+    ctx.strokeStyle = c.out; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + Vd[0] * Rm, oy + Vd[1] * Rm); ctx.stroke();
+    ctx.beginPath(); ctx.arc(ox + Vd[0] * vv * Rm, oy + Vd[1] * vv * Rm, 5, 0, Math.PI * 2); ctx.fillStyle = c.out; ctx.fill();
+    const Ld = dir(s3.a); arrow(ctx, ox + Ld[0] * Rm * 1.02, oy + Ld[1] * Rm * 1.02, ox + Ld[0] * Rm * 0.85, oy + Ld[1] * Rm * 0.85, c.warn, 2);
+    document.getElementById("spec-b-hud").textContent = `filled: ${s3.model === "phong" ? "Phong" : "Blinn-Phong"}\ndashed: ${other === "phong" ? "Phong" : "Blinn-Phong"}\nradius = intensity`;
+  });
+  const lSlider = RP.slider("#spec-l", (v) => { s3.a = v; specA.draw(); specB.draw(); }, { fmt: (v) => v + "°" });
+  const vSlider = RP.slider("#spec-v", (v) => { s3.b = v; specA.draw(); specB.draw(); }, { fmt: (v) => v + "°" });
+  RP.slider("#spec-n", (v) => { s3.n = v; specA.draw(); specB.draw(); });
+  RP.toggleGroup("#spec-model", (v) => { s3.model = v; specA.draw(); specB.draw(); });
+  let specHandle = null;
+  const specAngle = (x, y) => clamp(Math.round(Math.atan2(x - specGeom.ox, specGeom.oy - y) / DEG), -85, 85);
+  RP.drag(document.getElementById("spec-a"), {
+    down(x, y) {
+      if (!specGeom) return false;
+      const ang = Math.atan2(x - specGeom.ox, specGeom.oy - y) / DEG;
+      specHandle = Math.abs(ang - s3.a) <= Math.abs(ang - s3.b) ? lSlider : vSlider;
+      specHandle.value = specAngle(x, y);
+    },
+    move(x, y) { if (specHandle) specHandle.value = specAngle(x, y); },
+    up() { specHandle = null; },
+  });
+
+  /* =====================================================================
+     STEP 4 — term breakdown
+     ===================================================================== */
+  const LIGHTS = { white: [1, 1, 1], warm: [1, 0.72, 0.42], cool: [0.55, 0.75, 1], magenta: [1, 0.3, 0.8] };
+  const s4 = { lp: { x: -0.45, y: 0.5 }, lc: LIGHTS.white, mat: { albedo: [0.1, 0.28, 0.7], ka: 0.08, kd: 0.8, ks: 0.5, shin: 48, phong: false } };
+  let termCells = [];
+  const PANELS = [
+    { name: "Ambient", f: "k_a·albedo·C", pick: (t, m, lc) => [t.a * m.albedo[0] * lc[0], t.a * m.albedo[1] * lc[1], t.a * m.albedo[2] * lc[2]] },
+    { name: "Diffuse", f: "k_d·albedo·C·N·L", pick: (t, m, lc) => [t.d * m.albedo[0] * lc[0], t.d * m.albedo[1] * lc[1], t.d * m.albedo[2] * lc[2]] },
+    { name: "Specular", f: "k_s·C·(N·H)ⁿ", pick: (t, m, lc) => [t.s * lc[0], t.s * lc[1], t.s * lc[2]] },
+    { name: "Sum", f: "final color", pick: (t, m, lc) => litColor(t, m, lc) },
+  ];
+  const terms = RP.canvas("#terms-c", (s) => {
+    const { ctx, w, h, c, dpr } = s;
+    ctx.clearRect(0, 0, w, h);
+    const cols = w >= 640 ? 4 : 2, rows = 4 / cols, cw = w / cols, ch = h / rows;
+    const R = Math.max(20, Math.min(cw * 0.36, (ch - 54) * 0.46));
+    const L = makeLight(s4.lp, "dir");
+    termCells = [];
+    PANELS.forEach((p, i) => {
+      const col = i % cols, row = Math.floor(i / cols);
+      const cx = col * cw + cw / 2, cy = row * ch + (ch - 34) / 2 + 6;
+      termCells.push({ x0: col * cw, y0: row * ch, cx, cy, R });
+      drawSphere(ctx, "term" + i, cx, cy, R, dpr, (N) => p.pick(shade(N, N, L, s4.mat), s4.mat, s4.lc), 180);
+      drawLightMarker(ctx, cx, cy, R, s4.lp, c);
+      text(ctx, p.name, cx, row * ch + ch - 30, c.ink, "center", "700 13px 'IBM Plex Sans', system-ui, sans-serif");
+      text(ctx, p.f, cx, row * ch + ch - 13, c.muted, "center", "400 11px 'JetBrains Mono', ui-monospace, monospace");
+      if (cols === 4 && i < 3) text(ctx, i < 2 ? "+" : "=", (col + 1) * cw, cy, c.muted, "center", "700 22px 'IBM Plex Sans', system-ui, sans-serif");
+    });
+    const m = s4.mat, sum = m.ka + m.kd + m.ks;
+    document.getElementById("terms-hud").textContent = `k_a + k_d + k_s = ${sum.toFixed(2)}${sum > 1 ? "  (> 1: can clip)" : ""}`;
+  });
+  lightPad(document.getElementById("terms-c"), (x, y) => {
+    const cell = termCells.find((q) => Math.abs(x - q.cx) <= Math.max(q.R * 2, 40) && Math.abs(y - q.cy) <= Math.max(q.R * 2, 40) && x >= q.x0 && y >= q.y0);
+    return cell || termCells[0] || null;
+  }, s4.lp, () => terms.draw());
+  RP.slider("#t-ka", (v) => { s4.mat.ka = v; terms.draw(); });
+  RP.slider("#t-kd", (v) => { s4.mat.kd = v; terms.draw(); });
+  RP.slider("#t-ks", (v) => { s4.mat.ks = v; terms.draw(); });
+  RP.slider("#t-n", (v) => { s4.mat.shin = v; terms.draw(); });
+  RP.toggleGroup("#t-color", (v) => { s4.lc = LIGHTS[v]; terms.draw(); });
+
+  /* =====================================================================
+     STEP 5 — flat vs Gouraud vs per-pixel
+     ===================================================================== */
+  const s5 = { seg: 8, mode: "all", wire: false, orbit: false, ang: 0.8, lp: { x: 0.3, y: 0.32 },
+    mat: { albedo: [0.7, 0.28, 0.08], ka: 0.06, kd: 0.8, ks: 0.7, shin: 80, phong: false } };
+  const meshCache = {};
+  const MROT = m4.mul(m4.rotX(0.35), m4.rotY(0.25));
+  function getMesh(seg) {
+    if (meshCache[seg]) return meshCache[seg];
+    const ms = RP.mesh.sphere(seg, Math.max(3, Math.round(seg / 2)));
+    const pos = ms.pos.map((p) => m4.xform(MROT, [p[0], p[1], p[2], 1]).slice(0, 3));
+    const nrm = ms.nrm.map((p) => v3.norm(m4.xform(MROT, [p[0], p[1], p[2], 0]).slice(0, 3))); // pure rotation: normal matrix = M
+    return (meshCache[seg] = { pos, nrm, tri: ms.tri });
+  }
+  const WHITE = [1, 1, 1];
+  function rasterize(key, n, mesh, mode, L, m) {
+    const b = getBuf(key, n), d = b.img.data, depth = b.depth;
+    d.fill(0); depth.fill(-1e9);
+    const k = n / 2 * 0.92, hh = n / 2, P = mesh.pos, NN = mesh.nrm;
+    const sx = P.map((p) => hh + p[0] * k), sy = P.map((p) => hh - p[1] * k);
+    const vcol = mode === "gouraud" ? NN.map((N, i) => litColor(shade(N, P[i], L, m), m, WHITE)) : null;
+    let tris = 0, frags = 0;
+    for (const t of mesh.tri) {
+      const ia = t[0], ib = t[1], ic = t[2], A = P[ia], B = P[ib], C = P[ic];
+      const fn = v3.cross(v3.sub(B, A), v3.sub(C, A)), fl = v3.len(fn);
+      if (fl < 1e-9 || fn[2] <= 0) continue; // degenerate or back-facing (camera on +Z)
+      tris++;
+      let fcol = null;
+      if (mode === "flat") { const cen = [(A[0] + B[0] + C[0]) / 3, (A[1] + B[1] + C[1]) / 3, (A[2] + B[2] + C[2]) / 3]; fcol = litColor(shade(v3.scale(fn, 1 / fl), cen, L, m), m, WHITE); }
+      const x0 = sx[ia], y0 = sy[ia], x1 = sx[ib], y1 = sy[ib], x2 = sx[ic], y2 = sy[ic];
+      const area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+      if (Math.abs(area) < 1e-9) continue;
+      const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2))), maxX = Math.min(n - 1, Math.ceil(Math.max(x0, x1, x2)));
+      const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2))), maxY = Math.min(n - 1, Math.ceil(Math.max(y0, y1, y2)));
+      for (let j = minY; j <= maxY; j++) {
+        const py = j + 0.5;
+        for (let i = minX; i <= maxX; i++) {
+          const px = i + 0.5;
+          const w0 = ((x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)) / area;
+          const w1 = ((x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)) / area;
+          const w2 = 1 - w0 - w1;
+          if (w0 < -1e-7 || w1 < -1e-7 || w2 < -1e-7) continue;
+          const z = w0 * A[2] + w1 * B[2] + w2 * C[2], idx = j * n + i;
+          if (z <= depth[idx]) continue;
+          depth[idx] = z;
+          let col;
+          if (mode === "flat") col = fcol;
+          else if (mode === "gouraud") { const a = vcol[ia], bb = vcol[ib], cc = vcol[ic]; col = [w0 * a[0] + w1 * bb[0] + w2 * cc[0], w0 * a[1] + w1 * bb[1] + w2 * cc[1], w0 * a[2] + w1 * bb[2] + w2 * cc[2]]; }
+          else {
+            const Na = NN[ia], Nb = NN[ib], Nc = NN[ic];
+            const N = v3.norm([w0 * Na[0] + w1 * Nb[0] + w2 * Nc[0], w0 * Na[1] + w1 * Nb[1] + w2 * Nc[1], w0 * Na[2] + w1 * Nb[2] + w2 * Nc[2]]);
+            const Pp = [w0 * A[0] + w1 * B[0] + w2 * C[0], w0 * A[1] + w1 * B[1] + w2 * C[1], z];
+            col = litColor(shade(N, Pp, L, m), m, WHITE);
+            frags++;
+          }
+          const q = idx * 4; d[q] = enc(col[0]); d[q + 1] = enc(col[1]); d[q + 2] = enc(col[2]); d[q + 3] = 255;
+        }
+      }
+    }
+    b.g.putImageData(b.img, 0, 0);
+    return { c: b.c, tris, evals: mode === "flat" ? tris : mode === "gouraud" ? P.length : frags };
+  }
+  let gourCells = [];
+  const MODE_NAME = { flat: "Flat", gouraud: "Gouraud", phong: "Phong (per-pixel)" };
+  const MODE_SUB = { flat: "per triangle", gouraud: "per vertex", phong: "per fragment" };
+  const gour = RP.canvas("#gour", (s) => {
+    const { ctx, w, h, c, dpr } = s;
+    ctx.clearRect(0, 0, w, h);
+    const modes = s5.mode === "all" ? ["flat", "gouraud", "phong"] : [s5.mode];
+    const cw = w / modes.length, D = Math.max(40, Math.min(cw * 0.94, h - 60)), cy = (h - 40) / 2 + 8;
+    const mesh = getMesh(s5.seg), L = makeLight(s5.lp, "dir");
+    const n = Math.max(32, Math.min(220, Math.round(D * dpr)));
+    gourCells = [];
+    const counts = {};
+    let tris = 0;
+    modes.forEach((mode, i) => {
+      const cx = cw * i + cw / 2, R = D / 2 * 0.92;
+      const r = rasterize("g" + i, n, mesh, mode, L, s5.mat);
+      counts[mode] = r.evals; tris = r.tris;
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(r.c, cx - D / 2, cy - D / 2, D, D);
+      gourCells.push({ x0: cw * i, cx, cy, R });
+      if (s5.wire) {
+        ctx.save(); ctx.strokeStyle = RP.alpha(c.ink, 0.45); ctx.lineWidth = 0.75; ctx.beginPath();
+        for (const t of mesh.tri) {
+          const A = mesh.pos[t[0]], B = mesh.pos[t[1]], C = mesh.pos[t[2]];
+          const fn = v3.cross(v3.sub(B, A), v3.sub(C, A));
+          if (fn[2] <= 1e-9) continue;
+          ctx.moveTo(cx + A[0] * R, cy - A[1] * R); ctx.lineTo(cx + B[0] * R, cy - B[1] * R); ctx.lineTo(cx + C[0] * R, cy - C[1] * R); ctx.closePath();
+        }
+        ctx.stroke(); ctx.restore();
+      }
+      drawLightMarker(ctx, cx, cy, R, s5.lp, c);
+      const narrow = cw < 190;
+      text(ctx, narrow ? MODE_NAME[mode].split(" ")[0] : MODE_NAME[mode], cx, h - 30, c.ink, "center", "700 13px 'IBM Plex Sans', system-ui, sans-serif");
+      text(ctx, narrow ? `${r.evals.toLocaleString()} evals` : `${MODE_SUB[mode]}: ${r.evals.toLocaleString()} evals`, cx, h - 13, c.muted, "center", "400 11px 'JetBrains Mono', ui-monospace, monospace");
+    });
+    document.getElementById("gour-hud").textContent = `${tris} front-facing triangles · ${mesh.pos.length} vertices`;
+  });
+  lightPad(document.getElementById("gour"), (x) => gourCells.find((q, i) => x >= q.x0 && (i === gourCells.length - 1 || x < gourCells[i + 1].x0)) || null, s5.lp, () => gour.draw());
+  RP.slider("#g-seg", (v) => { s5.seg = v; gour.draw(); });
+  RP.slider("#g-n", (v) => { s5.mat.shin = v; gour.draw(); });
+  RP.toggleGroup("#g-mode", (v) => { s5.mode = v; gour.draw(); });
+  const wireBtn = document.getElementById("g-wire");
+  wireBtn.addEventListener("click", () => { s5.wire = !s5.wire; wireBtn.setAttribute("aria-pressed", String(s5.wire)); gour.draw(); });
+  const orbitBtn = document.getElementById("g-orbit");
+  const anim = RP.loop(document.getElementById("gour"), (t, dt) => {
+    if (!s5.orbit) return;
+    s5.ang += dt * 0.5;
+    s5.lp.x = 0.62 * Math.cos(s5.ang); s5.lp.y = 0.62 * Math.sin(s5.ang);
+    gour.draw();
+  });
+  anim.stop();
+  orbitBtn.addEventListener("click", () => {
+    s5.orbit = !s5.orbit; orbitBtn.setAttribute("aria-pressed", String(s5.orbit));
+    if (s5.orbit) { s5.ang = Math.atan2(s5.lp.y, s5.lp.x); anim.start(); } else anim.stop();
+  });
+})();
+</script>
+</body>
+</html>

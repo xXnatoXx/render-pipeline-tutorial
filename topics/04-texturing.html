@@ -1,0 +1,895 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Texturing &amp; Sampling · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .viz-stage + .viz-stage { border-top: 1px solid var(--line); }
+  .viz-stage canvas#pyr { height: 150px; }
+  .face-row .btn { min-width: 38px; }
+  .legend i.l-frag { background: var(--frag); }
+  .legend i.l-warn { background: var(--warn); }
+  .legend i.l-good { background: var(--good); }
+  .legend i.l-acc { background: var(--accent); }
+</style>
+</head>
+<body data-topic="04">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 04 · Foundations</p>
+    <h1>Texturing &amp; Sampling</h1>
+    <p class="lede">A texture is an image that the fragment shader looks up once per fragment. Most of the difference between a crisp image and a shimmering mess comes down to doing that lookup well: at the right spot, with the right amount of blur.</p>
+    <div class="stage-band"><span class="app">Application</span><span class="vtx">Vertex</span><span class="ras">Rasterize</span><span class="on frag">Fragment</span><span class="out">Output</span></div>
+  </section>
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>Texels vs pixels, UV coordinates, and how a mesh gets unwrapped</li>
+    <li>What wrap modes do with UVs outside 0…1</li>
+    <li>Why UVs need perspective-correct interpolation (and what the PlayStation 1 did instead)</li>
+    <li>Nearest vs bilinear filtering when a texture is magnified</li>
+    <li>Why minification aliases, and how mipmaps and trilinear filtering fix it</li>
+    <li>Anisotropic filtering for surfaces seen at grazing angles</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="uv">
+    <h2><span class="step-no">STEP 1</span>Texels, UVs and unwrapping</h2>
+    <p>A texture is a grid of colored cells called <b>texels</b> (texture elements), so they don't get mixed up with the <b>pixels</b> of the framebuffer. A 256×256 texture has 65,536 texels. On screen, one pixel might cover a tenth of a texel or a hundred texels, depending on how close the surface is.</p>
+    <p>Shaders don't address texels by integer index. They use <b>UV coordinates</b>: <code>u</code> runs across the image and <code>v</code> runs up it, both from 0 to 1. The same UVs then work whether the texture is 64² or 4096². Every vertex stores a UV pair as an attribute. The rasterizer interpolates it across the triangle (chapter 02), and the fragment shader uses it to <i>sample</i> the texture.</p>
+    <p>Where do the UVs come from? An artist (or a tool) <b>unwraps</b> the mesh: they cut it along seams and flatten the pieces into the UV square, the way a cardboard box unfolds into a flat net. Each flat piece is a <b>UV island</b>. Below, a cube unfolds into six islands.</p>
+    <div class="math">texel coordinate:  x = u·W − 0.5      y = (1 − v)·H − 0.5
+texel i covers u ∈ [i/W, (i+1)/W];  its center sits at u = (i + 0.5)/W
+(v points up, OpenGL style: image row 0 is at v = 1. Direct3D puts v = 0 at the top.)</div>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="net" aria-label="The cube's texture laid out flat as a cross-shaped net of six numbered UV islands in the unit UV square"></canvas><div class="hud" id="net-hud"></div><span class="pane-label">UV space</span></div>
+        <div class="viz-stage"><canvas id="cube" aria-label="A rotating 3D cube textured with the net; the hovered face is highlighted"></canvas><div class="hud" id="cube-hud"></div><span class="pane-label">3D cube</span></div>
+      </div>
+      <div class="controls">
+        <div class="btn-row face-row" id="faces" role="group" aria-label="Highlight a face">
+          <button class="btn" type="button" data-f="-1" aria-pressed="true">None</button>
+          <button class="btn" type="button" data-f="0" aria-pressed="false">1</button>
+          <button class="btn" type="button" data-f="1" aria-pressed="false">2</button>
+          <button class="btn" type="button" data-f="2" aria-pressed="false">3</button>
+          <button class="btn" type="button" data-f="3" aria-pressed="false">4</button>
+          <button class="btn" type="button" data-f="4" aria-pressed="false">5</button>
+          <button class="btn" type="button" data-f="5" aria-pressed="false">6</button>
+        </div>
+        <div class="btn-row"><button class="btn" type="button" id="spin1" aria-pressed="true">Spin</button></div>
+      </div>
+      <figcaption><b>Try it:</b> hover an island on the left (or a face on the right) to see where it lands. Drag the cube to turn it. The small black triangle in each island marks its (0, 0) corner, so you can check that every face is folded the right way round.</figcaption>
+    </figure>
+    <p>UVs are allowed to go outside 0…1, and the <b>wrap mode</b> (also called address mode) decides what happens there. <b>Repeat</b> keeps only the fractional part, so the texture tiles. That is how one small brick image covers a whole wall. <b>Clamp to edge</b> pins the coordinate to the border, which smears the edge texels outward. <b>Mirrored repeat</b> tiles too, but flips every other copy, so the seams always match up.</p>
+    <div class="math">repeat:   u' = u − floor(u)
+clamp:    u' = min(max(u, 0), 1)          (in texels: clamp the index to 0 … W−1)
+mirror:   t = u mod 2;   u' = t ≤ 1 ? t : 2 − t</div>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="wrap" aria-label="A square quad textured with a letter F tile; dashed lines mark where UV crosses whole numbers; the wrap mode controls what appears outside the 0 to 1 tile"></canvas><div class="hud" id="wrap-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row" id="wrapmode"><button class="btn" data-value="repeat" aria-pressed="true">Repeat</button><button class="btn" data-value="clamp">Clamp</button><button class="btn" data-value="mirror">Mirror</button></div>
+        <div class="control"><label for="wscale">UV scale <output for="wscale"></output></label><input type="range" id="wscale" min="0.5" max="4" step="0.25" value="2"></div>
+        <div class="control"><label for="woffu">Offset u <output for="woffu"></output></label><input type="range" id="woffu" min="-1" max="1" step="0.05" value="-0.5"></div>
+        <div class="control"><label for="woffv">Offset v <output for="woffv"></output></label><input type="range" id="woffv" min="-1" max="1" step="0.05" value="-0.5"></div>
+      </div>
+      <figcaption><b>Try it:</b> the quad's corners get UVs from <i>offset</i> to <i>offset + scale</i>. Switch to Clamp and watch the edge texels stretch into streaks. Mirror flips the "F" in every other copy.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> UVs connect a point on the surface to a point in the image, and they don't depend on resolution. Unwrapping chooses that mapping once. The wrap mode decides what happens beyond the 0…1 square.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="perspective">
+    <h2><span class="step-no">STEP 2</span>Affine vs perspective-correct interpolation</h2>
+    <p>The rasterizer knows each fragment's screen-space barycentric weights <code>b₀, b₁, b₂</code>. The obvious move is to blend the vertex UVs with them: <code>u = b₀u₀ + b₁u₁ + b₂u₂</code>. This is called <b>affine</b> interpolation, and on a tilted surface it's wrong. Perspective squeezes far-away parts of a triangle into fewer pixels, so equal steps across the screen are <i>not</i> equal steps across the surface.</p>
+    <p>The fix comes from the perspective divide. After projection, <code>u/w</code>, <code>v/w</code> and <code>1/w</code> <i>do</i> vary linearly across the screen (<code>w</code> is the clip-space w, which is the view depth). So the rasterizer interpolates those three values and divides once per fragment:</p>
+    <div class="math">u = (b₀·u₀/w₀ + b₁·u₁/w₁ + b₂·u₂/w₂) / (b₀/w₀ + b₁/w₁ + b₂/w₂)
+example: halfway between a vertex at w = 1 (u = 0) and one at w = 3 (u = 1):
+  affine        u = 0.5
+  perspective   u = (0.5·0 + 0.5·⅓) / (0.5·1 + 0.5·⅓) = 0.25</div>
+    <p>The original PlayStation's GPU did only affine texture mapping. You can see it in its games: textures bend along triangle diagonals and "swim" as the camera moves. Developers worked around it by cutting large polygons into many small ones, which keeps the error small.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="affine" aria-label="A tilted checkerboard plane rendered with affine texture interpolation; the checks bend along the triangle diagonal"></canvas><div class="hud" id="aff-hud"></div><span class="pane-label">Affine</span></div>
+        <div class="viz-stage"><canvas id="persp" aria-label="The same tilted checkerboard plane rendered with perspective-correct interpolation; the checks stay straight"></canvas><div class="hud" id="per-hud"></div><span class="pane-label">Perspective-correct</span></div>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="tilt2">Plane tilt <output for="tilt2"></output></label><input type="range" id="tilt2" min="0" max="80" step="1" value="65"></div>
+        <div class="control"><label for="sub2">Subdivisions <output for="sub2"></output></label><input type="range" id="sub2" min="1" max="8" step="1" value="1"></div>
+        <div class="btn-row"><button class="btn" type="button" id="tris2" aria-pressed="true">Show triangles</button><button class="btn" type="button" id="spin2" aria-pressed="true">Spin</button></div>
+      </div>
+      <figcaption><b>Try it:</b> at tilt 0° the two panes match, because every vertex has the same w. Tilt the plane and the affine checks kink at the diagonal. Then raise the subdivisions the way PS1 developers did, and watch the error shrink.</figcaption>
+    </figure>
+    <div class="callout ras"><strong>Key idea.</strong> Interpolate <code>attribute/w</code> and <code>1/w</code> linearly in screen space, then divide per fragment. Modern GPUs do this automatically for every varying. GLSL's <code>noperspective</code> qualifier is how you opt out.</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="magnify">
+    <h2><span class="step-no">STEP 3</span>Magnification: nearest vs bilinear</h2>
+    <p>When a surface is close, one texel covers many pixels. This is <b>magnification</b>. The sampler has to invent colors <i>between</i> texel centers, and it has two classic options.</p>
+    <p><b>Nearest</b> (point sampling) returns the texel whose cell contains the sample point. You get hard, blocky texels, which is exactly what pixel-art games want. <b>Bilinear</b> finds the four texel centers around the sample point and blends them by distance: first along x, then along y.</p>
+    <div class="math">x = u·W − 0.5    i = floor(x)    fx = x − i
+y = (1−v)·H − 0.5    j = floor(y)    fy = y − j
+color = (1−fx)(1−fy)·T[i,j]   + fx(1−fy)·T[i+1,j]
+      + (1−fx)·fy·T[i,j+1]   + fx·fy·T[i+1,j+1]
+example: fx = 0.25, fy = 0.5  →  weights 0.375, 0.125, 0.375, 0.125  (always sum to 1)</div>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="mag" class="tall" aria-label="An 8 by 8 smiley texture magnified onto a grid of large screen pixels; hovering a pixel shows the texels and weights used to color it"></canvas><div class="hud" id="mag-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row" id="magmode"><button class="btn" data-value="nearest">Nearest</button><button class="btn" data-value="bilinear" aria-pressed="true">Bilinear</button></div>
+        <div class="control"><label for="zoom3">Pixels per texel <output for="zoom3"></output></label><input type="range" id="zoom3" min="1" max="10" step="0.5" value="6"></div>
+        <div class="legend"><span><i class="l-frag"></i>hovered pixel &amp; sample point</span><span><i class="l-acc"></i>texels used</span></div>
+      </div>
+      <figcaption><b>Try it:</b> every big square is one screen pixel. Hover one to see where its center lands in the texture. In Bilinear, the dot sizes and labels show each of the four texels' weights.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> Bilinear filtering hides the texel grid, but it can't add detail that isn't in the texture. Up close, a low-resolution texture just looks soft. That's why games use higher-resolution textures, layered "detail" textures, or nearest filtering on purpose for a pixel-art look.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="mipmaps">
+    <h2><span class="step-no">STEP 4</span>Minification, aliasing and mipmaps</h2>
+    <p>The opposite case is worse. On a floor stretching to the horizon, one far-away pixel can cover dozens of texels. This is <b>minification</b>. A single point sample (even bilinear, which reads only 4 texels) picks one of those dozens almost at random. The result is <b>aliasing</b>: moiré patterns that don't exist in the texture, and shimmering that crawls across the surface as the camera moves. In sampling-theory terms, you need about two samples per cycle of detail (the Nyquist rate), and a distant checkerboard has far more detail than that.</p>
+    <p>The fix is to filter <i>before</i> sampling. Lance Williams' 1983 paper "Pyramidal Parametrics" introduced <b>mipmaps</b> (MIP stands for <i>multum in parvo</i>, "much in a small space"). A mipmap is a chain of copies, each half the width and height of the last, down to 1×1. Each texel of level <code>k</code> is the average of a 2×2 block from level <code>k−1</code>. The whole chain costs only one third more memory: 1 + ¼ + ¹⁄₁₆ + … = 4/3.</p>
+    <p>To pick a level, the GPU needs to know how many texels one pixel spans. It shades pixels in 2×2 <b>quads</b>, so it can subtract UVs between neighboring pixels to get screen-space derivatives. Shaders can read these too: <code>ddx/ddy</code> in HLSL, <code>dFdx/dFdy</code> in GLSL.</p>
+    <div class="math">L = max( |∂uv/∂x|·size,  |∂uv/∂y|·size )      texels per pixel
+λ = log₂(L) + bias                              mip level
+example: 256² texture, L = 4 texels/pixel → λ = 2 → level 2 (64×64)
+trilinear = lerp( bilinear(level ⌊λ⌋), bilinear(level ⌊λ⌋+1), λ − ⌊λ⌋ )</div>
+    <p>Bilinear filtering on one mip level leaves visible bands where λ crosses a whole number. <b>Trilinear</b> filtering removes them by also blending between the two nearest levels. The <i>Mip tint</i> mode paints each level a different color, a classic debug view for checking that texture resolution matches the screen.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="mip" class="tall" aria-label="A checkerboard floor receding to the horizon, rendered with the selected filter; nearest filtering shows moiré near the horizon"></canvas><div class="hud" id="mip-hud"></div></div>
+      <div class="viz-stage"><canvas id="pyr" aria-label="The mip pyramid: the 256 by 256 checker texture and its eight successively halved levels down to 1 by 1"></canvas></div>
+      <div class="controls">
+        <div class="btn-row" id="mipmode"><button class="btn" data-value="nearest" aria-pressed="true">Nearest</button><button class="btn" data-value="bilinear">Bilinear</button><button class="btn" data-value="trilinear">Trilinear (mips)</button><button class="btn" data-value="tint">Mip tint</button></div>
+        <div class="control"><label for="bias4">LOD bias <output for="bias4"></output></label><input type="range" id="bias4" min="-2" max="3" step="0.25" value="0"></div>
+        <div class="btn-row"><button class="btn" type="button" id="move4" aria-pressed="false">Move camera</button></div>
+      </div>
+      <figcaption><b>Try it:</b> in Nearest, press <i>Move camera</i> and watch the far checks crawl. Switch to Trilinear: the distance fades to a stable gray, which is the true average color. Hover the floor to read λ, and look for the levels that light up in the pyramid. A negative bias sharpens the image but brings the shimmer back.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> Never take one sample of a region that covers many texels. Mipmaps pre-average the texture, and screen-space derivatives choose the level whose texels are about one pixel in size.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="aniso">
+    <h2><span class="step-no">STEP 5</span>Anisotropic filtering</h2>
+    <p>Map a square pixel onto a floor seen at a shallow angle and you get a long, thin shape in texture space. It might be 1 texel wide and 10 texels deep. A mip level can only filter a <i>square</i> region. If the GPU picks λ from the long side (as in step 4), it also blurs across the short side, and floors turn to mush in the distance. If it picks the short side, the long side aliases.</p>
+    <p><b>Anisotropic filtering</b> takes several trilinear samples ("probes") along the footprint's long axis. Each probe uses a sharper mip level, chosen from the long side divided by the number of probes. The extension that introduced the setting, <code>EXT_texture_filter_anisotropic</code>, describes roughly this scheme. Real hardware algorithms are vendor-specific and not public in detail. The "2×…16×" option in game settings caps the number of probes.</p>
+    <div class="math">Lmax = max(|ddx|, |ddy|)    Lmin = min(|ddx|, |ddy|)     (in texels)
+N    = min( ceil(Lmax / Lmin), maxAniso )
+λ    = log₂(Lmax / N)
+color = average of N trilinear samples spread along the long axis
+example: |ddx| = 1.2, |ddy| = 9.6 → ratio 8 → N = 8, λ = log₂(1.2) ≈ 0.26 instead of 3.26</div>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="aniL" aria-label="A brick floor seen at an adjustable angle with one selected pixel marked"></canvas><div class="hud" id="aniL-hud"></div><span class="pane-label">Screen</span></div>
+        <div class="viz-stage"><canvas id="aniR" aria-label="Texture space around the selected pixel: its footprint ellipse and the region covered by the isotropic sample or the anisotropic probes"></canvas><div class="hud" id="aniR-hud"></div><span class="pane-label">Texture space</span></div>
+      </div>
+      <div class="controls">
+        <div class="btn-row" id="animode"><button class="btn" data-value="iso">Isotropic (trilinear)</button><button class="btn" data-value="aniso" aria-pressed="true">Anisotropic</button></div>
+        <div class="control"><label for="tilt5">View angle above floor <output for="tilt5"></output></label><input type="range" id="tilt5" min="4" max="90" step="1" value="14"></div>
+        <div class="control"><label for="maxa5">Max anisotropy <output for="maxa5"></output></label><input type="range" id="maxa5" min="0" max="4" step="1" value="3"></div>
+        <div class="legend"><span><i class="l-frag"></i>pixel footprint</span><span><i class="l-warn"></i>isotropic filter area</span><span><i class="l-good"></i>anisotropic probes</span></div>
+      </div>
+      <figcaption><b>Try it:</b> hover (or tap) the floor to pick a pixel. At 90° (looking straight down) the footprint is a circle and both modes match. Lower the angle and the footprint stretches. Compare the far bricks in the two modes.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> A pixel's footprint in texture space is an ellipse, not a square. Anisotropic filtering covers the long axis with several small samples, so a floor stays sharp to the horizon without aliasing.</div>
+  </section>
+
+  <!-- RECAP -->
+  <section class="step" id="recap">
+    <h2><span class="step-no">RECAP</span>What to remember</h2>
+    <ul>
+      <li><b>Texels</b> live in the texture and <b>pixels</b> live on screen. UVs in 0…1 link them independently of resolution. Unwrapping lays a mesh out as UV islands.</li>
+      <li><b>Wrap modes</b> (repeat, clamp, mirror) decide what UVs outside 0…1 mean.</li>
+      <li>Interpolate <code>u/w</code>, <code>v/w</code> and <code>1/w</code>, then divide: that's <b>perspective-correct</b> interpolation. Affine interpolation wobbles (PS1).</li>
+      <li><b>Magnification</b>: nearest is blocky, bilinear blends 4 texels by distance.</li>
+      <li><b>Minification</b> aliases. <b>Mipmaps</b> (Williams, 1983) pre-filter the texture, λ = log₂(texels per pixel) comes from <code>ddx/ddy</code>, and <b>trilinear</b> blends two levels.</li>
+      <li><b>Anisotropic</b> filtering takes several probes along the long axis of an elongated footprint.</li>
+    </ul>
+    <p>Textures hold more than color. Normal maps, roughness, metalness, ambient occlusion and height maps are all textures, and they go through the same sampler, mipmaps and filtering. (Filtering a normal map averages directions, which needs extra care in physically based shading; see chapter 07.) Real games also store most textures <b>block-compressed</b>, and the texture unit decodes them during sampling, which saves both memory and bandwidth:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Format</th><th>Where</th><th>Size</th></tr></thead>
+      <tbody>
+        <tr><td>BC1 (DXT1)</td><td>Desktop / console</td><td>8 bytes per 4×4 block = 4 bits per texel</td></tr>
+        <tr><td>BC7</td><td>Desktop / console</td><td>16 bytes per 4×4 block = 8 bits per texel, high quality</td></tr>
+        <tr><td>BC5</td><td>Desktop / console</td><td>Two channels, a common choice for normal maps</td></tr>
+        <tr><td>ASTC</td><td>Mobile, Apple GPUs</td><td>128 bits per block, block size from 4×4 (8 bpp) to 12×12 (≈0.89 bpp)</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const { clamp, m4, v3 } = RP;
+  const DEG = Math.PI / 180;
+
+  /* ================= Texture helpers (all procedural) ================= */
+  function makeTex(w, h) { return { w, h, d: new Float32Array(w * h * 3) }; }
+  function texFromCanvas(cv) {
+    const id = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
+    const t = makeTex(cv.width, cv.height);
+    for (let i = 0, j = 0; i < id.length; i += 4, j += 3) { t.d[j] = id[i]; t.d[j + 1] = id[i + 1]; t.d[j + 2] = id[i + 2]; }
+    return t;
+  }
+  function texFromFn(w, h, fn) {
+    const t = makeTex(w, h), c = [0, 0, 0];
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      fn(x, y, c); const j = (y * w + x) * 3; t.d[j] = c[0]; t.d[j + 1] = c[1]; t.d[j + 2] = c[2];
+    }
+    return t;
+  }
+  /* Box-filter mip chain (each level averages 2x2 texels of the previous one). */
+  function buildMips(t) {
+    const mips = [t]; let cur = t;
+    while (cur.w > 1 || cur.h > 1) {
+      const w = Math.max(1, cur.w >> 1), h = Math.max(1, cur.h >> 1), n = makeTex(w, h);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) for (let k = 0; k < 3; k++) {
+        let s = 0;
+        for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+          const sx = Math.min(cur.w - 1, x * 2 + dx), sy = Math.min(cur.h - 1, y * 2 + dy);
+          s += cur.d[(sy * cur.w + sx) * 3 + k];
+        }
+        n.d[(y * w + x) * 3 + k] = s / 4;
+      }
+      mips.push(n); cur = n;
+    }
+    t.mips = mips; return t;
+  }
+  function hash(a, b) {
+    let h = (Math.imul(a, 374761393) + Math.imul(b, 668265263)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+  }
+
+  /* Wrap modes act on integer texel indices. */
+  const WRAP = {
+    repeat: (i, n) => ((i % n) + n) % n,
+    clamp: (i, n) => (i < 0 ? 0 : i >= n ? n - 1 : i),
+    mirror: (i, n) => { const m = 2 * n; const k = ((i % m) + m) % m; return k < n ? k : m - 1 - k; },
+  };
+  function sampleNearest(t, u, v, wrap, out) {
+    const ix = wrap(Math.floor(u * t.w), t.w), iy = wrap(Math.floor((1 - v) * t.h), t.h);
+    const j = (iy * t.w + ix) * 3; out[0] = t.d[j]; out[1] = t.d[j + 1]; out[2] = t.d[j + 2];
+    return out;
+  }
+  function sampleBilinear(t, u, v, wrap, out) {
+    const x = u * t.w - 0.5, y = (1 - v) * t.h - 0.5;
+    const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+    const W = t.w, d = t.d;
+    const xa = wrap(x0, W), xb = wrap(x0 + 1, W), ya = wrap(y0, t.h), yb = wrap(y0 + 1, t.h);
+    const a = (ya * W + xa) * 3, b = (ya * W + xb) * 3, c = (yb * W + xa) * 3, e = (yb * W + xb) * 3;
+    const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+    for (let k = 0; k < 3; k++) out[k] = d[a + k] * w00 + d[b + k] * w10 + d[c + k] * w01 + d[e + k] * w11;
+    return out;
+  }
+  const tmpA = [0, 0, 0], tmpB = [0, 0, 0];
+  function sampleTrilinear(t, u, v, lam, out) {
+    const n = t.mips.length - 1;
+    lam = clamp(lam, 0, n);
+    const l0 = Math.floor(lam), f = lam - l0;
+    sampleBilinear(t.mips[l0], u, v, WRAP.repeat, out);
+    if (f > 0.001 && l0 < n) {
+      sampleBilinear(t.mips[l0 + 1], u, v, WRAP.repeat, tmpB);
+      for (let k = 0; k < 3; k++) out[k] += (tmpB[k] - out[k]) * f;
+    }
+    return out;
+  }
+  /* Footprint of one pixel in texel units, from UV derivatives. */
+  function footprint(t, dux, dvx, duy, dvy, maxA) {
+    const lx = Math.hypot(dux * t.w, dvx * t.h), ly = Math.hypot(duy * t.w, dvy * t.h);
+    const xMajor = lx >= ly;
+    const Lmax = Math.max(lx, ly, 1e-8), Lmin = Math.max(Math.min(lx, ly), 1e-8);
+    const N = Math.max(1, Math.min(maxA, Math.ceil(Lmax / Lmin - 1e-6)));
+    return { lx, ly, Lmax, Lmin, N, lamIso: Math.log2(Lmax), lamAniso: Math.log2(Lmax / N),
+      au: xMajor ? dux : duy, av: xMajor ? dvx : dvy };
+  }
+  function sampleAniso(t, u, v, dux, dvx, duy, dvy, maxA, out) {
+    const fp = footprint(t, dux, dvx, duy, dvy, maxA);
+    if (fp.N === 1) return sampleTrilinear(t, u, v, fp.lamAniso, out);
+    let r = 0, g = 0, b = 0;
+    for (let i = 0; i < fp.N; i++) {
+      const s = (i + 0.5) / fp.N - 0.5;
+      sampleTrilinear(t, u + fp.au * s, v + fp.av * s, fp.lamAniso, tmpA);
+      r += tmpA[0]; g += tmpA[1]; b += tmpA[2];
+    }
+    out[0] = r / fp.N; out[1] = g / fp.N; out[2] = b / fp.N;
+    return out;
+  }
+
+  /* ================= Offscreen framebuffer helpers ================= */
+  const bufs = {};
+  function ensureBuf(key, W, H) {
+    W = Math.max(1, W | 0); H = Math.max(1, H | 0);
+    let b = bufs[key];
+    if (!b || b.W !== W || b.H !== H) {
+      const cv = document.createElement("canvas"); cv.width = W; cv.height = H;
+      const cx = cv.getContext("2d"); const img = cx.createImageData(W, H);
+      b = { cv, cx, img, d: img.data, W, H }; bufs[key] = b;
+    }
+    return b;
+  }
+  function blit(ctx, b, x, y, w, h) { b.cx.putImageData(b.img, 0, 0); ctx.imageSmoothingEnabled = false; ctx.drawImage(b.cv, x, y, w, h); }
+  function fillBuf(b, rgb) { const d = b.d; for (let i = 0; i < d.length; i += 4) { d[i] = rgb[0]; d[i + 1] = rgb[1]; d[i + 2] = rgb[2]; d[i + 3] = 255; } }
+  const rgb255 = (hex) => RP.hex2rgb(hex).map((x) => x * 255);
+  function label(ctx, c, text, x, y, align) {
+    ctx.font = "600 11px ui-monospace, Consolas, monospace";
+    const tw = ctx.measureText(text).width;
+    const lx = align === "center" ? x - tw / 2 : align === "right" ? x - tw : x;
+    ctx.fillStyle = RP.alpha(c.surface, 0.85); ctx.fillRect(lx - 3, y - 9, tw + 6, 14);
+    ctx.fillStyle = c.ink; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(text, lx, y - 2);
+  }
+
+  /* ================= Software triangle rasterizer =================
+     Vertices in buffer pixels: {x, y, z (NDC), iw = 1/w, u, v}. Pixel centers at +0.5. */
+  const shadeOut = [0, 0, 0];
+  function rasterTri(b, zb, A, B, C, persp, shade) {
+    const area = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
+    if (Math.abs(area) < 1e-9) return;
+    const minX = Math.max(0, Math.floor(Math.min(A.x, B.x, C.x))), maxX = Math.min(b.W - 1, Math.ceil(Math.max(A.x, B.x, C.x)));
+    const minY = Math.max(0, Math.floor(Math.min(A.y, B.y, C.y))), maxY = Math.min(b.H - 1, Math.ceil(Math.max(A.y, B.y, C.y)));
+    const inv = 1 / area, d = b.d, W = b.W;
+    for (let y = minY; y <= maxY; y++) {
+      const py = y + 0.5;
+      for (let x = minX; x <= maxX; x++) {
+        const px = x + 0.5;
+        const w0 = ((C.x - B.x) * (py - B.y) - (C.y - B.y) * (px - B.x)) * inv;
+        const w1 = ((A.x - C.x) * (py - C.y) - (A.y - C.y) * (px - C.x)) * inv;
+        const w2 = 1 - w0 - w1;
+        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        const idx = y * W + x;
+        if (zb) { const z = w0 * A.z + w1 * B.z + w2 * C.z; if (z >= zb[idx]) continue; zb[idx] = z; }
+        let u, v;
+        if (persp) {
+          const iw = w0 * A.iw + w1 * B.iw + w2 * C.iw;
+          u = (w0 * A.u * A.iw + w1 * B.u * B.iw + w2 * C.u * C.iw) / iw;
+          v = (w0 * A.v * A.iw + w1 * B.v * B.iw + w2 * C.v * C.iw) / iw;
+        } else {
+          u = w0 * A.u + w1 * B.u + w2 * C.u;
+          v = w0 * A.v + w1 * B.v + w2 * C.v;
+        }
+        shade(u, v, idx, shadeOut);
+        const o = idx * 4; d[o] = shadeOut[0]; d[o + 1] = shadeOut[1]; d[o + 2] = shadeOut[2]; d[o + 3] = 255;
+      }
+    }
+  }
+  function toScreen(mvp, p, W, H, u, v) {
+    const r = m4.project(mvp, p, W, H);
+    return { x: r.x, y: r.y, z: r.z, iw: 1 / r.w, u, v };
+  }
+
+  /* ================= Ground-plane renderer (exact per-pixel UVs by ray casting) ================= */
+  function makeCam(o, W, H) {
+    return { th: Math.tan(o.fov / 2), asp: W / H, cp: Math.cos(o.pitch), sp: Math.sin(o.pitch), W, H, x: o.x, y: o.y, z: o.z, scale: o.scale };
+  }
+  function groundUV(C, px, py, out) {
+    const a = (px / C.W * 2 - 1) * C.th * C.asp, b = (1 - py / C.H * 2) * C.th;
+    const dy = b * C.cp - C.sp;
+    if (dy >= -1e-5) return false;
+    const dz = -b * C.sp - C.cp, t = -C.y / dy;
+    out[0] = (C.x + t * a) / C.scale; out[1] = -(C.z + t * dz) / C.scale;
+    return true;
+  }
+  function renderGround(b, C, sampler, sky) {
+    const p = [0, 0], qx = [0, 0], qy = [0, 0], col = [0, 0, 0], d = b.d;
+    for (let y = 0; y < b.H; y++) for (let x = 0; x < b.W; x++) {
+      const o = (y * b.W + x) * 4;
+      if (!groundUV(C, x + 0.5, y + 0.5, p)) { d[o] = sky[0]; d[o + 1] = sky[1]; d[o + 2] = sky[2]; d[o + 3] = 255; continue; }
+      groundUV(C, x + 1.5, y + 0.5, qx); groundUV(C, x + 0.5, y + 1.5, qy);
+      sampler(p[0], p[1], qx[0] - p[0], qx[1] - p[1], qy[0] - p[0], qy[1] - p[1], col);
+      d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 255;
+    }
+  }
+  function pixelDerivs(C, px, py) {
+    const p = [0, 0], qx = [0, 0], qy = [0, 0];
+    if (!groundUV(C, px + 0.5, py + 0.5, p)) return null;
+    groundUV(C, px + 1.5, py + 0.5, qx); groundUV(C, px + 0.5, py + 1.5, qy);
+    return { u: p[0], v: p[1], dux: qx[0] - p[0], dvx: qx[1] - p[1], duy: qy[0] - p[0], dvy: qy[1] - p[1] };
+  }
+
+  /* ================= STEP 1a: UV net and folded cube ================= */
+  const FACE_NAMES = ["+X right", "−X left", "+Y top", "−Y bottom", "+Z front", "−Z back"];
+  const NET_CELL = [[2, 1], [0, 1], [1, 0], [1, 2], [1, 1], [3, 1]]; // [col,row] per face, RP.mesh.cube() order
+  const FACE_HUE = [0, 28, 52, 130, 200, 275];
+  function makeNetCanvas() {
+    const cv = document.createElement("canvas"); cv.width = 512; cv.height = 384;
+    const g = cv.getContext("2d");
+    g.fillStyle = "#33373f"; g.fillRect(0, 0, 512, 384);
+    g.strokeStyle = "rgba(255,255,255,0.07)"; g.lineWidth = 6;
+    for (let k = -384; k < 512; k += 24) { g.beginPath(); g.moveTo(k, 384); g.lineTo(k + 384, 0); g.stroke(); }
+    for (let f = 0; f < 6; f++) {
+      const x = NET_CELL[f][0] * 128, y = NET_CELL[f][1] * 128;
+      for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
+        g.fillStyle = `hsl(${FACE_HUE[f]},62%,${(i + j) % 2 ? 54 : 66}%)`; g.fillRect(x + i * 32, y + j * 32, 32, 32);
+      }
+      g.strokeStyle = "rgba(0,0,0,0.4)"; g.lineWidth = 3; g.strokeRect(x + 1.5, y + 1.5, 125, 125);
+      g.fillStyle = "#14161c"; g.textAlign = "center"; g.textBaseline = "middle";
+      g.font = "bold 46px sans-serif"; g.fillText(String(f + 1), x + 64, y + 54);
+      g.font = "bold 15px sans-serif"; g.fillText(FACE_NAMES[f], x + 64, y + 98);
+      g.beginPath(); g.moveTo(x + 5, y + 123); g.lineTo(x + 27, y + 123); g.lineTo(x + 5, y + 101); g.closePath(); g.fill();
+    }
+    return cv;
+  }
+  const netCv = makeNetCanvas(), netTex = texFromCanvas(netCv), cube = RP.mesh.cube();
+  const s1 = { yaw: 0.65, pitch: 0.42, hover: -1, spin: !RP.reduced, dragging: false };
+  let faceBuf = null, faceW = 0, faceH = 0;
+  const L1 = v3.norm([0.4, 0.7, 1]);
+  const cubeEl = document.getElementById("cube"), netEl = document.getElementById("net");
+  const faceBtns = [...document.querySelectorAll("#faces button")];
+
+  function netRect(w, h) {
+    let W = w - 56, H = W * 0.75;
+    if (H > h - 56) { H = h - 56; W = H / 0.75; }
+    return { x: (w - W) / 2, y: (h - H) / 2, w: W, h: H };
+  }
+  const netV = RP.canvas(netEl, (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const R = netRect(w, h);
+    ctx.imageSmoothingEnabled = true; ctx.drawImage(netCv, R.x, R.y, R.w, R.h);
+    if (s1.hover >= 0) {
+      ctx.fillStyle = RP.alpha(c.surface2, 0.6);
+      for (let f = 0; f < 6; f++) if (f !== s1.hover) ctx.fillRect(R.x + NET_CELL[f][0] * R.w / 4, R.y + NET_CELL[f][1] * R.h / 3, R.w / 4, R.h / 3);
+      const [cc, rr] = NET_CELL[s1.hover];
+      ctx.strokeStyle = c.frag; ctx.lineWidth = 3; ctx.strokeRect(R.x + cc * R.w / 4, R.y + rr * R.h / 3, R.w / 4, R.h / 3);
+    }
+    ctx.strokeStyle = c.muted; ctx.lineWidth = 1; ctx.strokeRect(R.x + 0.5, R.y + 0.5, R.w - 1, R.h - 1);
+    ctx.fillStyle = c.muted; ctx.font = "11px ui-monospace, Consolas, monospace"; ctx.textBaseline = "middle";
+    ctx.textAlign = "left"; ctx.fillText("(0,0)", R.x - 4, R.y + R.h + 12);
+    ctx.textAlign = "right"; ctx.fillText("(1,1)", R.x + R.w + 4, R.y - 12);
+    ctx.textAlign = "center"; ctx.fillText("u →", R.x + R.w / 2, R.y + R.h + 12);
+    ctx.save(); ctx.translate(R.x - 12, R.y + R.h / 2); ctx.rotate(-Math.PI / 2); ctx.fillText("v →", 0, 0); ctx.restore();
+    const hud = document.getElementById("net-hud");
+    if (s1.hover >= 0) {
+      const [cc, rr] = NET_CELL[s1.hover];
+      hud.textContent = `island ${s1.hover + 1}: ${FACE_NAMES[s1.hover]}\nu ∈ [${(cc / 4).toFixed(2)}, ${((cc + 1) / 4).toFixed(2)}]\nv ∈ [${((2 - rr) / 3).toFixed(2)}, ${((3 - rr) / 3).toFixed(2)}]`;
+    } else hud.textContent = "6 UV islands in one\n512×384 texture";
+  });
+
+  const cubeV = RP.canvas(cubeEl, (s) => {
+    const { ctx, w, h, c } = s;
+    const k = Math.min(0.6, 300 / Math.max(w, h));
+    const W = Math.max(40, Math.round(w * k)), H = Math.max(40, Math.round(h * k));
+    const b = ensureBuf("cube", W, H);
+    fillBuf(b, rgb255(c.surface2));
+    const zb = new Float32Array(W * H).fill(Infinity);
+    if (!faceBuf || faceBuf.length !== W * H) faceBuf = new Int8Array(W * H);
+    faceBuf.fill(-1); faceW = W; faceH = H;
+    const M = m4.mul(m4.rotX(s1.pitch), m4.rotY(s1.yaw));
+    const eye = [0, 0, 3.1];
+    const mvp = m4.chain(m4.perspective(0.8, W / H, 0.1, 20), m4.lookAt(eye, [0, 0, 0], [0, 1, 0]), M);
+    const hi = rgb255(c.frag);
+    for (let f = 0; f < 6; f++) {
+      const nn = m4.xform(M, [cube.nrm[f * 4][0], cube.nrm[f * 4][1], cube.nrm[f * 4][2], 0]);
+      const n = [nn[0], nn[1], nn[2]];
+      if (v3.dot(n, v3.sub(eye, v3.scale(n, 0.5))) <= 0) continue; // back-face
+      const lit = 0.55 + 0.45 * Math.max(0, v3.dot(n, L1));
+      const cc = NET_CELL[f][0], rr = NET_CELL[f][1];
+      const vs = [];
+      for (let i = 0; i < 4; i++) {
+        const vi = f * 4 + i, su = cube.uv[vi][0], sv = cube.uv[vi][1];
+        vs.push(toScreen(mvp, cube.pos[vi], W, H, (cc + su) / 4, (2 - rr + sv) / 3));
+      }
+      const isHi = f === s1.hover;
+      const shade = (u, v, idx, out) => {
+        sampleBilinear(netTex, u, v, WRAP.clamp, out);
+        for (let q = 0; q < 3; q++) { out[q] *= lit; if (isHi) out[q] = out[q] * 0.6 + hi[q] * 0.4; }
+        faceBuf[idx] = f;
+      };
+      rasterTri(b, zb, vs[0], vs[1], vs[2], true, shade);
+      rasterTri(b, zb, vs[0], vs[2], vs[3], true, shade);
+    }
+    blit(ctx, b, 0, 0, w, h);
+    document.getElementById("cube-hud").textContent = s1.hover >= 0 ? `face ${s1.hover + 1}: ${FACE_NAMES[s1.hover]}` : "drag to rotate";
+  });
+
+  function setHover(f) {
+    faceBtns.forEach((bt) => bt.setAttribute("aria-pressed", String(+bt.dataset.f === f)));
+    if (f !== s1.hover) { s1.hover = f; cubeV.draw(); netV.draw(); }
+  }
+  faceBtns.forEach((bt) => bt.addEventListener("click", () => setHover(+bt.dataset.f)));
+  function pickNet(x, y) {
+    const R = netRect(netV.w, netV.h);
+    const u = (x - R.x) / R.w, t = (y - R.y) / R.h;
+    if (u < 0 || u >= 1 || t < 0 || t >= 1) { setHover(-1); return; }
+    const col = Math.floor(u * 4), row = Math.floor(t * 3);
+    setHover(NET_CELL.findIndex((p) => p[0] === col && p[1] === row));
+  }
+  RP.drag(netEl, { down: pickNet, move: pickNet, hover: pickNet });
+  netEl.addEventListener("pointerleave", () => setHover(-1));
+  let last1 = [0, 0];
+  RP.drag(cubeEl, {
+    down(x, y) { last1 = [x, y]; s1.dragging = true; },
+    move(x, y) { s1.yaw += (x - last1[0]) * 0.01; s1.pitch = clamp(s1.pitch + (y - last1[1]) * 0.01, -1.4, 1.4); last1 = [x, y]; cubeV.draw(); },
+    up() { s1.dragging = false; },
+    hover(x, y) {
+      if (!faceBuf) return;
+      const bx = Math.floor(x / cubeV.w * faceW), by = Math.floor(y / cubeV.h * faceH);
+      setHover(bx >= 0 && by >= 0 && bx < faceW && by < faceH ? faceBuf[by * faceW + bx] : -1);
+    },
+  });
+  cubeEl.addEventListener("pointerleave", () => setHover(-1));
+  const anim1 = RP.loop(cubeEl, (t, dt) => { if (s1.spin && !s1.dragging && dt > 0) { s1.yaw += dt * 0.5; cubeV.draw(); } });
+  const spin1 = document.getElementById("spin1");
+  spin1.setAttribute("aria-pressed", String(s1.spin));
+  if (!s1.spin) anim1.stop();
+  spin1.addEventListener("click", () => { s1.spin = !s1.spin; spin1.setAttribute("aria-pressed", String(s1.spin)); if (s1.spin) anim1.start(); else anim1.stop(); });
+
+  /* ================= STEP 1b: wrap modes ================= */
+  function makeTileCanvas() {
+    const cv = document.createElement("canvas"); cv.width = cv.height = 128;
+    const g = cv.getContext("2d");
+    const gr = g.createLinearGradient(0, 0, 128, 0);
+    gr.addColorStop(0, "#e4573d"); gr.addColorStop(0.5, "#f2c14e"); gr.addColorStop(1, "#3fa36b");
+    g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+    const gv = g.createLinearGradient(0, 0, 0, 128);
+    gv.addColorStop(0, "rgba(40,70,210,0.6)"); gv.addColorStop(1, "rgba(40,70,210,0)");
+    g.fillStyle = gv; g.fillRect(0, 0, 128, 128);
+    g.strokeStyle = "rgba(255,255,255,0.45)"; g.lineWidth = 1;
+    for (let i = 32; i < 128; i += 32) { g.beginPath(); g.moveTo(i + 0.5, 0); g.lineTo(i + 0.5, 128); g.moveTo(0, i + 0.5); g.lineTo(128, i + 0.5); g.stroke(); }
+    g.fillStyle = "#1a1a2e"; g.textAlign = "center"; g.textBaseline = "middle";
+    g.font = "bold 86px sans-serif"; g.fillText("F", 64, 68);
+    g.textAlign = "left"; g.font = "bold 12px sans-serif"; g.fillText("0,0", 4, 120);
+    return cv;
+  }
+  const tileTex = texFromCanvas(makeTileCanvas());
+  const s1b = { mode: "repeat", scale: 2, ou: -0.5, ov: -0.5 };
+  const wrapV = RP.canvas("#wrap", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const S = Math.max(40, Math.min(w - 32, h - 32)), x0 = (w - S) / 2, y0 = (h - S) / 2;
+    const R = Math.max(16, Math.min(220, Math.round(S / 1.5)));
+    const b = ensureBuf("wrap", R, R), wrap = WRAP[s1b.mode], col = [0, 0, 0], d = b.d;
+    for (let j = 0; j < R; j++) for (let i = 0; i < R; i++) {
+      const u = ((i + 0.5) / R) * s1b.scale + s1b.ou, v = (1 - (j + 0.5) / R) * s1b.scale + s1b.ov;
+      sampleBilinear(tileTex, u, v, wrap, col);
+      const o = (j * R + i) * 4; d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 255;
+    }
+    b.cx.putImageData(b.img, 0, 0); ctx.imageSmoothingEnabled = true; ctx.drawImage(b.cv, x0, y0, S, S);
+    ctx.save(); ctx.setLineDash([5, 4]); ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5;
+    for (let k = Math.ceil(s1b.ou); k <= s1b.ou + s1b.scale; k++) { const x = x0 + (k - s1b.ou) / s1b.scale * S; ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0 + S); ctx.stroke(); }
+    for (let k = Math.ceil(s1b.ov); k <= s1b.ov + s1b.scale; k++) { const y = y0 + S - (k - s1b.ov) / s1b.scale * S; ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x0 + S, y); ctx.stroke(); }
+    ctx.restore();
+    // outline the original 0..1 tile
+    const tx0 = x0 + (0 - s1b.ou) / s1b.scale * S, tx1 = x0 + (1 - s1b.ou) / s1b.scale * S;
+    const ty1 = y0 + S - (0 - s1b.ov) / s1b.scale * S, ty0 = y0 + S - (1 - s1b.ov) / s1b.scale * S;
+    ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, S, S); ctx.clip();
+    ctx.strokeStyle = c.frag; ctx.lineWidth = 2.5; ctx.strokeRect(tx0, ty0, tx1 - tx0, ty1 - ty0); ctx.restore();
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.strokeRect(x0 - 0.5, y0 - 0.5, S + 1, S + 1);
+    const f = (x) => x.toFixed(2);
+    document.getElementById("wrap-hud").textContent = `${s1b.mode}\nu ∈ [${f(s1b.ou)}, ${f(s1b.ou + s1b.scale)}]\nv ∈ [${f(s1b.ov)}, ${f(s1b.ov + s1b.scale)}]\n▭ = the 0…1 tile`;
+  });
+  RP.toggleGroup("#wrapmode", (v) => { s1b.mode = v; wrapV.draw(); });
+  RP.slider("#wscale", (v) => { s1b.scale = v; wrapV.draw(); });
+  RP.slider("#woffu", (v) => { s1b.ou = v; wrapV.draw(); });
+  RP.slider("#woffv", (v) => { s1b.ov = v; wrapV.draw(); });
+
+  /* ================= STEP 2: affine vs perspective-correct ================= */
+  const checkTex = texFromFn(128, 128, (x, y, c) => {
+    if (((x >> 3) + (y >> 3)) & 1) { c[0] = 236; c[1] = 230; c[2] = 214; } else { c[0] = 46; c[1] = 74; c[2] = 122; }
+    if (y < 8 && x < 8) { c[0] = 214; c[1] = 64; c[2] = 70; } // a red corner check marks the UV origin tile
+  });
+  const s2 = { tilt: 65 * DEG, sub: 1, tris: true, spin: !RP.reduced, rot: 0.35 };
+  const HALF = 1.2;
+  function planeMVP(W, H) {
+    const M = m4.mul(m4.rotX(-s2.tilt), m4.rotZ(s2.rot));
+    return m4.chain(m4.perspective(50 * DEG, W / H, 0.1, 20), m4.lookAt([0, 0, 3.2], [0, 0, 0], [0, 1, 0]), M);
+  }
+  function drawPlane(s, persp, key, hudId) {
+    const { ctx, w, h, c } = s;
+    const k = Math.min(0.5, 260 / Math.max(w, h));
+    const W = Math.max(40, Math.round(w * k)), H = Math.max(40, Math.round(h * k));
+    const b = ensureBuf(key, W, H);
+    fillBuf(b, rgb255(c.surface2));
+    const mvp = planeMVP(W, H), n = s2.sub;
+    const shade = (u, v, idx, out) => sampleNearest(checkTex, u, v, WRAP.repeat, out);
+    const V = [];
+    for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) V.push(toScreen(mvp, [-HALF + 2 * HALF * i / n, -HALF + 2 * HALF * j / n, 0, 1], W, H, i / n, j / n));
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      const a = V[j * (n + 1) + i], bb = V[j * (n + 1) + i + 1], cc = V[(j + 1) * (n + 1) + i + 1], dd = V[(j + 1) * (n + 1) + i];
+      rasterTri(b, null, a, bb, cc, persp, shade);
+      rasterTri(b, null, a, cc, dd, persp, shade);
+    }
+    blit(ctx, b, 0, 0, w, h);
+    if (s2.tris) {
+      const mc = planeMVP(w, h), P = [];
+      for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) P.push(m4.project(mc, [-HALF + 2 * HALF * i / n, -HALF + 2 * HALF * j / n, 0], w, h));
+      ctx.strokeStyle = c.vtx; ctx.lineWidth = 1.5; ctx.beginPath();
+      for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+        const a = P[j * (n + 1) + i], bb = P[j * (n + 1) + i + 1], cc = P[(j + 1) * (n + 1) + i + 1], dd = P[(j + 1) * (n + 1) + i];
+        ctx.moveTo(a.x, a.y); ctx.lineTo(bb.x, bb.y); ctx.lineTo(cc.x, cc.y); ctx.lineTo(dd.x, dd.y); ctx.lineTo(a.x, a.y); ctx.lineTo(cc.x, cc.y);
+      }
+      ctx.stroke();
+    }
+    document.getElementById(hudId).textContent = persp ? "u = Σ bᵢuᵢ/wᵢ ÷ Σ bᵢ/wᵢ" : "u = Σ bᵢuᵢ";
+  }
+  const affV = RP.canvas("#affine", (s) => drawPlane(s, false, "aff", "aff-hud"));
+  const perV = RP.canvas("#persp", (s) => drawPlane(s, true, "per", "per-hud"));
+  const draw2 = () => { affV.draw(); perV.draw(); };
+  RP.slider("#tilt2", (v) => { s2.tilt = v * DEG; draw2(); }, { fmt: (v) => v + "°" });
+  RP.slider("#sub2", (v) => { s2.sub = v; draw2(); }, { fmt: (v) => v + "×" + v });
+  const tris2 = document.getElementById("tris2"), spin2 = document.getElementById("spin2");
+  tris2.addEventListener("click", () => { s2.tris = !s2.tris; tris2.setAttribute("aria-pressed", String(s2.tris)); draw2(); });
+  const anim2 = RP.loop(document.getElementById("affine"), (t, dt) => { if (s2.spin && dt > 0) { s2.rot += dt * 0.35; draw2(); } });
+  spin2.setAttribute("aria-pressed", String(s2.spin));
+  if (!s2.spin) anim2.stop();
+  spin2.addEventListener("click", () => { s2.spin = !s2.spin; spin2.setAttribute("aria-pressed", String(s2.spin)); if (s2.spin) anim2.start(); else anim2.stop(); });
+
+  /* ================= STEP 3: magnification ================= */
+  const PAL = { b: [92, 168, 232], y: [250, 204, 62], k: [32, 30, 42], r: [218, 62, 74] };
+  const PAT = ["bbyyyybb", "byyyyyyb", "ykyyyyky", "ykyyyyky", "yyyyyyyy", "yryyyyry", "byrrrryb", "bbyyyybb"];
+  const tex8 = texFromFn(8, 8, (x, y, c) => { const p = PAL[PAT[y][x]]; c[0] = p[0]; c[1] = p[1]; c[2] = p[2]; });
+  const s3 = { mode: "bilinear", zoom: 6, hx: null, hy: null };
+  let g3 = null;
+  const magV = RP.canvas("#mag", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const P = 6, W = Math.max(8, Math.floor(w / P)), H = Math.max(8, Math.floor(h / P));
+    const ox = (w - W * P) / 2, oy = (h - H * P) / 2;
+    const S = 8 * s3.zoom, x0 = (W - S) / 2, y0 = (H - S) / 2;
+    g3 = { P, W, H, ox, oy };
+    const b = ensureBuf("mag", W, H), d = b.d, bg = rgb255(c.surface2), col = [0, 0, 0];
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const u = (x + 0.5 - x0) / S, v = 1 - (y + 0.5 - y0) / S, o = (y * W + x) * 4;
+      if (u < 0 || u > 1 || v < 0 || v > 1) { d[o] = bg[0]; d[o + 1] = bg[1]; d[o + 2] = bg[2]; d[o + 3] = 255; continue; }
+      if (s3.mode === "nearest") sampleNearest(tex8, u, v, WRAP.clamp, col); else sampleBilinear(tex8, u, v, WRAP.clamp, col);
+      d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = 255;
+    }
+    blit(ctx, b, ox, oy, W * P, H * P);
+    // texel grid
+    const tcss = (i) => ox + (x0 + i * s3.zoom) * P, tcssY = (j) => oy + (y0 + j * s3.zoom) * P;
+    ctx.strokeStyle = RP.alpha(c.ink, 0.3); ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = 0; i <= 8; i++) { ctx.moveTo(tcss(i), tcssY(0)); ctx.lineTo(tcss(i), tcssY(8)); ctx.moveTo(tcss(0), tcssY(i)); ctx.lineTo(tcss(8), tcssY(i)); }
+    ctx.stroke();
+    // hovered pixel
+    if (s3.hx === null) { s3.hx = Math.floor(x0 + 0.42 * S); s3.hy = Math.floor(y0 + 0.36 * S); }
+    const hx = clamp(s3.hx, 0, W - 1), hy = clamp(s3.hy, 0, H - 1);
+    const u = (hx + 0.5 - x0) / S, v = 1 - (hy + 0.5 - y0) / S;
+    const spx = ox + (hx + 0.5) * P, spy = oy + (hy + 0.5) * P;
+    const hud = document.getElementById("mag-hud");
+    const inside = u >= 0 && u <= 1 && v >= 0 && v <= 1;
+    if (inside) {
+      const tx = u * 8 - 0.5, ty = (1 - v) * 8 - 0.5;
+      const cx = (i) => tcss(i + 0.5), cy = (j) => tcssY(j + 0.5);
+      if (s3.mode === "nearest") {
+        const ix = clamp(Math.floor(u * 8), 0, 7), iy = clamp(Math.floor((1 - v) * 8), 0, 7);
+        ctx.strokeStyle = c.accent; ctx.lineWidth = 3; ctx.strokeRect(tcss(ix), tcssY(iy), s3.zoom * P, s3.zoom * P);
+        ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(cx(ix), cy(iy), 4, 0, 7); ctx.fill();
+        hud.textContent = `pixel (${hx}, ${hy})\nuv = (${u.toFixed(3)}, ${v.toFixed(3)})\nnearest texel [${ix}, ${iy}]\nweight 1.0`;
+      } else {
+        const i0 = Math.floor(tx), j0 = Math.floor(ty), fx = tx - i0, fy = ty - j0;
+        const ws = [[i0, j0, (1 - fx) * (1 - fy)], [i0 + 1, j0, fx * (1 - fy)], [i0, j0 + 1, (1 - fx) * fy], [i0 + 1, j0 + 1, fx * fy]];
+        ctx.strokeStyle = c.accent; ctx.lineWidth = 2; ctx.strokeRect(cx(i0), cy(j0), s3.zoom * P, s3.zoom * P);
+        for (const [i, j, wt] of ws) {
+          ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(cx(i), cy(j), 2.5 + 7 * wt, 0, 7); ctx.fill();
+        }
+        if (s3.zoom >= 3) for (const [i, j, wt] of ws) label(ctx, c, wt.toFixed(3), cx(i), cy(j) + (j === j0 ? -14 : 22), "center");
+        const ci = (i) => clamp(i, 0, 7);
+        hud.textContent = `pixel (${hx}, ${hy})\nuv = (${u.toFixed(3)}, ${v.toFixed(3)})\ntexel xy = (${tx.toFixed(2)}, ${ty.toFixed(2)})\nfx = ${fx.toFixed(2)}  fy = ${fy.toFixed(2)}\n` +
+          ws.map(([i, j, wt]) => `T[${ci(i)},${ci(j)}] × ${wt.toFixed(3)}`).join("\n");
+      }
+    } else hud.textContent = `pixel (${hx}, ${hy})\noutside the texture`;
+    ctx.strokeStyle = c.frag; ctx.lineWidth = 2; ctx.strokeRect(ox + hx * P - 1, oy + hy * P - 1, P + 2, P + 2);
+    ctx.fillStyle = c.frag; ctx.beginPath(); ctx.arc(spx, spy, 3, 0, 7); ctx.fill();
+  });
+  function pick3(x, y) {
+    if (!g3) return;
+    s3.hx = clamp(Math.floor((x - g3.ox) / g3.P), 0, g3.W - 1); s3.hy = clamp(Math.floor((y - g3.oy) / g3.P), 0, g3.H - 1);
+    magV.draw();
+  }
+  RP.drag(document.getElementById("mag"), { down: pick3, move: pick3, hover: pick3 });
+  RP.toggleGroup("#magmode", (v) => { s3.mode = v; magV.draw(); });
+  RP.slider("#zoom3", (v) => { s3.zoom = v; s3.hx = null; magV.draw(); }, { fmt: (v) => v.toFixed(1) });
+
+  /* ================= STEP 4: minification and mipmaps ================= */
+  const checker256 = buildMips(texFromFn(256, 256, (x, y, c) => {
+    if (((x >> 2) + (y >> 2)) & 1) { c[0] = 238; c[1] = 234; c[2] = 222; } else { c[0] = 34; c[1] = 48; c[2] = 76; }
+  }));
+  const TINT = [[230, 60, 60], [240, 140, 40], [235, 210, 50], [80, 190, 80], [50, 190, 200], [60, 110, 230], [140, 80, 220], [220, 80, 190], [150, 150, 150]];
+  const s4 = { mode: "nearest", bias: 0, moving: false, z: 0, hx: -1, hy: -1 };
+  let C4 = null;
+  function lamOf(t, dux, dvx, duy, dvy) { return Math.log2(Math.max(Math.hypot(dux * t.w, dvx * t.h), Math.hypot(duy * t.w, dvy * t.h), 1e-8)); }
+  function sampler4(u, v, dux, dvx, duy, dvy, out) {
+    const t = checker256;
+    if (s4.mode === "nearest") return sampleNearest(t, u, v, WRAP.repeat, out);
+    if (s4.mode === "bilinear") return sampleBilinear(t, u, v, WRAP.repeat, out);
+    const lam = lamOf(t, dux, dvx, duy, dvy) + s4.bias;
+    sampleTrilinear(t, u, v, lam, out);
+    if (s4.mode === "tint") {
+      const lc = clamp(lam, 0, t.mips.length - 1), l0 = Math.floor(lc), f = lc - l0, l1 = Math.min(l0 + 1, TINT.length - 1);
+      for (let k = 0; k < 3; k++) { const tc = TINT[l0][k] + (TINT[l1][k] - TINT[l0][k]) * f; out[k] = out[k] * 0.45 + tc * 0.55; }
+    }
+    return out;
+  }
+  const mipEl = document.getElementById("mip");
+  const mipV = RP.canvas(mipEl, (s) => {
+    const { ctx, w, h, c } = s;
+    const k = Math.min(0.5, 440 / w);
+    const W = Math.max(40, Math.round(w * k)), H = Math.max(30, Math.round(h * k));
+    const b = ensureBuf("mip", W, H);
+    C4 = makeCam({ x: 0.37, y: 1, z: s4.z, pitch: 0.17, fov: 60 * DEG, scale: 4 }, W, H);
+    renderGround(b, C4, sampler4, rgb255(c.surface2));
+    blit(ctx, b, 0, 0, w, h);
+    update4Info();
+  });
+  function info4() {
+    if (!C4 || s4.hx < 0) return null;
+    const p = pixelDerivs(C4, s4.hx, s4.hy);
+    if (!p) return { sky: true };
+    const t = checker256;
+    const X = Math.hypot(p.dux * t.w, p.dvx * t.h), Y = Math.hypot(p.duy * t.w, p.dvy * t.h);
+    return { X, Y, L: Math.max(X, Y), lam: Math.log2(Math.max(X, Y, 1e-8)) + s4.bias };
+  }
+  function update4Info() {
+    const hud = document.getElementById("mip-hud"), names = { nearest: "nearest, no mips", bilinear: "bilinear, no mips", trilinear: "trilinear + mipmaps", tint: "mip tint (debug)" };
+    const inf = info4();
+    let txt = names[s4.mode];
+    if (!inf) txt += "\nhover the floor";
+    else if (inf.sky) txt += "\n(sky: no texture)";
+    else {
+      const lc = clamp(inf.lam, 0, 8);
+      txt += `\n|ddx| = ${inf.X.toFixed(2)} texels\n|ddy| = ${inf.Y.toFixed(2)} texels\nλ = log₂(${inf.L.toFixed(2)})${s4.bias ? (s4.bias > 0 ? " + " : " − ") + Math.abs(s4.bias) : ""} = ${inf.lam.toFixed(2)}`;
+      txt += s4.mode === "nearest" || s4.mode === "bilinear" ? "\n(ignored: level 0 only)" : `\n→ levels ${Math.floor(lc)} & ${Math.min(8, Math.floor(lc) + 1)}, blend ${(lc - Math.floor(lc)).toFixed(2)}`;
+    }
+    hud.textContent = txt;
+    pyrV.draw();
+  }
+  const levelCanvases = { plain: [], tint: [] };
+  function levelCanvas(i, tint) {
+    const list = tint ? levelCanvases.tint : levelCanvases.plain;
+    if (list[i]) return list[i];
+    const t = checker256.mips[i], cv = document.createElement("canvas"); cv.width = t.w; cv.height = t.h;
+    const cx = cv.getContext("2d"), img = cx.createImageData(t.w, t.h);
+    for (let p = 0; p < t.w * t.h; p++) for (let k = 0; k < 3; k++) img.data[p * 4 + k] = tint ? t.d[p * 3 + k] * 0.45 + TINT[i][k] * 0.55 : t.d[p * 3 + k];
+    for (let p = 0; p < t.w * t.h; p++) img.data[p * 4 + 3] = 255;
+    cx.putImageData(img, 0, 0); list[i] = cv; return cv;
+  }
+  const pyrV = RP.canvas("#pyr", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const n = checker256.mips.length, gap = 6;
+    const s0 = Math.max(8, Math.min(h - 50, (w - 24 - gap * (n - 1)) / 2));
+    const inf = info4(), useMips = s4.mode === "trilinear" || s4.mode === "tint";
+    const l0 = inf && !inf.sky ? Math.floor(clamp(inf.lam, 0, n - 1)) : -1;
+    const l1 = l0 >= 0 ? Math.min(n - 1, l0 + 1) : -1;
+    const frac = inf && !inf.sky ? clamp(inf.lam, 0, n - 1) - l0 : 0;
+    ctx.fillStyle = c.muted; ctx.font = "11px ui-monospace, Consolas, monospace"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(w < 480 ? "mip pyramid · total memory ×4/3" : "mip pyramid · each level ½ the size · total memory ×4/3", 12, 14);
+    let x = 12; const yb = h - 22;
+    for (let i = 0; i < n; i++) {
+      const sz = Math.max(2, s0 / Math.pow(2, i));
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(levelCanvas(i, s4.mode === "tint"), x, yb - sz, sz, sz);
+      if (useMips && (i === l0 || (i === l1 && frac > 0.001))) {
+        ctx.strokeStyle = c.frag; ctx.lineWidth = i === l0 ? 3 : 2; ctx.strokeRect(x - 2, yb - sz - 2, sz + 4, sz + 4);
+      } else { ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.strokeRect(x - 0.5, yb - sz - 0.5, sz + 1, sz + 1); }
+      ctx.fillStyle = i === l0 && useMips ? c.frag : c.muted; ctx.textAlign = "center";
+      if (sz >= 22 || i === 0) ctx.fillText(`L${i} ${checker256.mips[i].w}²`, x + Math.max(sz, 40) / 2, yb + 11);
+      else if (i === n - 1) ctx.fillText(`…L${i}`, x + 6, yb + 11);
+      x += sz + gap;
+    }
+  });
+  RP.drag(mipEl, {
+    down(x, y) { pick4(x, y); }, move(x, y) { pick4(x, y); }, hover(x, y) { pick4(x, y); },
+  });
+  function pick4(x, y) { if (!C4) return; s4.hx = clamp(Math.floor(x / mipV.w * C4.W), 0, C4.W - 1); s4.hy = clamp(Math.floor(y / mipV.h * C4.H), 0, C4.H - 1); update4Info(); }
+  RP.toggleGroup("#mipmode", (v) => { s4.mode = v; mipV.draw(); });
+  RP.slider("#bias4", (v) => { s4.bias = v; mipV.draw(); }, { fmt: (v) => (v > 0 ? "+" : "") + v.toFixed(2) });
+  const move4 = document.getElementById("move4");
+  const anim4 = RP.loop(mipEl, (t, dt) => { if (s4.moving && dt > 0) { s4.z -= dt * 0.6; mipV.draw(); } });
+  anim4.stop();
+  move4.addEventListener("click", () => { s4.moving = !s4.moving; move4.setAttribute("aria-pressed", String(s4.moving)); if (s4.moving) anim4.start(); else anim4.stop(); });
+
+  /* ================= STEP 5: anisotropic filtering ================= */
+  const brick = buildMips(texFromFn(256, 256, (x, y, c) => {
+    const row = y >> 5, off = row & 1 ? 32 : 0, xx = (x + off) & 255;
+    const lx = xx & 63, ly = y & 31;
+    if (lx < 3 || ly < 3) { c[0] = 212; c[1] = 206; c[2] = 196; return; }
+    const hb = hash(xx >> 6, row), n = hash(x, y) * 22;
+    c[0] = 140 + hb * 70 + n; c[1] = 62 + hb * 34 + n * 0.6; c[2] = 48 + hb * 22 + n * 0.5;
+  }));
+  const s5 = { mode: "aniso", tilt: 14 * DEG, maxA: 8, fx: 0.5, fy: 0.72, dirty: true };
+  let C5 = null;
+  RP.onTheme(() => { s5.dirty = true; });
+  function sampler5(u, v, dux, dvx, duy, dvy, out) {
+    if (s5.mode === "aniso") return sampleAniso(brick, u, v, dux, dvx, duy, dvy, s5.maxA, out);
+    return sampleTrilinear(brick, u, v, lamOf(brick, dux, dvx, duy, dvy), out);
+  }
+  function sel5() {
+    if (!C5) return null;
+    const px = clamp(Math.floor(s5.fx * C5.W), 0, C5.W - 1), py = clamp(Math.floor(s5.fy * C5.H), 0, C5.H - 1);
+    const p = pixelDerivs(C5, px, py);
+    return { px, py, p, fp: p ? footprint(brick, p.dux, p.dvx, p.duy, p.dvy, s5.maxA) : null };
+  }
+  let lastBuf5 = null;
+  const aniLEl = document.getElementById("aniL");
+  const aniLV = RP.canvas(aniLEl, (s) => {
+    const { ctx, w, h, c } = s;
+    const k = Math.min(0.5, 250 / w);
+    const W = Math.max(40, Math.round(w * k)), H = Math.max(30, Math.round(h * k));
+    const b = ensureBuf("aniL", W, H);
+    if (s5.dirty || b !== lastBuf5) {
+      C5 = makeCam({ x: 0.3, y: 1, z: 0, pitch: s5.tilt, fov: 55 * DEG, scale: 2 }, W, H);
+      renderGround(b, C5, sampler5, rgb255(c.surface2));
+      s5.dirty = false; lastBuf5 = b;
+      requestAnimationFrame(() => aniRV.draw());
+    }
+    blit(ctx, b, 0, 0, w, h);
+    const sel = sel5(), cw = w / W, ch = h / H;
+    const x = sel.px * cw, y = sel.py * ch;
+    ctx.strokeStyle = c.frag; ctx.lineWidth = 2; ctx.strokeRect(x - 2, y - 2, cw + 4, ch + 4);
+    ctx.beginPath(); ctx.moveTo(x + cw / 2, y - 12); ctx.lineTo(x + cw / 2, y - 4); ctx.moveTo(x + cw / 2, y + ch + 4); ctx.lineTo(x + cw / 2, y + ch + 12);
+    ctx.moveTo(x - 12, y + ch / 2); ctx.lineTo(x - 4, y + ch / 2); ctx.moveTo(x + cw + 4, y + ch / 2); ctx.lineTo(x + cw + 12, y + ch / 2); ctx.stroke();
+    document.getElementById("aniL-hud").textContent = (s5.mode === "aniso" ? `anisotropic, max ${s5.maxA}×` : "isotropic trilinear") + `\nview ${Math.round(s5.tilt / DEG)}° above floor`;
+  });
+  const aniRV = RP.canvas("#aniR", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const hud = document.getElementById("aniR-hud");
+    const sel = sel5();
+    if (!sel || !sel.p) { hud.textContent = sel ? "selected pixel is sky:\nno texture footprint" : ""; return; }
+    const { p, fp } = sel, T = 256;
+    const tcx = p.u * T, tcy = (1 - p.v) * T;
+    const X = [p.dux * T, -p.dvx * T], Y = [p.duy * T, -p.dvy * T];
+    const Wt = Math.max(8, fp.Lmax * 1.7), scale = Math.min(w, h) / Wt;
+    const cx = w / 2, cy = h / 2;
+    // texture patch (level 0, nearest) around the footprint
+    const PW = Math.max(8, Math.min(180, Math.ceil(w / 3))), PH = Math.max(8, Math.round(PW * h / w));
+    const b = ensureBuf("aniR", PW, PH), d = b.d, col = [0, 0, 0];
+    for (let j = 0; j < PH; j++) for (let i = 0; i < PW; i++) {
+      const tx = tcx + ((i + 0.5) / PW * w - cx) / scale, ty = tcy + ((j + 0.5) / PH * h - cy) / scale;
+      sampleNearest(brick, tx / T, 1 - ty / T, WRAP.repeat, col);
+      const o = (j * PW + i) * 4; d[o] = col[0] * 0.8; d[o + 1] = col[1] * 0.8; d[o + 2] = col[2] * 0.8; d[o + 3] = 255;
+    }
+    blit(ctx, b, 0, 0, w, h);
+    if (scale >= 7) { // texel grid
+      ctx.strokeStyle = RP.alpha(c.ink, 0.15); ctx.lineWidth = 1; ctx.beginPath();
+      const fx0 = tcx - cx / scale, fy0 = tcy - cy / scale;
+      for (let t = Math.ceil(fx0); t < fx0 + w / scale; t++) { const x = cx + (t - tcx) * scale; ctx.moveTo(x, 0); ctx.lineTo(x, h); }
+      for (let t = Math.ceil(fy0); t < fy0 + h / scale; t++) { const y = cy + (t - tcy) * scale; ctx.moveTo(0, y); ctx.lineTo(w, y); }
+      ctx.stroke();
+    }
+    const S = (vx, vy) => [cx + vx * scale, cy + vy * scale];
+    // parallelogram spanned by ddx and ddy
+    ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = c.frag; ctx.lineWidth = 1.5; ctx.beginPath();
+    [[1, 1], [1, -1], [-1, -1], [-1, 1]].forEach(([a, bb], i) => { const q = S((a * X[0] + bb * Y[0]) / 2, (a * X[1] + bb * Y[1]) / 2); if (i) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]); });
+    ctx.closePath(); ctx.stroke(); ctx.restore();
+    // footprint ellipse: image of the pixel's inscribed circle
+    ctx.strokeStyle = c.frag; ctx.lineWidth = 2.5; ctx.beginPath();
+    for (let i = 0; i <= 64; i++) { const t = i / 64 * Math.PI * 2, q = S((Math.cos(t) * X[0] + Math.sin(t) * Y[0]) / 2, (Math.cos(t) * X[1] + Math.sin(t) * Y[1]) / 2); if (i) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]); }
+    ctx.stroke();
+    if (s5.mode === "iso") {
+      ctx.strokeStyle = c.warn; ctx.fillStyle = RP.alpha(c.warn, 0.18); ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, fp.Lmax / 2 * scale), 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    } else {
+      const A = [fp.au * T, -fp.av * T], r = Math.max(2, fp.Lmax / fp.N / 2 * scale);
+      ctx.strokeStyle = c.good; ctx.fillStyle = RP.alpha(c.good, 0.2); ctx.lineWidth = 2;
+      for (let i = 0; i < fp.N; i++) {
+        const sft = (i + 0.5) / fp.N - 0.5, q = S(A[0] * sft, A[1] * sft);
+        ctx.beginPath(); ctx.arc(q[0], q[1], r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = c.good; ctx.beginPath(); ctx.arc(q[0], q[1], 2, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = RP.alpha(c.good, 0.2);
+      }
+    }
+    // ddx / ddy arrows
+    const arrow = (v, color, name) => {
+      const q = S(v[0], v[1]); ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(q[0], q[1]); ctx.stroke();
+      label(ctx, c, name, q[0], q[1] + 4, "center");
+    };
+    arrow([X[0] / 2, X[1] / 2], c.ink, "ddx/2"); arrow([Y[0] / 2, Y[1] / 2], c.ink, "ddy/2");
+    const ratio = fp.Lmax / fp.Lmin;
+    hud.textContent = `|ddx| = ${fp.lx.toFixed(2)}  |ddy| = ${fp.ly.toFixed(2)} texels\nratio ${ratio.toFixed(1)} : 1\n` +
+      `isotropic: 1 sample, λ = ${Math.max(0, fp.lamIso).toFixed(2)}\n` +
+      `aniso ${s5.maxA}×: N = ${fp.N}, λ = ${Math.max(0, fp.lamAniso).toFixed(2)}`;
+  });
+  function pick5(x, y) { s5.fx = clamp(x / aniLV.w, 0, 0.999); s5.fy = clamp(y / aniLV.h, 0, 0.999); aniLV.draw(); aniRV.draw(); }
+  RP.drag(aniLEl, { down: pick5, move: pick5, hover: pick5 });
+  const redraw5 = () => { s5.dirty = true; aniLV.draw(); aniRV.draw(); };
+  RP.toggleGroup("#animode", (v) => { s5.mode = v; redraw5(); });
+  RP.slider("#tilt5", (v) => { s5.tilt = v * DEG; redraw5(); }, { fmt: (v) => v + "°" });
+  RP.slider("#maxa5", (v) => { s5.maxA = Math.pow(2, v); redraw5(); }, { fmt: (v) => Math.pow(2, v) + "×" });
+})();
+</script>
+</body>
+</html>

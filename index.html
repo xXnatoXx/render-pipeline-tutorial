@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Render Pipeline Tutorial</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .hub-hero { display: grid; gap: 16px; padding-block: 24px 28px; max-width: var(--wide) !important; }
+  .hub-hero h1 { font-size: clamp(2.3rem, 6vw, 4rem); max-width: 16ch; }
+  .hub-hero .lede { max-width: 60ch; }
+  .flow-wrap { max-width: var(--wide) !important; }
+  #flow { height: 400px; }
+  @media (max-width: 720px) { #flow { height: 340px; } }
+  .stage-info { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 20px; align-items: start; padding: 16px; border-top: 1px solid var(--line); }
+  .stage-info h3 { display: flex; align-items: center; gap: 10px; }
+  .stage-info h3 i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .stage-info p { color: var(--muted); font-size: 0.95rem; max-width: 70ch; }
+  .stage-info .go { white-space: nowrap; font-weight: 600; font-size: 0.9rem; }
+  @media (max-width: 560px) { .stage-info { grid-template-columns: 1fr; } .stage-info .go { white-space: normal; } }
+
+  .eras { max-width: var(--wide) !important; display: grid; gap: 28px; padding-block: 40px 16px; }
+  .era { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 16px; align-items: start; }
+  .era-label { font: 600 0.75rem/1.3 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding-top: 14px; border-top: 2px solid var(--ink); }
+  .era-label span { display: block; color: var(--ink); font: 700 1.1rem/1.2 var(--font-display); letter-spacing: 0; text-transform: none; margin-top: 4px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .card { display: grid; gap: 8px; align-content: start; padding: 16px 16px 16px 20px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); text-decoration: none; color: var(--ink); position: relative; overflow: hidden; }
+  .card:hover { border-color: var(--accent); }
+  .card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--stage, var(--ink)); }
+  .card .no { font: 600 0.75rem/1 var(--font-mono); color: var(--muted); }
+  .card h3 { font-size: 1.15rem; }
+  .card p { font-size: 0.9rem; color: var(--muted); }
+  @media (max-width: 720px) { .era { grid-template-columns: 1fr; } .era-label { padding-top: 10px; } }
+
+  .how { display: grid; gap: 10px; padding-block: 32px 8px; }
+  .how ol { gap: 8px; }
+  footer.foot { max-width: var(--wide); margin: 0 auto; padding-block: 24px 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between; }
+</style>
+</head>
+<body>
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hub-hero">
+    <p class="eyebrow">An interactive course · 9 chapters</p>
+    <h1>How a GPU turns triangles into pixels</h1>
+    <p class="lede">Follow one frame through the real-time render pipeline. The course starts with the classical foundations: transforms, rasterization, shading and texturing. It then moves through the programmable GPU and modern techniques, and ends with the explicit APIs and game engines that ship games today. Every step has a visualization you can drag, slide and break.</p>
+  </section>
+
+  <figure class="viz flow-wrap" aria-labelledby="flow-title">
+    <div class="viz-stage">
+      <canvas id="flow" tabindex="0" aria-label="Animated diagram of the render pipeline: a cube's vertices are transformed, assembled into triangles, rasterized into fragments, shaded, and merged into the framebuffer. Click a stage to read about it."></canvas>
+    </div>
+    <div class="controls">
+      <div class="btn-row" id="flow-play"><button class="btn" data-value="play" aria-pressed="true">Play</button><button class="btn" data-value="pause">Pause</button></div>
+      <div class="btn-row"><button class="btn" id="flow-prev" type="button">← Stage</button><button class="btn" id="flow-next" type="button">Stage →</button></div>
+      <div class="control"><label for="flow-res">Raster resolution <output for="flow-res"></output></label><input type="range" id="flow-res" min="8" max="40" value="18"></div>
+    </div>
+    <div class="stage-info" aria-live="polite">
+      <div><h3 id="flow-title"><i id="flow-chip"></i><span id="flow-name"></span></h3><p id="flow-desc"></p></div>
+      <a class="go" id="flow-link" href="#">Open chapter →</a>
+    </div>
+  </figure>
+
+  <div class="eras" id="eras"></div>
+
+  <section class="how">
+    <h2>How to use this course</h2>
+    <ol>
+      <li>Read the chapters in order. Each one assumes the last, and the overview diagram above shows where each chapter sits in the pipeline.</li>
+      <li>Touch every visualization. Drag the vertices and lights, push the sliders to their extremes, and watch what breaks.</li>
+      <li>Keep the conventions in mind. Matrices are OpenGL-style column-major (<code>P · V · M</code>), the world is right-handed and y-up, and the camera looks down −Z.</li>
+      <li>After Chapter 09, try building a tiny software rasterizer or a WebGPU triangle yourself. The chapters give you every piece.</li>
+    </ol>
+  </section>
+</main>
+<footer class="foot">
+  <span>Render Pipeline Tutorial · procedural visuals, no external assets</span>
+  <a href="https://github.com/xXnatoXx/render-pipeline-tutorial">Source on GitHub</a>
+</footer>
+
+<script src="assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const BLURBS = {
+    "01": "Object, world, view and clip space, plus the perspective divide that makes far things small.",
+    "02": "Edge functions, coverage, barycentric interpolation and the z-buffer.",
+    "03": "Normals, Lambert's law, Phong and Blinn-Phong, and flat vs Gouraud vs per-pixel shading.",
+    "04": "UVs, perspective-correct interpolation, filtering and the mipmap pyramid.",
+    "05": "From fixed function to shaders. Write a live fragment shader and watch warps diverge.",
+    "06": "Many lights, the G-buffer, tiled and clustered culling, and shadow maps with bias and PCF.",
+    "07": "Microfacet BRDFs, linear color, HDR tonemapping, bloom and anti-aliasing.",
+    "08": "OpenGL's state machine vs Vulkan, Direct3D 12, Metal and WebGPU, plus command buffers and fences.",
+    "09": "Frame graphs, Unity SRP, Unreal's Nanite and Lumen, Godot, hybrid ray tracing, and a pixel-art pipeline.",
+  };
+  const ERA_ORDER = [["Foundations", "Classical graphics"], ["GPU era", "Hardware"], ["Modern techniques", "Real-time rendering"], ["APIs", "Talking to the GPU"], ["Engines", "Shipping a frame"]];
+  const stageVar = { vtx: "var(--vtx)", ras: "var(--ras)", frag: "var(--frag)", out: "var(--out)", app: "var(--ink)" };
+  document.getElementById("eras").innerHTML = ERA_ORDER.map(([era, label]) => {
+    const ts = RP.TOPICS.filter((t) => t.era === era);
+    return `<section class="era"><div class="era-label">${label}<span>${era}</span></div><div class="cards">${ts.map((t) =>
+      `<a class="card" href="topics/${t.slug}.html" style="--stage:${stageVar[t.stage]}"><span class="no">CHAPTER ${t.no}</span><h3>${t.title}</h3><p>${BLURBS[t.no]}</p></a>`).join("")}</div></section>`;
+  }).join("");
+
+  /* ---------- Pipeline flow diagram ---------- */
+  const STAGES = [
+    { key: "app", name: "Application", col: "ink", ch: "09", desc: "The CPU decides what to draw. It culls invisible objects, sorts and batches them, and records draw calls into command buffers for the GPU." },
+    { key: "vtx", name: "Vertex shader", col: "vtx", ch: "01", desc: "Every vertex is multiplied by the model, view and projection matrices to reach clip space. This is the first programmable stage." },
+    { key: "asm", name: "Assembly & clip", col: "vtx", ch: "05", desc: "Vertices are grouped into triangles and clipped against the view frustum. The perspective divide then maps them into normalized device coordinates, and the viewport maps those to pixels." },
+    { key: "ras", name: "Rasterize", col: "ras", ch: "02", desc: "Fixed-function hardware finds every pixel center inside each triangle and interpolates the vertex attributes with barycentric weights. Each covered sample becomes a fragment." },
+    { key: "frag", name: "Fragment shader", col: "frag", ch: "03", desc: "A small program runs once per fragment. It samples textures and evaluates lighting to produce a color." },
+    { key: "out", name: "Output merge", col: "out", ch: "06", desc: "Depth and stencil tests decide which fragments survive. Blending writes the survivors into the framebuffer, and post-processing and present follow." },
+  ];
+  const cv = document.getElementById("flow");
+  let stage = 0, phase = 0, res = 18, playing = !RP.reduced, frozenT = 1.2;
+  const nameEl = document.getElementById("flow-name"), descEl = document.getElementById("flow-desc"), linkEl = document.getElementById("flow-link"), chipEl = document.getElementById("flow-chip");
+  function showInfo() {
+    const s = STAGES[stage], t = RP.TOPICS.find((x) => x.no === s.ch);
+    nameEl.textContent = s.name; descEl.textContent = s.desc;
+    linkEl.href = `topics/${t.slug}.html`; linkEl.textContent = `Chapter ${t.no}: ${t.title} →`;
+    chipEl.style.background = `var(--${s.col})`;
+  }
+  const cube = RP.mesh.cube();
+  const BASE = [0.95, 0.55, 0.35]; // linear albedo of the demo cube
+  function mvpAt(t, aspect) {
+    const M = RP.m4.chain(RP.m4.rotY(t * 0.6), RP.m4.rotX(0.5));
+    const V = RP.m4.lookAt([0, 0.5, 2.2], [0, 0, 0], [0, 1, 0]);
+    const P = RP.m4.perspective(0.9, aspect, 0.1, 20);
+    return { M, mvp: RP.m4.chain(P, V, M) };
+  }
+  const L = RP.v3.norm([0.5, 0.8, 0.6]);
+  const enc = (x) => (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055);
+  const font = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim() || "sans-serif";
+  function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+  function hud(ctx, c, x, y, lines) {
+    ctx.font = `400 11.5px ${font("--font-mono")}`; ctx.textAlign = "left"; ctx.textBaseline = "top";
+    const wMax = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 16;
+    ctx.fillStyle = RP.alpha(c.paper, 0.9); roundRect(ctx, x, y, wMax, lines.length * 16 + 10, 6); ctx.fill();
+    ctx.fillStyle = c.ink; lines.forEach((l, i) => ctx.fillText(l, x + 8, y + 6 + i * 16));
+  }
+
+  const view = RP.canvas(cv, (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.clearRect(0, 0, w, h);
+    const narrow = w < 640;
+    const pad = 12, railH = narrow ? 44 : 52, n = STAGES.length, gap = 6;
+    const bw = (w - pad * 2 - gap * (n - 1)) / n;
+    s.hit = [];
+    STAGES.forEach((st, i) => {
+      const x = pad + i * (bw + gap), y = pad, on = i === stage, col = c[st.col];
+      ctx.fillStyle = on ? col : c.surface; ctx.strokeStyle = on ? col : c.line; ctx.lineWidth = 1;
+      roundRect(ctx, x, y, bw, railH, 8); ctx.fill(); ctx.stroke();
+      const txt = on ? (st.col === "ink" ? c.paper : c.surface) : c.ink;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = on ? txt : c.muted; ctx.font = `600 ${narrow ? 9 : 10.5}px ${font("--font-mono")}`;
+      ctx.fillText(String(i + 1).padStart(2, "0"), x + bw / 2, y + (narrow ? 13 : 15));
+      ctx.fillStyle = txt; ctx.font = `600 ${narrow ? 9.5 : 12.5}px ${font("--font-body")}`;
+      let label = st.name; if (ctx.measureText(label).width > bw - 8) label = st.name.split(" ")[0];
+      ctx.fillText(label, x + bw / 2, y + railH - (narrow ? 13 : 16));
+      if (on) { ctx.fillStyle = RP.alpha(txt, 0.6); ctx.fillRect(x + 6, y + railH - 4, (bw - 12) * phase, 2); }
+      s.hit.push([x, y, bw, railH]);
+    });
+
+    const py = pad + railH + 10, ph = h - py - pad, pw = w - pad * 2;
+    ctx.fillStyle = c.surface; ctx.strokeStyle = c.line; roundRect(ctx, pad, py, pw, ph, 10); ctx.fill(); ctx.stroke();
+    const t = playing ? performance.now() / 1000 : frozenT;
+    const vw = Math.min(pw - 24, ph * 1.6), vh = ph - 24, vx = pad + (pw - vw) / 2, vy = py + 12;
+    const { M, mvp } = mvpAt(t, vw / vh);
+    const proj = cube.pos.map((p) => RP.m4.project(mvp, p, vw, vh));
+    const P = (i) => [vx + proj[i].x, vy + proj[i].y];
+    const key = STAGES[stage].key;
+    ctx.save(); ctx.beginPath(); ctx.rect(pad + 1, py + 1, pw - 2, ph - 2); ctx.clip();
+
+    if (key === "app") {
+      const items = ["cull: 3 of 7 objects visible", "sort by material", "bind pipeline (lit_opaque)", "bind vertex buffer: cube", "set uniforms: MVP, light", "draw(36 vertices)"];
+      const k = Math.floor(phase * (items.length + 1));
+      const fs = narrow ? 11 : 13;
+      ctx.font = `500 ${fs}px ${font("--font-mono")}`; ctx.textAlign = "left"; ctx.textBaseline = "top";
+      items.forEach((it, i) => { ctx.fillStyle = i < k ? c.ink : c.muted; ctx.globalAlpha = i < k ? 1 : 0.45; ctx.fillText((i < k ? "▸ " : "  ") + it, pad + 16, py + 18 + i * (fs + 9)); });
+      ctx.globalAlpha = 1;
+      if (!narrow) {
+        const cx = pad + pw * 0.74, cy = py + ph / 2, r = Math.min(ph, pw * 0.4) * 0.38;
+        ctx.strokeStyle = c.accent; ctx.fillStyle = RP.alpha(c.accent, 0.12);
+        ctx.beginPath(); ctx.moveTo(cx, cy + r); ctx.lineTo(cx - r, cy - r); ctx.lineTo(cx + r, cy - r); ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(cx, cy + r, 4, 0, Math.PI * 2); ctx.fill();
+        const objs = [[0, -0.5, 1], [-0.4, -0.2, 1], [0.3, -0.7, 1], [-1.1, 0.3, 0], [1.2, -0.2, 0], [0.2, 0.9, 0], [-0.9, -1.1, 0]];
+        objs.forEach(([ox, oy, vis]) => { ctx.fillStyle = vis ? c.vtx : c.muted; ctx.globalAlpha = vis || phase < 0.2 ? 1 : 0.3; ctx.fillRect(cx + ox * r - 6, cy + oy * r - 6, 12, 12); });
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c.muted; ctx.font = `500 11px ${font("--font-mono")}`; ctx.textAlign = "center"; ctx.fillText("camera frustum (top-down)", cx, py + ph - 20);
+      }
+    } else if (key === "vtx" || key === "asm") {
+      if (key === "asm") {
+        ctx.strokeStyle = c.vtx; ctx.lineWidth = 1.4;
+        const upto = Math.floor(phase * cube.tri.length + 1);
+        cube.tri.slice(0, upto).forEach(([a, b, d]) => { ctx.beginPath(); ctx.moveTo(...P(a)); ctx.lineTo(...P(b)); ctx.lineTo(...P(d)); ctx.closePath(); ctx.stroke(); });
+        ctx.setLineDash([4, 4]); ctx.strokeStyle = c.muted; ctx.lineWidth = 1; ctx.strokeRect(vx, vy, vw, vh); ctx.setLineDash([]);
+      }
+      proj.forEach((p, i) => {
+        const [x, y] = P(i);
+        const pulse = key === "vtx" ? RP.smoothstep(i / proj.length, i / proj.length + 0.1, phase) : 1;
+        ctx.fillStyle = c.vtx; ctx.beginPath(); ctx.arc(x, y, 2 + 3 * pulse, 0, Math.PI * 2); ctx.fill();
+      });
+      if (key === "vtx") {
+        const i = Math.min(proj.length - 1, Math.floor(phase * proj.length));
+        const [x, y] = P(i); ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.stroke();
+        const p = cube.pos[i], cl = RP.m4.xform(mvp, [p[0], p[1], p[2], 1]);
+        hud(ctx, c, pad + 10, py + 10, [`vertex ${i}  object (${p.map((v) => v.toFixed(1)).join(", ")})`, `clip = P·V·M·v`, `   = (${cl.map((v) => v.toFixed(2)).join(", ")})`]);
+      } else hud(ctx, c, pad + 10, py + 10, [`${cube.tri.length} triangles assembled`, "clip → ÷w → NDC → viewport"]);
+    } else {
+      const cell = Math.max(4, Math.floor(Math.min(vw, vh) / res));
+      const gw = Math.floor(vw / cell), gh = Math.floor(vh / cell);
+      const ox = vx + (vw - gw * cell) / 2, oy = vy + (vh - gh * cell) / 2;
+      const depth = new Float32Array(gw * gh).fill(Infinity), shade = new Array(gw * gh).fill(null), hits = new Uint8Array(gw * gh);
+      const nrmW = cube.nrm.map((nn) => RP.v3.norm(RP.m4.xform(M, [nn[0], nn[1], nn[2], 0]).slice(0, 3)));
+      const G = (i) => [(P(i)[0] - ox) / cell, (P(i)[1] - oy) / cell, proj[i].z];
+      cube.tri.forEach(([a, b, d]) => {
+        const A = G(a), B = G(b), C = G(d);
+        const area = (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0]);
+        if (area >= 0) return; // back face: counter-clockwise in NDC becomes clockwise with screen y down
+        const minx = Math.max(0, Math.floor(Math.min(A[0], B[0], C[0]))), maxx = Math.min(gw - 1, Math.ceil(Math.max(A[0], B[0], C[0])));
+        const miny = Math.max(0, Math.floor(Math.min(A[1], B[1], C[1]))), maxy = Math.min(gh - 1, Math.ceil(Math.max(A[1], B[1], C[1])));
+        const nd = Math.max(0, RP.v3.dot(nrmW[a], L));
+        for (let y = miny; y <= maxy; y++) for (let x = minx; x <= maxx; x++) {
+          const qx = x + 0.5, qy = y + 0.5;
+          const w0 = (C[0] - B[0]) * (qy - B[1]) - (C[1] - B[1]) * (qx - B[0]);
+          const w1 = (A[0] - C[0]) * (qy - C[1]) - (A[1] - C[1]) * (qx - C[0]);
+          const w2 = (B[0] - A[0]) * (qy - A[1]) - (B[1] - A[1]) * (qx - A[0]);
+          if (w0 > 0 || w1 > 0 || w2 > 0) continue;
+          const z = (w0 * A[2] + w1 * B[2] + w2 * C[2]) / area;
+          const k = y * gw + x; hits[k]++;
+          if (z < depth[k]) { depth[k] = z; shade[k] = nd; }
+        }
+      });
+      const reveal = Math.floor(phase * gh * 1.15);
+      ctx.lineWidth = 0.5; ctx.strokeStyle = c.line;
+      for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+        const k = y * gw + x, X = ox + x * cell, Y = oy + y * cell;
+        ctx.strokeRect(X + 0.25, Y + 0.25, cell - 0.5, cell - 0.5);
+        if (shade[k] === null || y > reveal) continue;
+        if (key === "ras") { ctx.fillStyle = RP.alpha(c.ras, Math.min(0.95, 0.3 + 0.3 * hits[k])); ctx.fillRect(X + 1, Y + 1, cell - 2, cell - 2); }
+        else {
+          const lit = 0.08 + 0.92 * shade[k], inset = key === "out" ? 0 : 1;
+          ctx.fillStyle = RP.rgb2css(BASE.map((b) => enc(b * lit))); ctx.fillRect(X + inset, Y + inset, cell - 2 * inset, cell - 2 * inset);
+        }
+      }
+      if (key === "ras") { ctx.strokeStyle = c.ink; ctx.lineWidth = 1; ctx.globalAlpha = 0.45; cube.tri.forEach(([a, b, d]) => { ctx.beginPath(); ctx.moveTo(...P(a)); ctx.lineTo(...P(b)); ctx.lineTo(...P(d)); ctx.closePath(); ctx.stroke(); }); ctx.globalAlpha = 1; }
+      const kept = shade.filter((v) => v !== null).length, frags = hits.reduce((a, b) => a + b, 0);
+      const lines = key === "ras" ? [`${gw}×${gh} pixel grid`, `${frags} fragments from front faces`, "darker = covered by 2+ triangles"]
+        : key === "frag" ? ["color = albedo × max(N·L, 0)", `${frags} shader invocations`] : [`depth test kept ${kept} of ${frags} fragments`, "framebuffer ready to present"];
+      hud(ctx, c, pad + 10, py + 10, lines);
+    }
+    ctx.restore();
+  });
+
+  const anim = RP.loop(cv, (t, dt) => {
+    if (playing) { phase += dt / 3.2; if (phase >= 1) { phase = 0; stage = (stage + 1) % STAGES.length; showInfo(); } }
+    view.draw();
+  });
+  function select(i) { stage = (i + STAGES.length) % STAGES.length; phase = playing ? 0 : 1; showInfo(); view.draw(); }
+  document.getElementById("flow-prev").addEventListener("click", () => select(stage - 1));
+  document.getElementById("flow-next").addEventListener("click", () => select(stage + 1));
+  cv.addEventListener("keydown", (e) => { if (e.key === "ArrowRight") { select(stage + 1); e.preventDefault(); } if (e.key === "ArrowLeft") { select(stage - 1); e.preventDefault(); } });
+  cv.addEventListener("click", (e) => {
+    const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+    (view.hit || []).forEach(([hx, hy, hw, hh], i) => { if (x >= hx && x <= hx + hw && y >= hy && y <= hy + hh) select(i); });
+  });
+  const playGroup = RP.toggleGroup("#flow-play", (v) => {
+    const was = playing; playing = v === "play";
+    if (playing) anim.start(); else { if (was) frozenT = performance.now() / 1000; phase = 1; anim.stop(); view.draw(); }
+  });
+  RP.slider("#flow-res", (v) => { res = v; view.draw(); });
+  if (RP.reduced) playGroup.set("pause");
+  showInfo();
+})();
+</script>
+</body>
+</html>

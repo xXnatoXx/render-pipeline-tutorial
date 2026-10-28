@@ -1,0 +1,989 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Game Engine Pipelines · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  #fg { height: 460px; }
+  #fl { height: 310px; }
+  #bud { height: 380px; }
+  #lod-hud { left: auto; right: 10px; }
+  @media (max-width: 720px) { #fg { height: 620px; } #fl { height: 320px; } #bud { height: 400px; } }
+  .fg-info { padding: 12px 16px; border-top: 1px solid var(--line); font-size: 0.92rem; display: grid; gap: 6px; background: var(--surface); }
+  .fg-info h3 { font-size: 1rem; }
+  .fg-info .io { font: 400 0.8rem/1.5 var(--font-mono); color: var(--muted); }
+  .fg-info .io b { color: var(--ink); font-weight: 600; }
+  .pick { display: grid; gap: 4px; min-width: 150px; flex: 1 1 160px; }
+  .pick label { font: 600 0.72rem/1.2 var(--font-mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .sw-vtx { background: var(--vtx); } .sw-ras { background: var(--ras); } .sw-frag { background: var(--frag); } .sw-out { background: var(--out); }
+  .sw-good { background: var(--good); } .sw-muted { background: var(--muted); } .sw-bad { background: var(--bad); } .sw-warn { background: var(--warn); } .sw-accent { background: var(--accent); }
+  td small { color: var(--muted); }
+</style>
+</head>
+<body data-topic="09">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 09 · Engines</p>
+    <h1>Game Engine Pipelines</h1>
+    <p class="lede">Everything so far happens inside one draw call. A game engine's renderer is the code that decides which draw calls to make, in what order, into which textures, and how to fit all of it into 16.6 milliseconds.</p>
+    <div class="stage-band"><span class="on app">Application</span><span class="vtx">Vertex</span><span class="ras">Rasterize</span><span class="frag">Fragment</span><span class="out">Output</span></div>
+  </section>
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>What the CPU side of a renderer does before the GPU sees anything: culling, sorting, batching and instancing.</li>
+    <li>How a <em>render graph</em> (frame graph) orders passes, removes unused work, shares memory and inserts barriers.</li>
+    <li>What a typical modern frame contains and how it fits a frame budget.</li>
+    <li>The ideas behind Unity's SRP, Unreal 5 (Nanite, Lumen, Virtual Shadow Maps), Godot 4, hybrid ray tracing and upscalers.</li>
+    <li>How to apply all of this to a small custom pipeline of your own, such as a pixel-art look.</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="cpu-prep">
+    <h2><span class="step-no">STEP 1</span>CPU-side prep: decide what to draw</h2>
+    <p>A level might contain 100,000 objects, but the camera sees only a slice of them. Every object you send to the GPU costs CPU time to record and GPU time to process, so the first job of an engine's renderer runs on the CPU and is about <em>not</em> drawing things.</p>
+    <p><b>Frustum culling</b> throws away objects outside the camera's view volume. Engines test a cheap bounding sphere or box against the six frustum planes; here, in a top-down 2D view, the frustum is a wedge. <b>Occlusion culling</b> removes objects that are inside the frustum but hidden behind something big, like a wall. Real engines do this with precomputed visibility data, GPU occlusion queries, or a low-resolution "hierarchical Z" depth buffer; the demo uses a simple line-of-sight test.</p>
+    <p>What survives is then <b>sorted</b>. Opaque objects are often sorted by material, so the GPU switches shaders and textures as rarely as possible, or roughly front to back, so the depth test rejects hidden fragments early. Transparent objects must be sorted back to front so blending looks right. Finally, many copies of the same mesh can be merged into one <b>instanced</b> draw call that passes a list of per-instance transforms. The result is a list of commands that gets recorded into command buffers (chapter 08), often on several threads at once.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="cpu" class="tall" aria-label="Top-down view of a scene with trees, rocks, crates and walls. A camera at the bottom shows its view frustum as a wedge. Culled objects are faded; a strip at the bottom shows the draw calls in submission order."></canvas><div class="hud" id="cpu-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="cpu-ang">Camera yaw <output for="cpu-ang"></output></label><input type="range" id="cpu-ang" min="-80" max="80" value="0"></div>
+        <div class="btn-row">
+          <button class="btn" id="cpu-fr" aria-pressed="false">Frustum culling</button>
+          <button class="btn" id="cpu-oc" aria-pressed="false">Occlusion culling</button>
+          <button class="btn" id="cpu-so" aria-pressed="false">Sort by material</button>
+          <button class="btn" id="cpu-in" aria-pressed="false">Instancing</button>
+        </div>
+        <div class="legend"><span><i class="sw-good"></i>tree</span><span><i class="sw-muted"></i>rock</span><span><i class="sw-vtx"></i>crate</span><span><i class="sw-frag"></i>wall (occluder)</span><span><i class="sw-warn"></i>ring = wasted draw</span><span><i class="sw-bad"></i>occluded</span></div>
+      </div>
+      <figcaption><b>Try it:</b> start with everything off and note the draw call count. Turn on frustum culling, then occlusion culling, then instancing. Drag on the canvas to aim the camera. "Sort by material" changes how often the GPU must switch state (the colored strip shows the order).</figcaption>
+    </figure>
+    <div class="callout"><strong>Key idea.</strong> The cheapest draw call is the one you never make. Culling cuts the number of objects; sorting cuts state changes; instancing cuts the number of calls needed for what remains.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="graph">
+    <h2><span class="step-no">STEP 2</span>Render graphs: a frame as a list of passes</h2>
+    <p>A modern frame is not one render. It is a dozen or more <b>passes</b>, each drawing into or computing textures that later passes read. A typical deferred frame goes: depth prepass → shadow maps → G-buffer → SSAO → lighting → sky and volumetric fog → transparents → post-processing (TAA, bloom, tonemapping) → UI.</p>
+    <p>Wiring these by hand gets fragile fast. At GDC 2017, Yuriy O'Donnell presented Frostbite's <b>FrameGraph</b>, and the idea spread widely (Unreal calls its version the Render Dependency Graph; Unity has a RenderGraph API). Each pass <em>declares</em> which resources it reads and writes, and leaves the details to the graph. Then a compile step:</p>
+    <ul>
+      <li><b>orders</b> the passes by their dependencies;</li>
+      <li><b>culls</b> passes whose outputs nobody reads, walking backwards from the final image;</li>
+      <li><b>aliases</b> memory: short-lived ("transient") textures whose lifetimes don't overlap can share the same memory;</li>
+      <li><b>inserts barriers</b>, the explicit synchronization that APIs like Vulkan and D3D12 require when a texture switches from being written to being read.</li>
+    </ul>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="fg" aria-label="Frame graph: pass boxes colored by category, connected by edges to small resource pills. Culled passes are drawn dashed. Click a pass to highlight what it reads and writes."></canvas><div class="hud" id="fg-hud"></div></div>
+      <div class="fg-info" id="fg-info" aria-live="polite"></div>
+      <div class="controls">
+        <div class="pick"><label for="fg-sel">Inspect pass</label><select id="fg-sel"></select></div>
+        <div class="btn-row">
+          <button class="btn" id="fg-ao" aria-pressed="true">Lighting reads SSAO</button>
+          <button class="btn" id="fg-bl" aria-pressed="true">Bloom enabled</button>
+          <button class="btn" id="fg-db" aria-pressed="false">Show debug overlay</button>
+        </div>
+        <div class="legend"><span><i class="sw-vtx"></i>geometry pass</span><span><i class="sw-ras"></i>compute / effect</span><span><i class="sw-frag"></i>shading</span><span><i class="sw-out"></i>post + output</span><span><i class="sw-good"></i>reads</span><span><i class="sw-accent"></i>writes</span></div>
+      </div>
+      <div class="viz-stage"><canvas id="fl" aria-label="Lifetime chart: one row per texture, a bar from the pass that first writes it to the pass that last reads it. With aliasing on, bars sharing a memory slot have the same color."></canvas><div class="hud" id="fl-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row"><button class="btn" id="fl-al" aria-pressed="true">Alias transient memory</button></div>
+      </div>
+      <figcaption><b>Try it:</b> click a pass (or pick one from the list) to see its inputs and outputs. Turn off "Lighting reads SSAO" and watch the SSAO pass get culled because nothing consumes its output. The debug view is culled until the UI pass actually reads it. Below, rows that never overlap in time can share one memory slot.</figcaption>
+    </figure>
+    <div class="callout ras"><strong>Key idea.</strong> Passes only say <em>what</em> they read and write. Because the graph sees the whole frame at once, it can schedule, skip, share memory and synchronize automatically, which is far less error-prone than doing it by hand.</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="budget">
+    <h2><span class="step-no">STEP 3</span>The frame budget</h2>
+    <p>At 60 frames per second, every frame gets 1000 / 60 ≈ <b>16.7 ms</b>; at 30 fps, 33.3 ms. Everything above (all passes, plus any ray tracing and post-processing) has to fit inside that, on top of the CPU work. Rendering engineers spend a lot of their time with GPU profilers, moving milliseconds around.</p>
+    <p>Each pass scales differently. Screen-space passes (G-buffer, SSAO, lighting) cost roughly in proportion to the number of pixels, so rendering at 75% resolution per axis costs about 0.75² ≈ 56% as much. Shadow maps scale with the number of cascades instead. That's why <b>upscalers</b> matter so much: NVIDIA DLSS, AMD FSR and Intel XeSS render at a lower internal resolution, then reconstruct a sharp full-resolution image from several jittered frames plus motion vectors. DLSS and recent FSR versions use neural networks; they usually replace TAA rather than adding to it.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="bud" aria-label="A stacked horizontal bar of per-pass GPU costs compared with a budget line at 16.7 or 33.3 milliseconds, with a per-pass list below."></canvas><div class="hud" id="bud-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="bud-res">Render resolution <output for="bud-res"></output></label><input type="range" id="bud-res" min="50" max="100" step="1" value="100"></div>
+        <div class="control"><label for="bud-casc">Shadow cascades <output for="bud-casc"></output></label><input type="range" id="bud-casc" min="1" max="4" value="3"></div>
+        <div class="control"><label for="bud-lights">Dynamic lights <output for="bud-lights"></output></label><input type="range" id="bud-lights" min="0" max="256" step="8" value="32"></div>
+        <div class="btn-row"><button class="btn" id="bud-rt" aria-pressed="false">Ray tracing</button><button class="btn" id="bud-up" aria-pressed="false">Upscaler</button></div>
+        <div class="btn-row" id="bud-fps"><button class="btn" data-value="60" aria-pressed="true">60 fps</button><button class="btn" data-value="30">30 fps</button></div>
+      </div>
+      <figcaption><b>Try it:</b> turn ray tracing on: the frame no longer fits 60 fps. Now enable the upscaler and drop the render resolution to about 67% (a typical "quality" upscaling mode). The costs here are illustrative numbers for a mid-range GPU at 1440p, not measurements.</figcaption>
+    </figure>
+    <div class="callout warn"><strong>Key idea.</strong> A frame is a fixed budget. Every feature buys image quality with milliseconds, and resolution is the biggest lever, which is why reconstruction upscalers are now standard.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="nanite">
+    <h2><span class="step-no">STEP 4</span>Unreal 5 and Nanite-style cluster LOD</h2>
+    <p>Unreal Engine 5 uses <b>deferred shading</b> by default (a forward renderer is available too, often used for VR). Its three headline systems, as Epic describes them:</p>
+    <ul>
+      <li><b>Nanite</b>, "virtualized geometry": meshes are split into small clusters of triangles (around 128 each) arranged in a hierarchy of levels of detail. Each frame the GPU picks, per cluster, the coarsest version whose simplification error would be smaller than about a pixel on screen. Tiny triangles are rasterized by a software rasterizer running in compute shaders, because hardware rasterizers are inefficient with pixel-sized triangles.</li>
+      <li><b>Lumen</b>, dynamic global illumination and reflections: bounced light is traced against simplified scene representations (such as signed distance fields and screen-space data), with hardware ray tracing as an option.</li>
+      <li><b>Virtual Shadow Maps</b>: very high-resolution shadow maps (Epic cites 16k × 16k) split into pages, where only the pages actually needed on screen are rendered and cached between frames. They are designed to pair with Nanite's detail.</li>
+    </ul>
+    <p>Here's the core of the Nanite idea in 2D. The "mesh" is a terrain line made of 256 segments (our stand-in for triangles), grouped into clusters of 16. Each coarser level has half as many clusters, and each cluster still has 16 segments, so it covers twice as much ground with half the detail. Every cluster stores its <em>error</em>, the largest distance between its simplified shape and the full detail. Projected onto the screen, error ≈ error × focal length ÷ distance, in pixels. If that's below the threshold, the cluster is drawn; otherwise its two children are tested instead.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="lod" class="tall" aria-label="Side view of a terrain line made of colored clusters. Clusters near the camera use fine detail, distant ones use coarse detail. Below, a five-level hierarchy shows which clusters are selected."></canvas><div class="hud" id="lod-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="lod-d">Camera distance <output for="lod-d"></output></label><input type="range" id="lod-d" min="2" max="400" value="30"></div>
+        <div class="control"><label for="lod-t">Error threshold <output for="lod-t"></output></label><input type="range" id="lod-t" min="0.25" max="8" step="0.25" value="2"></div>
+        <div class="btn-row"><button class="btn" id="lod-full" aria-pressed="false">Overlay full detail</button></div>
+      </div>
+      <figcaption><b>Try it:</b> slide the camera away and watch distant clusters merge into coarser ones while the segment count drops. Near clusters stay detailed. The strip at the bottom is the cluster hierarchy: filled cells are the ones drawn this frame.</figcaption>
+    </figure>
+    <div class="callout vtx"><strong>Key idea.</strong> Instead of choosing one LOD for a whole object, cluster LOD picks detail per small patch, by how many pixels its error would cover. Geometry cost then tracks screen resolution, not how detailed the source mesh is.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="rt">
+    <h2><span class="step-no">STEP 5</span>Rasterization vs ray tracing, and the hybrid frame</h2>
+    <p>Rasterization asks, for each triangle, "which pixels does this cover?" It projects geometry towards the camera, which is very fast but only answers questions about what the camera sees directly. Ray tracing asks, for each pixel, "what does this ray hit first?" It can follow a ray onward to a light (shadows) or bounce it off a mirror (reflections). Testing every ray against every triangle would be hopeless, so the scene is stored in a <b>bounding volume hierarchy (BVH)</b>: a tree of boxes. A ray that misses a box skips everything inside it.</p>
+    <p>DirectX Raytracing (DXR) and Vulkan's ray tracing extensions expose this on GPUs with hardware support: the driver builds the BVH ("acceleration structures"), and the hardware speeds up box and triangle tests. Games almost always use a <b>hybrid</b>: rasterize the primary view into a G-buffer as usual, then trace a small number of rays per pixel for shadows, reflections or GI. Those few rays give a noisy result, so a <b>denoiser</b> blends results across neighboring pixels and previous frames.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="rtc" class="tall" aria-label="2D scene with a camera on the left, a mirror floor, a box, a round object, a plank and a back wall. Depending on mode, lines show projection of vertices to the camera or rays with bounces and BVH boxes. A column on the right shows the resulting pixel colors."></canvas><div class="hud" id="rt-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row" id="rt-mode"><button class="btn" data-value="raster" aria-pressed="true">Rasterize</button><button class="btn" data-value="rt">Ray trace</button><button class="btn" data-value="hybrid">Hybrid</button></div>
+        <div class="control"><label for="rt-b">Bounces <output for="rt-b"></output></label><input type="range" id="rt-b" min="0" max="3" value="1"></div>
+        <div class="control"><label for="rt-n">Pixels <output for="rt-n"></output></label><input type="range" id="rt-n" min="8" max="40" value="20"></div>
+        <div class="control"><label for="rt-i">Inspect pixel <output for="rt-i"></output></label><input type="range" id="rt-i" min="0" max="19" value="17"></div>
+      </div>
+      <figcaption><b>Try it:</b> in Rasterize mode the mirror floor is just gray and nothing casts shadows. Switch to Ray trace to see BVH boxes tested by the inspected ray (hover the canvas to pick a pixel), shadow rays to the light, and reflection bounces. Hybrid gives the same image with raster primary visibility, so it needs far fewer rays.</figcaption>
+    </figure>
+    <div class="callout frag"><strong>Key idea.</strong> Raster is the fast way to find what the camera sees; rays are the flexible way to ask everything else. A BVH makes rays affordable, and denoisers make a few rays per pixel enough.</div>
+  </section>
+
+  <!-- STEP 6 -->
+  <section class="step" id="engines">
+    <h2><span class="step-no">STEP 6</span>Engines compared, and building your own pipeline</h2>
+    <p>Unity's <b>Scriptable Render Pipeline (SRP)</b> moved the renderer from engine internals into C# you can read and replace. Unity ships two: the <b>Universal Render Pipeline (URP)</b>, built to scale from phones to consoles, and the <b>High Definition Render Pipeline (HDRP)</b> for high-end PC and console. HDRP has been built on a render graph internally for several versions, and in Unity 6 URP uses the RenderGraph API by default. <b>Godot 4</b> offers three renderers: <b>Forward+</b> (clustered forward lighting for desktop), <b>Mobile</b> (a simpler forward renderer for phones and tablets) and <b>Compatibility</b> (OpenGL-based, for old hardware and the web).</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Engine / pipeline</th><th>Default approach</th><th>Aims at</th><th>Notable features</th><th>How you customize</th></tr></thead>
+        <tbody>
+          <tr><td>Unity URP</td><td>Forward, with Forward+ and Deferred options</td><td>Mobile to console, scalability</td><td>Lightweight, wide platform reach</td><td>Renderer Features and custom render passes (C#), RenderGraph in Unity 6</td></tr>
+          <tr><td>Unity HDRP</td><td>Deferred or forward, tiled/clustered lighting</td><td>High-end PC and console</td><td>Physical camera and light units, volumetrics, ray tracing on supported hardware</td><td>Custom Passes, Volume overrides, shader graphs</td></tr>
+          <tr><td>Unreal Engine 5</td><td>Deferred (forward optional)</td><td>High-end, scales down</td><td>Nanite, Lumen, Virtual Shadow Maps, TSR upscaling</td><td>Material graphs, post-process materials, full C++ source (Render Dependency Graph)</td></tr>
+          <tr><td>Godot 4</td><td>Forward+ / Mobile / Compatibility</td><td>Desktop / mobile / web and old GPUs</td><td>SDFGI, VoxelGI, lightmaps (Forward+); open source</td><td>Godot shading language, CompositorEffects (4.3+), engine source</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>You don't need a AAA team to use these ideas. Suppose you want a <b>stylized pixel-art look</b> for a 3D game. As a render graph, it's just a few passes:</p>
+    <pre><code>// pseudocode, engine-agnostic
+lowRes  = createTexture(screenW / pixelSize, screenH / pixelSize)
+pass "scene":     write lowRes.color, depth, objectId  // tiny target
+pass "outline":   read objectId -> write lowRes.color  // dark edges
+pass "palette":   read/write lowRes.color  // nearest palette color
+pass "upscale":   read lowRes.color -> write backbuffer (nearest)
+pass "UI":        write backbuffer at full resolution</code></pre>
+    <p>In Godot that might be a SubViewport with nearest filtering plus a screen shader; in Unity URP, a low-resolution render texture plus a Renderer Feature. A common extra trick is snapping the camera to whole low-res texels so the image doesn't shimmer as it moves. Try each pass below.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="px" aria-label="A small 3D scene with hills and a rotating cube, rendered at low resolution and upscaled with nearest or smooth filtering, optionally quantized to a 12-color palette and outlined."></canvas><div class="hud" id="px-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="px-s">Pixel size <output for="px-s"></output></label><input type="range" id="px-s" min="1" max="10" value="4"></div>
+        <div class="btn-row" id="px-f"><button class="btn" data-value="nearest" aria-pressed="true">Nearest upscale</button><button class="btn" data-value="smooth">Bilinear upscale</button></div>
+        <div class="btn-row"><button class="btn" id="px-q" aria-pressed="true">Palette quantize</button><button class="btn" id="px-o" aria-pressed="true">Outline</button><button class="btn" id="px-play" aria-pressed="true">Rotate</button></div>
+      </div>
+      <figcaption><b>Try it:</b> set pixel size to 1 to see the "normal" render, then raise it. Switch to bilinear to see why point sampling matters for crisp pixels. Toggle the palette and outline passes one at a time.</figcaption>
+    </figure>
+    <div class="callout out"><strong>Key idea.</strong> A custom pipeline is just your own render graph: choose the targets, the passes and their order. Pixel art is "render small, post-process, upscale with nearest filtering."</div>
+  </section>
+
+  <section class="step" id="recap">
+    <h2><span class="step-no">RECAP</span>What to remember</h2>
+    <ul>
+      <li>The CPU side of a renderer culls (frustum, occlusion), sorts (by material, by depth, transparents back to front), batches and instances, then records command lists.</li>
+      <li>A render graph has passes declare their reads and writes. The graph orders passes, culls unused ones, aliases transient memory and inserts barriers for you (Frostbite FrameGraph, GDC 2017).</li>
+      <li>A typical frame: depth prepass → shadows → G-buffer or Forward+ → SSAO → lighting → sky/volumetrics → transparents → TAA, bloom, tonemap → UI, all within about 16.7 ms at 60 fps.</li>
+      <li>Resolution is the biggest cost lever; DLSS, FSR and XeSS render fewer pixels and reconstruct the rest.</li>
+      <li>Unreal 5 is deferred by default, with Nanite (cluster-hierarchy LOD chosen by screen-space error, software rasterization of tiny triangles), Lumen GI and Virtual Shadow Maps. Unity offers URP and HDRP through SRP; Godot 4 offers Forward+, Mobile and Compatibility.</li>
+      <li>Hybrid rendering rasterizes primary visibility and traces rays through a BVH for shadows, reflections and GI, then denoises.</li>
+      <li>Your own pipeline, such as a pixel-art one, is the same idea at small scale: a low-res target, a few post passes, and a nearest-neighbor upscale.</li>
+    </ul>
+  </section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const MONO = '"JetBrains Mono", ui-monospace, Consolas, monospace';
+  const $ = (s) => document.querySelector(s);
+  const A = RP.alpha;
+
+  function toggleBtn(id, cb) {
+    const b = document.getElementById(id);
+    b.type = "button";
+    const val = () => b.getAttribute("aria-pressed") === "true";
+    b.addEventListener("click", () => { b.setAttribute("aria-pressed", String(!val())); cb(val()); });
+    cb(val());
+    return b;
+  }
+  function rrect(ctx, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath(); ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+  function rng(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+  // Ray o + t*d against segment a-b. Returns t (> 0) or Infinity.
+  function segHit(ox, oy, dx, dy, ax, ay, bx, by) {
+    const ex = bx - ax, ey = by - ay, den = dx * ey - dy * ex;
+    if (Math.abs(den) < 1e-12) return Infinity;
+    const wx = ax - ox, wy = ay - oy;
+    const t = (wx * ey - wy * ex) / den, u = (wx * dy - wy * dx) / den;
+    return t > 1e-6 && u >= 0 && u <= 1 ? t : Infinity;
+  }
+  function distSeg(px, py, s) {
+    const ex = s[2] - s[0], ey = s[3] - s[1];
+    const t = RP.clamp(((px - s[0]) * ex + (py - s[1]) * ey) / (ex * ex + ey * ey));
+    return Math.hypot(px - (s[0] + ex * t), py - (s[1] + ey * t));
+  }
+  function arrow(ctx, x0, y0, x1, y1, size) {
+    const a = Math.atan2(y1 - y0, x1 - x0);
+    ctx.beginPath(); ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - size * Math.cos(a - 0.45), y1 - size * Math.sin(a - 0.45));
+    ctx.lineTo(x1 - size * Math.cos(a + 0.45), y1 - size * Math.sin(a + 0.45));
+    ctx.closePath(); ctx.fill();
+  }
+
+  /* =====================================================================
+     STEP 1 — CPU-side culling, sorting, instancing
+     ===================================================================== */
+  (function () {
+    const W = 100, H = 70, cam = { x: 50, y: 67 }, FOV = 70 * Math.PI / 180, FAR = 60;
+    const st = { ang: 0, fr: false, oc: false, so: false, inst: false };
+    const walls = [[26, 42, 44, 39], [55, 31, 72, 35], [16, 21, 33, 16], [62, 14, 82, 11]];
+    const types = [{ k: "tree", mat: "leaf", r: 2.2 }, { k: "rock", mat: "stone", r: 1.6 }, { k: "crate", mat: "wood", r: 1.6 }];
+    const R = rng(11), objs = [];
+    for (let gy = 0; gy < 7; gy++) for (let gx = 0; gx < 10; gx++) {
+      const x = 6 + gx * 9.8 + (R() - 0.5) * 5, y = 4 + gy * 7.8 + (R() - 0.5) * 4;
+      const t = types[Math.floor(R() * 3)];
+      if (Math.hypot(x - cam.x, y - cam.y) < 9) continue;
+      if (walls.some((w) => distSeg(x, y, w) < 3.2)) continue;
+      objs.push({ x, y, t });
+    }
+    for (let i = objs.length - 1; i > 0; i--) { const j = Math.floor(R() * (i + 1)); const tmp = objs[i]; objs[i] = objs[j]; objs[j] = tmp; }
+    const all = objs.slice();
+    walls.forEach((w, i) => all.splice(4 + i * 11, 0, { x: (w[0] + w[2]) / 2, y: (w[1] + w[3]) / 2, w, t: { k: "wall", mat: "wall", r: Math.hypot(w[2] - w[0], w[3] - w[1]) / 2 } }));
+    const blocked = (px, py, selfWall) => walls.some((w) => w !== selfWall && segHit(cam.x, cam.y, px - cam.x, py - cam.y, w[0], w[1], w[2], w[3]) < 1);
+
+    function classify() {
+      const dir = [Math.sin(st.ang), -Math.cos(st.ang)];
+      for (const o of all) {
+        const dx = o.x - cam.x, dy = o.y - cam.y, d = Math.hypot(dx, dy);
+        const ang = Math.acos(RP.clamp((dx * dir[0] + dy * dir[1]) / d, -1, 1));
+        const angR = Math.asin(Math.min(1, o.t.r / d));
+        o.inFr = ang - angR <= FOV / 2 && d - o.t.r < FAR;
+        if (o.w) o.occ = false;
+        else {
+          const px = -dy / d * o.t.r, py = dx / d * o.t.r;
+          o.occ = blocked(o.x, o.y) && blocked(o.x + px, o.y + py) && blocked(o.x - px, o.y - py);
+        }
+        o.status = st.fr && !o.inFr ? "frustum" : st.oc && o.occ ? "occl" : "vis";
+      }
+      let sub = all.filter((o) => o.status === "vis");
+      if (st.so) { const order = ["wall", "leaf", "stone", "wood"]; sub = sub.slice().sort((a, b) => order.indexOf(a.t.mat) - order.indexOf(b.t.mat)); }
+      let calls;
+      if (st.inst) {
+        const groups = new Map();
+        for (const o of sub) { if (!groups.has(o.t.k)) groups.set(o.t.k, { mat: o.t.mat, count: 0 }); groups.get(o.t.k).count++; }
+        calls = [...groups.values()];
+      } else calls = sub.map((o) => ({ mat: o.t.mat, count: 1 }));
+      let changes = 0;
+      calls.forEach((c, i) => { if (i === 0 || c.mat !== calls[i - 1].mat) changes++; });
+      return { sub, calls, changes };
+    }
+
+    let geo = { s: 1, ox: 0, oy: 0 };
+    const v = RP.canvas("#cpu", (s) => {
+      const { ctx, w, h, c } = s;
+      const matCol = { leaf: c.good, stone: c.muted, wood: c.vtx, wall: c.frag };
+      ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+      const strip = 44;
+      const sc = Math.min((w - 20) / W, (h - strip - 20) / H);
+      const ox = (w - W * sc) / 2, oy = 10;
+      geo = { s: sc, ox, oy };
+      const X = (x) => ox + x * sc, Y = (y) => oy + y * sc;
+      const res = classify();
+      // frustum wedge
+      const a0 = st.ang - FOV / 2, a1 = st.ang + FOV / 2;
+      ctx.beginPath(); ctx.moveTo(X(cam.x), Y(cam.y));
+      for (let i = 0; i <= 24; i++) { const a = RP.lerp(a0, a1, i / 24); ctx.lineTo(X(cam.x + Math.sin(a) * FAR), Y(cam.y - Math.cos(a) * FAR)); }
+      ctx.closePath(); ctx.fillStyle = A(c.accent, 0.09); ctx.fill(); ctx.strokeStyle = A(c.accent, 0.7); ctx.lineWidth = 1.2; ctx.stroke();
+      // world border
+      ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.strokeRect(X(0), Y(0), W * sc, H * sc);
+      for (const o of all) {
+        const col = matCol[o.t.mat];
+        const faded = o.status !== "vis";
+        ctx.globalAlpha = faded ? 0.28 : 1;
+        if (o.w) {
+          ctx.strokeStyle = col; ctx.lineWidth = Math.max(3, sc * 1.2); ctx.lineCap = "round";
+          ctx.beginPath(); ctx.moveTo(X(o.w[0]), Y(o.w[1])); ctx.lineTo(X(o.w[2]), Y(o.w[3])); ctx.stroke();
+          ctx.lineCap = "butt";
+        } else {
+          const r = o.t.r * sc;
+          ctx.beginPath();
+          if (o.t.k === "tree") ctx.arc(X(o.x), Y(o.y), r, 0, Math.PI * 2);
+          else if (o.t.k === "rock") { ctx.moveTo(X(o.x), Y(o.y) - r); ctx.lineTo(X(o.x) + r, Y(o.y)); ctx.lineTo(X(o.x), Y(o.y) + r); ctx.lineTo(X(o.x) - r, Y(o.y)); ctx.closePath(); }
+          else ctx.rect(X(o.x) - r * 0.85, Y(o.y) - r * 0.85, r * 1.7, r * 1.7);
+          if (faded) { ctx.strokeStyle = o.status === "occl" ? c.bad : col; ctx.lineWidth = 1.2; ctx.setLineDash(o.status === "occl" ? [3, 2] : []); ctx.stroke(); ctx.setLineDash([]); }
+          else { ctx.fillStyle = col; ctx.fill(); }
+        }
+        ctx.globalAlpha = 1;
+        if (o.status === "vis" && !o.w && (!o.inFr || o.occ)) {
+          ctx.strokeStyle = c.warn; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(X(o.x), Y(o.y), o.t.r * sc + 3, 0, Math.PI * 2); ctx.stroke();
+        }
+      }
+      // camera
+      ctx.save(); ctx.translate(X(cam.x), Y(cam.y)); ctx.rotate(st.ang);
+      ctx.fillStyle = c.ink; ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(7, 6); ctx.lineTo(-7, 6); ctx.closePath(); ctx.fill(); ctx.restore();
+      // draw-call strip
+      const sy = h - strip + 6, n = res.calls.length;
+      ctx.fillStyle = c.muted; ctx.font = "10px " + MONO; ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+      ctx.fillText("draw calls in submission order (" + n + ")", 10, sy);
+      const cw = n ? Math.min(st.inst ? 60 : 16, (w - 20) / n) : 0;
+      res.calls.forEach((cl, i) => {
+        ctx.fillStyle = matCol[cl.mat]; ctx.fillRect(10 + i * cw, sy + 5, Math.max(1, cw - 2), 18);
+        if (cl.count > 1 && cw > 26) { ctx.fillStyle = c.paper; ctx.textAlign = "center"; ctx.fillText("×" + cl.count, 10 + i * cw + cw / 2 - 1, sy + 18); ctx.textAlign = "left"; }
+      });
+      const wasted = res.sub.filter((o) => !o.w && (!o.inFr || o.occ)).length;
+      $("#cpu-hud").textContent = `objects      ${all.length}\nsubmitted    ${res.sub.length}  (wasted ${wasted})\ndraw calls   ${n}\nstate chg    ${res.changes}`;
+    });
+    const angS = RP.slider("#cpu-ang", (x) => { st.ang = x * Math.PI / 180; v.draw(); }, { fmt: (x) => x + "°" });
+    toggleBtn("cpu-fr", (on) => { st.fr = on; v.draw(); });
+    toggleBtn("cpu-oc", (on) => { st.oc = on; v.draw(); });
+    toggleBtn("cpu-so", (on) => { st.so = on; v.draw(); });
+    toggleBtn("cpu-in", (on) => { st.inst = on; v.draw(); });
+    const aim = (x, y) => {
+      const cx = geo.ox + cam.x * geo.s, cy = geo.oy + cam.y * geo.s;
+      if (cy - y < 4) return;
+      const a = Math.atan2(x - cx, cy - y) * 180 / Math.PI;
+      angS.value = Math.round(RP.clamp(a, -80, 80));
+    };
+    RP.drag(v.el, { down: (x, y) => { aim(x, y); }, move: aim });
+  })();
+
+  /* =====================================================================
+     STEP 2 — Frame graph + transient lifetimes
+     ===================================================================== */
+  (function () {
+    const RES = {
+      depth: { n: "depth", mb: 8.3 }, shadow: { n: "shadow map", mb: 67.1 }, alb: { n: "albedo", mb: 8.3 }, nrm: { n: "normal", mb: 8.3 },
+      ao: { n: "AO", mb: 2.1 }, hdr: { n: "HDR color", mb: 16.6 }, taa: { n: "TAA out", mb: 16.6 }, bloom: { n: "bloom", mb: 5.5 },
+      ldr: { n: "LDR", mb: 8.3 }, dbg: { n: "debug", mb: 8.3 }, back: { n: "backbuffer", mb: 8.3, imported: true },
+    };
+    const P = [
+      { id: "depth", n: "Depth pre", cat: "vtx", r: [], w: ["depth"], d: "Draws opaque geometry with a trivial shader, writing only depth. Later passes can then skip hidden fragments with an early depth test." },
+      { id: "shadow", n: "Shadows", cat: "vtx", r: [], w: ["shadow"], d: "Renders depth from the sun's point of view into cascaded shadow maps (chapter 06)." },
+      { id: "gbuf", n: "G-buffer", cat: "vtx", r: ["depth"], w: ["alb", "nrm"], d: "Draws opaque geometry again, storing material data (albedo, normals, roughness...) per pixel instead of lighting it." },
+      { id: "ssao", n: "SSAO", cat: "ras", r: ["depth", "nrm"], w: ["ao"], d: "Screen-space ambient occlusion: estimates how enclosed each pixel is from nearby depth samples, darkening creases." },
+      { id: "light", n: "Lighting", cat: "frag", r: ["alb", "nrm", "depth", "shadow", "ao"], w: ["hdr"], d: "Deferred lighting: for each pixel, reads the G-buffer, shadows and AO, sums all lights into an HDR color target." },
+      { id: "sky", n: "Sky + fog", cat: "ras", r: ["depth", "shadow"], w: ["hdr"], d: "Fills the sky where depth is empty and adds volumetric fog / light shafts on top of the lit image." },
+      { id: "trans", n: "Transparent", cat: "frag", r: ["depth", "shadow"], w: ["hdr"], d: "Forward-shades glass, particles and other blended objects, sorted back to front, blending into the HDR target." },
+      { id: "taa", n: "TAA", cat: "out", r: ["hdr", "depth"], w: ["taa"], d: "Temporal anti-aliasing: blends this frame with a reprojected history. (A real graph also imports last frame's history texture.)" },
+      { id: "bloom", n: "Bloom", cat: "out", r: ["taa"], w: ["bloom"], d: "Extracts bright areas and blurs them through a mip chain to make light glow (chapter 07)." },
+      { id: "tone", n: "Tonemap", cat: "out", r: ["taa", "bloom"], w: ["ldr"], d: "Combines bloom, applies exposure and a tonemapping curve, and converts HDR to a displayable LDR image." },
+      { id: "dbg", n: "Debug view", cat: "ras", r: ["depth", "nrm"], w: ["dbg"], d: "A visualization of normals and depth for developers. Nobody reads its output unless the overlay is on, so the graph culls it." },
+      { id: "ui", n: "UI", cat: "out", r: ["ldr"], w: ["back"], d: "Draws the HUD and menus at full resolution into the swapchain backbuffer, which is an imported (external) resource." },
+    ];
+    const st = { ao: true, bloom: true, dbg: false, sel: 4, alias: true };
+    function readsOf(p) {
+      let r = p.r.slice();
+      if (p.id === "light" && !st.ao) r = r.filter((x) => x !== "ao");
+      if (p.id === "tone" && !st.bloom) r = r.filter((x) => x !== "bloom");
+      if (p.id === "ui" && st.dbg) r.push("dbg");
+      return r;
+    }
+    function compile() {
+      const need = new Set(["back"]), alive = P.map(() => false);
+      for (let i = P.length - 1; i >= 0; i--) if (P[i].w.some((r) => need.has(r))) { alive[i] = true; readsOf(P[i]).forEach((r) => need.add(r)); }
+      let barriers = 0; const last = {}; const life = {};
+      let col = 0; const colOf = P.map(() => -1);
+      P.forEach((p, i) => {
+        if (!alive[i]) return;
+        colOf[i] = col;
+        const touch = (r, mode) => {
+          if (!life[r]) life[r] = { first: col, last: col, acc: [] };
+          life[r].last = col; life[r].acc.push([col, mode]);
+          if (last[r] && last[r] !== mode) barriers++;
+          last[r] = mode;
+        };
+        readsOf(p).forEach((r) => touch(r, "r"));
+        p.w.forEach((r) => touch(r, "w"));
+        col++;
+      });
+      // alias: greedy interval packing of transient resources
+      const keys = Object.keys(life).filter((k) => !RES[k].imported).sort((a, b) => life[a].first - life[b].first);
+      const slots = [];
+      for (const k of keys) {
+        let slot = slots.find((sl) => sl.end < life[k].first);
+        if (!slot) { slot = { end: -1, size: 0, id: slots.length }; slots.push(slot); }
+        slot.end = life[k].last; slot.size = Math.max(slot.size, RES[k].mb); life[k].slot = slot.id;
+      }
+      const total = keys.reduce((s, k) => s + RES[k].mb, 0), aliased = slots.reduce((s, sl) => s + sl.size, 0);
+      return { alive, barriers, life, cols: col, colOf, keys, slots, total, aliased };
+    }
+    let boxes = [];
+    const g = RP.canvas("#fg", (s) => {
+      const { ctx, w, h, c } = s;
+      const cc = compile();
+      ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+      const cols = w >= 640 ? 6 : 3, rows = Math.ceil(P.length / cols);
+      const cellW = w / cols, band = h / rows;
+      const bw = Math.min(cellW - 12, 122), bh = 32;
+      // pass positions (serpentine)
+      const pos = P.map((p, i) => {
+        const r = Math.floor(i / cols); let ci = i % cols; if (r % 2) ci = cols - 1 - ci;
+        return { x: (ci + 0.5) * cellW, y: r * band + band * 0.28 };
+      });
+      // resource positions: under the first writer
+      const rpos = {}; ctx.font = "10px " + MONO;
+      P.forEach((p, i) => {
+        const fresh = p.w.filter((r) => !rpos[r]);
+        fresh.forEach((r, j) => {
+          const off = (j - (fresh.length - 1) / 2) * Math.min(cellW * 0.48, 66);
+          const tw = ctx.measureText(RES[r].n).width + 12;
+          rpos[r] = { x: pos[i].x + off, y: pos[i].y + band * 0.42, w: tw, h: 18 };
+        });
+      });
+      const used = new Set(); P.forEach((p, i) => { if (cc.alive[i]) { readsOf(p).forEach((r) => used.add(r)); p.w.forEach((r) => used.add(r)); } });
+      // edges
+      const sel = st.sel;
+      function edge(x0, y0, x1, y1, color, lw, head) {
+        const mx = (x0 + x1) / 2, my = (y0 + y1) / 2 + (Math.abs(x1 - x0) > 4 ? 0 : 0);
+        const cx = mx + (y1 - y0) * 0.12, cy = my - (x1 - x0) * 0.08;
+        ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.quadraticCurveTo(cx, cy, x1, y1); ctx.stroke();
+        if (head) { ctx.fillStyle = color; arrow(ctx, cx, cy, x1, y1, 6); }
+      }
+      const passEdgePt = (i, fromY) => { const p = pos[i]; return fromY > p.y ? [p.x, p.y + bh / 2] : [p.x, p.y - bh / 2]; };
+      const resEdgePt = (r, fromY) => { const q = rpos[r]; return fromY > q.y ? [q.x, q.y + q.h / 2] : [q.x, q.y - q.h / 2]; };
+      for (let pass = 0; pass < 2; pass++) { // draw unselected first, selected on top
+        P.forEach((p, i) => {
+          const isSel = i === sel; if ((pass === 1) !== isSel) return;
+          const alive = cc.alive[i];
+          const reads = alive ? readsOf(p) : p.r;
+          reads.forEach((r) => {
+            const q = rpos[r]; const a = resEdgePt(r, pos[i].y), b = passEdgePt(i, q.y);
+            edge(a[0], a[1], b[0], b[1], isSel ? c.good : A(c.muted, alive ? 0.45 : 0.18), isSel ? 2.2 : 1, true);
+          });
+          p.w.forEach((r) => {
+            const q = rpos[r]; const a = passEdgePt(i, q.y), b = resEdgePt(r, pos[i].y);
+            edge(a[0], a[1], b[0], b[1], isSel ? c.accent : A(c.muted, alive ? 0.45 : 0.18), isSel ? 2.2 : 1, true);
+          });
+        });
+      }
+      // resource pills
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      for (const r in rpos) {
+        const q = rpos[r], p = P[sel];
+        const isR = readsOf(p).includes(r) && cc.alive[sel], isW = p.w.includes(r);
+        const on = used.has(r);
+        rrect(ctx, q.x - q.w / 2, q.y - q.h / 2, q.w, q.h, 9);
+        ctx.fillStyle = isW ? c.accent : isR ? c.good : c.surface; ctx.fill();
+        ctx.strokeStyle = on ? c.ink : c.line; ctx.lineWidth = 1; ctx.setLineDash(RES[r].imported ? [3, 2] : []); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = isW || isR ? c.paper : on ? c.ink : c.muted; ctx.font = "10px " + MONO;
+        ctx.fillText(RES[r].n, q.x, q.y + 0.5);
+      }
+      // pass boxes
+      boxes = [];
+      P.forEach((p, i) => {
+        const q = pos[i], alive = cc.alive[i], col = c[p.cat];
+        const x = q.x - bw / 2, y = q.y - bh / 2;
+        boxes.push({ x, y, w: bw, h: bh, i });
+        rrect(ctx, x, y, bw, bh, 7);
+        ctx.fillStyle = c.surface; ctx.fill();
+        ctx.fillStyle = A(col, alive ? 0.22 : 0.06); ctx.fill();
+        ctx.lineWidth = i === sel ? 3 : 1.5; ctx.strokeStyle = alive ? col : c.muted; ctx.setLineDash(alive ? [] : [4, 3]); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = alive ? c.ink : c.muted; ctx.font = "600 11px " + MONO;
+        ctx.fillText(p.n, q.x, q.y - (alive ? 0 : 6));
+        if (!alive) { ctx.font = "9px " + MONO; ctx.fillStyle = c.bad; ctx.fillText("culled", q.x, q.y + 8); }
+        ctx.font = "9px " + MONO; ctx.fillStyle = c.muted; ctx.textAlign = "left"; ctx.fillText(String(i + 1), x + 4, y + 8); ctx.textAlign = "center";
+      });
+      const nAlive = cc.alive.filter(Boolean).length;
+      $("#fg-hud").textContent = `passes ${nAlive}/${P.length} alive  barriers ${cc.barriers}`;
+      // info panel
+      const p = P[sel], alive = cc.alive[sel];
+      const rs = (alive ? readsOf(p) : p.r).map((r) => RES[r].n).join(", ") || "nothing";
+      const ws = p.w.map((r) => RES[r].n).join(", ");
+      $("#fg-info").innerHTML = `<h3>${sel + 1}. ${p.n}${alive ? "" : " — culled"}</h3><p>${p.d}</p><p class="io"><b>reads</b> ${rs}<br><b>writes</b> ${ws}</p>`;
+      l.draw();
+    });
+    const l = RP.canvas("#fl", (s) => {
+      const { ctx, w, h, c } = s;
+      const cc = compile();
+      ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+      const pal = [c.vtx, c.ras, c.frag, c.out, c.good, c.warn, c.accent, c.bad];
+      const keys = Object.keys(cc.life).sort((a, b) => cc.life[a].first - cc.life[b].first || (RES[a].imported ? 1 : 0));
+      const left = 84, top = 66, right = 12;
+      const rowH = Math.min(20, (h - top - 8) / Math.max(1, keys.length));
+      const colW = (w - left - right) / Math.max(1, cc.cols);
+      // column headers
+      ctx.font = "9px " + MONO; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      P.forEach((p, i) => {
+        const ci = cc.colOf[i]; if (ci < 0) return;
+        const x = left + (ci + 0.5) * colW;
+        ctx.fillStyle = A(c.line, 0.6); ctx.fillRect(left + ci * colW, top - 4, 1, h - top);
+        ctx.fillStyle = c.muted;
+        if (colW > 44) ctx.fillText(p.n, x, top - 12); else ctx.fillText(String(i + 1), x, top - 12);
+      });
+      keys.forEach((k, ri) => {
+        const L = cc.life[k], y = top + ri * rowH;
+        ctx.textAlign = "right"; ctx.fillStyle = c.ink; ctx.font = "10px " + MONO;
+        ctx.fillText(RES[k].n, left - 8, y + rowH / 2);
+        const x0 = left + L.first * colW + 3, x1 = left + (L.last + 1) * colW - 3;
+        const col = RES[k].imported ? c.muted : st.alias ? pal[L.slot % pal.length] : c.accent;
+        rrect(ctx, x0, y + 3, Math.max(4, x1 - x0), rowH - 6, 4);
+        ctx.fillStyle = A(col, 0.35); ctx.fill(); ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.stroke();
+        L.acc.forEach(([ci, mode]) => {
+          const x = left + (ci + 0.5) * colW, cy = y + rowH / 2;
+          ctx.beginPath(); ctx.arc(x, cy, 3, 0, Math.PI * 2);
+          if (mode === "w") { ctx.fillStyle = c.ink; ctx.fill(); } else { ctx.strokeStyle = c.ink; ctx.lineWidth = 1.2; ctx.stroke(); }
+        });
+        if (st.alias && !RES[k].imported && x1 - x0 > 50) { ctx.textAlign = "left"; ctx.fillStyle = c.ink; ctx.font = "9px " + MONO; ctx.fillText("slot " + L.slot, left + (L.first + 0.5) * colW + 7, y + rowH / 2); }
+      });
+      const t = cc.total.toFixed(0), a = cc.aliased.toFixed(0);
+      $("#fl-hud").textContent = st.alias ? `transient memory ${t} MB → ${a} MB with aliasing (${cc.slots.length} slots)  ● write ○ read` : `transient memory ${t} MB, no aliasing  ● write ○ read`;
+    });
+    const selEl = $("#fg-sel");
+    P.forEach((p, i) => { const o = document.createElement("option"); o.value = i; o.textContent = (i + 1) + ". " + p.n; selEl.appendChild(o); });
+    selEl.value = String(st.sel);
+    selEl.addEventListener("change", () => { st.sel = +selEl.value; g.draw(); });
+    toggleBtn("fg-ao", (on) => { st.ao = on; g.draw(); });
+    toggleBtn("fg-bl", (on) => { st.bloom = on; g.draw(); });
+    toggleBtn("fg-db", (on) => { st.dbg = on; g.draw(); });
+    toggleBtn("fl-al", (on) => { st.alias = on; l.draw(); });
+    RP.drag(g.el, {
+      down: (x, y) => { const b = boxes.find((q) => x >= q.x && x <= q.x + q.w && y >= q.y && y <= q.y + q.h); if (!b) return false; st.sel = b.i; selEl.value = String(b.i); g.draw(); return false; },
+      hover: (x, y) => { g.el.style.cursor = boxes.some((q) => x >= q.x && x <= q.x + q.w && y >= q.y && y <= q.y + q.h) ? "pointer" : "default"; },
+    });
+  })();
+
+  /* =====================================================================
+     STEP 3 — Frame budget
+     ===================================================================== */
+  (function () {
+    const b = { res: 100, casc: 3, lights: 32, rt: false, ups: false, fps: 60 };
+    function costs() {
+      const s = b.res / 100, p = s * s, L = [];
+      L.push(["Depth prepass", 0.6 * p, "vtx"]);
+      L.push(["Shadow maps", 0.9 * b.casc, "vtx"]);
+      L.push(["G-buffer", 2.0 * p, "vtx"]);
+      L.push(["SSAO", 0.8 * p, "ras"]);
+      L.push(["Lighting", (0.9 + 0.02 * b.lights) * p, "frag"]);
+      L.push(["Sky + volumetrics", 0.9 * p, "ras"]);
+      L.push(["Transparents", 0.8 * p, "frag"]);
+      if (b.rt) { L.push(["RT reflections + shadows", 5.0 * p, "accent"]); L.push(["Denoise", 1.4 * p, "accent"]); }
+      if (b.ups) L.push(["Upscaler (replaces TAA)", 1.1, "out"]);
+      else { L.push(["TAA", 0.5 * p, "out"]); if (s < 1) L.push(["Simple upscale", 0.1, "out"]); }
+      L.push(["Bloom + tonemap", 0.7, "out"]);
+      L.push(["UI", 0.3, "out"]);
+      return L;
+    }
+    const v = RP.canvas("#bud", (s) => {
+      const { ctx, w, h, c } = s;
+      ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+      const L = costs(), total = L.reduce((a, x) => a + x[1], 0), budget = 1000 / b.fps;
+      const fits = total <= budget;
+      const x0 = 12, x1 = w - 12, maxMs = Math.max(budget, total) * 1.08;
+      const X = (ms) => x0 + (ms / maxMs) * (x1 - x0);
+      const by = 64, bh = 34;
+      // background
+      ctx.fillStyle = c.surface; ctx.fillRect(x0, by, x1 - x0, bh);
+      let acc = 0;
+      ctx.font = "10px " + MONO; ctx.textBaseline = "middle"; ctx.textAlign = "center";
+      L.forEach(([n, ms, cat]) => {
+        const xa = X(acc), xb = X(acc + ms);
+        ctx.fillStyle = c[cat]; ctx.fillRect(xa, by, Math.max(0.5, xb - xa - 1), bh);
+        acc += ms;
+      });
+      // over budget hatch
+      if (!fits) { ctx.fillStyle = A(c.bad, 0.25); ctx.fillRect(X(budget), by - 6, X(total) - X(budget), bh + 12); }
+      // budget line
+      ctx.strokeStyle = fits ? c.good : c.bad; ctx.lineWidth = 2; ctx.setLineDash([5, 3]);
+      ctx.beginPath(); ctx.moveTo(X(budget), by - 18); ctx.lineTo(X(budget), by + bh + 8); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = fits ? c.good : c.bad; ctx.textAlign = X(budget) > w - 110 ? "right" : "left";
+      ctx.font = "600 11px " + MONO;
+      ctx.fillText(budget.toFixed(1) + " ms budget (" + b.fps + " fps)", X(budget) + (ctx.textAlign === "right" ? -6 : 6), by - 12);
+      // per-pass list
+      const ly = by + bh + 26, rowH = Math.min(19, (h - ly - 8) / L.length);
+      const nameW = Math.min(190, w * 0.42);
+      const maxPass = Math.max(...L.map((x) => x[1]), 3);
+      L.forEach(([n, ms, cat], i) => {
+        const y = ly + i * rowH + rowH / 2;
+        ctx.textAlign = "left"; ctx.fillStyle = c.ink; ctx.font = "11px " + MONO;
+        ctx.fillText(n, x0, y);
+        ctx.fillStyle = c[cat];
+        const bwid = (x1 - x0 - nameW - 56) * (ms / maxPass);
+        ctx.fillRect(x0 + nameW, y - rowH * 0.32, Math.max(1, bwid), rowH * 0.64);
+        ctx.fillStyle = c.muted; ctx.fillText(ms.toFixed(2) + " ms", x0 + nameW + bwid + 6, y);
+      });
+      const s0 = b.res / 100;
+      const q = b.ups ? (s0 < 1 ? "reconstructed by upscaler" : "native + upscaler AA") : (s0 < 1 ? "blurry (plain upscale)" : "native");
+      $("#bud-hud").textContent = `GPU frame ${total.toFixed(1)} ms  ≈ ${Math.floor(1000 / total)} fps  ${fits ? "✓ fits" : "✗ over budget"}\ninternal ${Math.round(2560 * s0)}×${Math.round(1440 * s0)} → 2560×1440, ${q}`;
+    });
+    RP.slider("#bud-res", (x) => { b.res = x; v.draw(); }, { fmt: (x) => x + "%" });
+    RP.slider("#bud-casc", (x) => { b.casc = x; v.draw(); });
+    RP.slider("#bud-lights", (x) => { b.lights = x; v.draw(); });
+    toggleBtn("bud-rt", (on) => { b.rt = on; v.draw(); });
+    toggleBtn("bud-up", (on) => { b.ups = on; v.draw(); });
+    RP.toggleGroup("#bud-fps", (x) => { b.fps = +x; v.draw(); });
+  })();
+
+  /* =====================================================================
+     STEP 4 — Nanite-style cluster LOD (2D)
+     ===================================================================== */
+  (function () {
+    const N0 = 256, L = 100, CS = 16, LEVELS = 5, FOCAL = 540 / (2 * Math.tan(Math.PI / 6));
+    const H0 = [];
+    for (let i = 0; i <= N0; i++) {
+      const x = (i / N0) * L;
+      H0.push(5 * Math.sin(x * 0.09 + 0.5) + 2.4 * Math.sin(x * 0.31 + 1) + 1.1 * Math.sin(x * 0.93 + 2) + 0.22 * Math.sin(x * 2.3 + 0.3) + 0.06 * Math.sin(x * 5.1));
+    }
+    // cluster at level k, index j: LOD0 vertex range [j*CS*2^k, (j+1)*CS*2^k], vertex step 2^k
+    const clusters = [];
+    for (let k = 0; k < LEVELS; k++) {
+      const step = 1 << k, span = CS * step, count = N0 / span, row = [];
+      for (let j = 0; j < count; j++) {
+        const i0 = j * span, i1 = i0 + span; let err = 0;
+        for (let i = i0; i <= i1; i++) {
+          const a = i0 + Math.floor((i - i0) / step) * step, b2 = Math.min(i1, a + step);
+          const t = b2 > a ? (i - a) / (b2 - a) : 0;
+          err = Math.max(err, Math.abs(H0[i] - RP.lerp(H0[a], H0[b2], t)));
+        }
+        if (k > 0) err = Math.max(err, clusters[k - 1][2 * j].err, clusters[k - 1][2 * j + 1].err) + 1e-4;
+        row.push({ k, j, i0, i1, step, err });
+      }
+      clusters.push(row);
+    }
+    const st = { d: 30, t: 2, full: false };
+    const camH = 14;
+    function projErr(cl) {
+      const x0 = (cl.i0 / N0) * L, dx = x0 + st.d; // camera sits at x = -d
+      const midH = H0[Math.round((cl.i0 + cl.i1) / 2)];
+      return (cl.err * FOCAL) / Math.hypot(dx, camH - midH);
+    }
+    function select() {
+      const out = [];
+      (function rec(k, j) { const cl = clusters[k][j]; if (k === 0 || projErr(cl) <= st.t) out.push(cl); else { rec(k - 1, 2 * j); rec(k - 1, 2 * j + 1); } })(LEVELS - 1, 0);
+      return out;
+    }
+    const v = RP.canvas("#lod", (s) => {
+      const { ctx, w, h, c } = s;
+      ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+      const pal = [c.vtx, c.ras, c.frag, c.out, c.good, c.warn, c.accent, c.bad];
+      const colOf = (cl) => pal[(cl.j + cl.k * 3) % pal.length];
+      const treeH = 104, top = 30, bottom = h - treeH - 18;
+      const xl = 70, xr = w - 14;
+      const X = (i) => xl + (i / N0) * (xr - xl);
+      const Y = (hh) => RP.lerp(bottom, top, (hh + 10) / 26);
+      const sel = select();
+      // camera indicator (clipped to the terrain area)
+      const wpx = (xr - xl) / L, camX = xl - st.d * wpx;
+      const cx = Math.max(16, camX), cy = Y(camH);
+      ctx.save(); ctx.beginPath(); ctx.rect(0, 0, w, bottom); ctx.clip();
+      ctx.strokeStyle = A(c.accent, 0.5); ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(xr, cy - (xr - cx) * 0.08); ctx.moveTo(cx, cy); ctx.lineTo(xr, cy + (xr - cx) * 0.5); ctx.stroke(); ctx.setLineDash([]);
+      ctx.restore();
+      ctx.fillStyle = c.ink; ctx.beginPath(); ctx.moveTo(cx + 10, cy); ctx.lineTo(cx - 6, cy - 7); ctx.lineTo(cx - 6, cy + 7); ctx.closePath(); ctx.fill();
+      ctx.font = "10px " + MONO; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      ctx.fillText(camX < 16 ? "◀ camera " + st.d + " units away" : "camera", Math.max(4, cx - 8), cy - 14);
+      // clusters
+      let segs = 0;
+      for (const cl of sel) {
+        const col = colOf(cl);
+        segs += (cl.i1 - cl.i0) / cl.step;
+        ctx.beginPath(); ctx.moveTo(X(cl.i0), bottom);
+        for (let i = cl.i0; i <= cl.i1; i += cl.step) ctx.lineTo(X(i), Y(H0[i]));
+        ctx.lineTo(X(cl.i1), bottom); ctx.closePath(); ctx.fillStyle = A(col, 0.16); ctx.fill();
+        ctx.beginPath();
+        for (let i = cl.i0; i <= cl.i1; i += cl.step) { if (i === cl.i0) ctx.moveTo(X(i), Y(H0[i])); else ctx.lineTo(X(i), Y(H0[i])); }
+        ctx.strokeStyle = col; ctx.lineWidth = 2.2; ctx.stroke();
+        const segPx = (X(cl.step) - X(0));
+        if (segPx > 5) { ctx.fillStyle = col; for (let i = cl.i0; i <= cl.i1; i += cl.step) { ctx.beginPath(); ctx.arc(X(i), Y(H0[i]), 1.8, 0, Math.PI * 2); ctx.fill(); } }
+        const wpxc = X(cl.i1) - X(cl.i0);
+        if (wpxc > 22) { ctx.fillStyle = c.ink; ctx.textAlign = "center"; ctx.font = "10px " + MONO; ctx.fillText("L" + cl.k, (X(cl.i0) + X(cl.i1)) / 2, bottom - 10); }
+        ctx.fillStyle = c.line; ctx.fillRect(X(cl.i0), bottom - 3, 1, 6);
+      }
+      if (st.full) {
+        ctx.beginPath(); for (let i = 0; i <= N0; i++) { if (i === 0) ctx.moveTo(X(i), Y(H0[i])); else ctx.lineTo(X(i), Y(H0[i])); }
+        ctx.strokeStyle = c.ink; ctx.lineWidth = 0.8; ctx.setLineDash([2, 2]); ctx.stroke(); ctx.setLineDash([]);
+      }
+      ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(xl, bottom); ctx.lineTo(xr, bottom); ctx.stroke();
+      ctx.fillStyle = c.muted; ctx.textAlign = "left"; ctx.font = "10px " + MONO; ctx.fillText("near", xl, bottom + 10); ctx.textAlign = "right"; ctx.fillText("far", xr, bottom + 10);
+      // hierarchy
+      const selSet = new Set(sel.map((cl) => cl.k + ":" + cl.j));
+      const rowH = (treeH - 8) / LEVELS, ty = h - treeH - 2;
+      for (let k = LEVELS - 1; k >= 0; k--) {
+        const row = clusters[k], y = ty + (LEVELS - 1 - k) * rowH, cw = (xr - xl) / row.length;
+        ctx.fillStyle = c.muted; ctx.textAlign = "right"; ctx.font = "10px " + MONO; ctx.fillText("LOD " + k, xl - 8, y + rowH / 2);
+        row.forEach((cl) => {
+          const x = xl + cl.j * cw, isSel = selSet.has(k + ":" + cl.j);
+          // ancestor of a selected cluster = refined
+          const refined = sel.some((sc) => sc.k < k && sc.i0 >= cl.i0 && sc.i1 <= cl.i1);
+          ctx.fillStyle = isSel ? colOf(cl) : refined ? A(c.ink, 0.12) : c.surface;
+          ctx.fillRect(x + 1, y + 1, Math.max(1, cw - 2), rowH - 3);
+          ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.strokeRect(x + 1, y + 1, Math.max(1, cw - 2), rowH - 3);
+        });
+      }
+      const hist = []; for (let k = 0; k < LEVELS; k++) { const n = sel.filter((cl) => cl.k === k).length; if (n) hist.push("L" + k + "×" + n); }
+      $("#lod-hud").textContent = `segments drawn ${segs} / ${N0} (${Math.round(segs / N0 * 100)}%)\nclusters ${sel.length}: ${hist.join(" ")}`;
+    });
+    RP.slider("#lod-d", (x) => { st.d = x; v.draw(); });
+    RP.slider("#lod-t", (x) => { st.t = x; v.draw(); }, { fmt: (x) => x.toFixed(2) + " px" });
+    toggleBtn("lod-full", (on) => { st.full = on; v.draw(); });
+  })();
+
+  /* =====================================================================
+     STEP 5 — Raster vs ray tracing (2D)
+     ===================================================================== */
+  (function () {
+    const segs = [];
+    const add = (ax, ay, bx, by, col, refl) => segs.push({ a: [ax, ay], b: [bx, by], col, refl: refl || 0 });
+    add(16, 54, 98, 54, [0.5, 0.52, 0.56], 0.7);          // mirror floor
+    add(98, 4, 98, 54, [0.86, 0.74, 0.52]);               // back wall
+    add(50, 36, 62, 36, [0.85, 0.32, 0.28]); add(62, 36, 62, 48, [0.85, 0.32, 0.28]);
+    add(62, 48, 50, 48, [0.85, 0.32, 0.28]); add(50, 48, 50, 36, [0.85, 0.32, 0.28]); // box
+    for (let i = 0; i < 10; i++) { const a0 = i / 10 * Math.PI * 2, a1 = (i + 1) / 10 * Math.PI * 2; add(78 + 7 * Math.cos(a0), 24 + 7 * Math.sin(a0), 78 + 7 * Math.cos(a1), 24 + 7 * Math.sin(a1), [0.3, 0.66, 0.45]); }
+    add(36, 10, 41, 26, [0.45, 0.52, 0.9]);               // plank
+    const SKY = [0.42, 0.55, 0.78], LIGHT = [70, 5], CAM = [6, 30], FOV = 64 * Math.PI / 180, TH = Math.tan(FOV / 2);
+    // BVH
+    function bounds(items) { let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity; for (const s of items) { x0 = Math.min(x0, s.a[0], s.b[0]); y0 = Math.min(y0, s.a[1], s.b[1]); x1 = Math.max(x1, s.a[0], s.b[0]); y1 = Math.max(y1, s.a[1], s.b[1]); } return [x0 - 0.6, y0 - 0.6, x1 + 0.6, y1 + 0.6]; }
+    function build(items, depth) {
+      const box = bounds(items);
+      if (items.length <= 2) return { box, items, depth };
+      const ax = box[2] - box[0] > box[3] - box[1] ? 0 : 1;
+      const sorted = items.slice().sort((p, q) => (p.a[ax] + p.b[ax]) - (q.a[ax] + q.b[ax]));
+      const m = sorted.length >> 1;
+      return { box, depth, l: build(sorted.slice(0, m), depth + 1), r: build(sorted.slice(m), depth + 1) };
+    }
+    const root = build(segs, 0);
+    const allNodes = []; (function walk(n) { allNodes.push(n); if (!n.items) { walk(n.l); walk(n.r); } })(root);
+    function slab(o, d, b) {
+      const ix = 1 / (Math.abs(d[0]) < 1e-12 ? 1e-12 : d[0]), iy = 1 / (Math.abs(d[1]) < 1e-12 ? 1e-12 : d[1]);
+      let t0 = (b[0] - o[0]) * ix, t1 = (b[2] - o[0]) * ix; if (t0 > t1) { const t = t0; t0 = t1; t1 = t; }
+      let u0 = (b[1] - o[1]) * iy, u1 = (b[3] - o[1]) * iy; if (u0 > u1) { const t = u0; u0 = u1; u1 = t; }
+      const tn = Math.max(t0, u0, 0), tf = Math.min(t1, u1);
+      return tn <= tf ? tn : Infinity;
+    }
+    function trace(o, d, stats, rec) {
+      let best = { t: Infinity, s: null }; const stack = [root];
+      stats.rays++;
+      while (stack.length) {
+        const n = stack.pop(); stats.box++;
+        const tb = slab(o, d, n.box);
+        if (tb >= best.t) { if (rec) rec.miss.push(n); continue; }
+        if (rec) rec.hit.push(n);
+        if (n.items) for (const s of n.items) { stats.seg++; const t = segHit(o[0], o[1], d[0], d[1], s.a[0], s.a[1], s.b[0], s.b[1]); if (t < best.t) best = { t, s }; }
+        else stack.push(n.l, n.r);
+      }
+      return best;
+    }
+    function normalAt(s, d) { let nx = -(s.b[1] - s.a[1]), ny = s.b[0] - s.a[0]; const l = Math.hypot(nx, ny); nx /= l; ny /= l; if (nx * d[0] + ny * d[1] > 0) { nx = -nx; ny = -ny; } return [nx, ny]; }
+    // shade a known hit; rt = use ray-traced shadows/reflections
+    function shadeHit(o, d, hit, bounces, rt, stats, rec) {
+      if (!hit.s) { if (rec) rec.path.push([o, [o[0] + d[0] * 120, o[1] + d[1] * 120], true]); return SKY; }
+      const P = [o[0] + d[0] * hit.t, o[1] + d[1] * hit.t], n = normalAt(hit.s, d);
+      if (rec) rec.path.push([o, P, false]);
+      const lx = LIGHT[0] - P[0], ly = LIGHT[1] - P[1], ld = Math.hypot(lx, ly), l = [lx / ld, ly / ld];
+      let diff = Math.max(0, n[0] * l[0] + n[1] * l[1]);
+      if (rt && diff > 0) {
+        const Po = [P[0] + n[0] * 0.02, P[1] + n[1] * 0.02];
+        const sh = trace(Po, [lx, ly], stats, null);
+        const blocked = sh.t < 1;
+        if (blocked) diff = 0;
+        if (rec) rec.shadow.push([P, blocked]);
+      }
+      const local = hit.s.col.map((x) => x * (0.2 + 0.8 * diff));
+      if (rt && hit.s.refl > 0 && bounces > 0) {
+        const dn = 2 * (d[0] * n[0] + d[1] * n[1]), r = [d[0] - dn * n[0], d[1] - dn * n[1]], rl = Math.hypot(r[0], r[1]);
+        const rd = [r[0] / rl, r[1] / rl], Po = [P[0] + n[0] * 0.02, P[1] + n[1] * 0.02];
+        const h2 = trace(Po, rd, stats, rec && rec.bounceRec ? rec : null);
+        const c2 = shadeHit(Po, rd, h2, bounces - 1, rt, stats, rec);
+        return local.map((x, i) => x * (1 - hit.s.refl) + c2[i] * hit.s.refl);
+      }
+      return local;
+    }
+    function pixDir(i, N) { const yy = ((i + 0.5) / N * 2 - 1) * TH; const l = Math.hypot(1, yy); return [1 / l, yy / l]; }
+    // raster primary visibility: project segment endpoints, z-test per covered pixel
+    function rasterize(N, stats) {
+      const zb = new Array(N).fill(null).map(() => ({ t: Infinity, s: null }));
+      for (const s of segs) {
+        stats.tri++;
+        const pa = ((s.a[1] - CAM[1]) / (s.a[0] - CAM[0]) / TH * 0.5 + 0.5) * N - 0.5;
+        const pb = ((s.b[1] - CAM[1]) / (s.b[0] - CAM[0]) / TH * 0.5 + 0.5) * N - 0.5;
+        const i0 = Math.max(0, Math.ceil(Math.min(pa, pb))), i1 = Math.min(N - 1, Math.floor(Math.max(pa, pb)));
+        for (let i = i0; i <= i1; i++) {
+          const d = pixDir(i, N); const t = segHit(CAM[0], CAM[1], d[0], d[1], s.a[0], s.a[1], s.b[0], s.b[1]);
+          stats.frag++;
+          if (t < zb[i].t) zb[i] = { t, s };
+        }
+      }
+      return zb;
+    }
+    const st = { mode: "raster", b: 1, N: 20, sel: 17 };
+    let geo = null;
+    const v = RP.canvas("#rtc", (s) => {
+      const { ctx, w, h, c } = s;
+      ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+      const stripW = 34, sc = Math.min((w - stripW - 30) / 100, (h - 20) / 60), ox = 10, oy = (h - 60 * sc) / 2;
+      const X = (x) => ox + x * sc, Y = (y) => oy + y * sc;
+      geo = { sc, ox, oy };
+      const N = st.N, stats = { rays: 0, box: 0, seg: 0, tri: 0, frag: 0 };
+      const colors = [], recs = [];
+      const zb = st.mode !== "rt" ? rasterize(N, stats) : null;
+      for (let i = 0; i < N; i++) {
+        const d = pixDir(i, N), isSel = i === st.sel;
+        const rec = isSel ? { hit: [], miss: [], path: [], shadow: [], bounceRec: false } : { hit: [], miss: [], path: [], shadow: [] };
+        let col;
+        if (st.mode === "raster") col = shadeHit(CAM, d, zb[i], 0, false, stats, rec);
+        else if (st.mode === "rt") { const hit = trace(CAM, d, stats, isSel ? rec : null); col = shadeHit(CAM, d, hit, st.b, true, stats, rec); }
+        else col = shadeHit(CAM, d, zb[i], st.b, true, stats, rec);
+        colors.push(col); recs.push(rec);
+      }
+      // BVH boxes
+      if (st.mode !== "raster") {
+        ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+        for (const n of allNodes) { ctx.strokeStyle = A(c.muted, 0.35 - n.depth * 0.04); ctx.strokeRect(X(n.box[0]), Y(n.box[1]), (n.box[2] - n.box[0]) * sc, (n.box[3] - n.box[1]) * sc); }
+        ctx.setLineDash([]);
+        const r = recs[st.sel];
+        for (const n of r.miss) { ctx.strokeStyle = A(c.bad, 0.55); ctx.lineWidth = 1; ctx.strokeRect(X(n.box[0]), Y(n.box[1]), (n.box[2] - n.box[0]) * sc, (n.box[3] - n.box[1]) * sc); }
+        for (const n of r.hit) { if (n.items) { ctx.fillStyle = A(c.accent, 0.16); ctx.fillRect(X(n.box[0]), Y(n.box[1]), (n.box[2] - n.box[0]) * sc, (n.box[3] - n.box[1]) * sc); } ctx.strokeStyle = A(c.accent, 0.8); ctx.lineWidth = 1.3; ctx.strokeRect(X(n.box[0]), Y(n.box[1]), (n.box[2] - n.box[0]) * sc, (n.box[3] - n.box[1]) * sc); }
+      }
+      // projection lines (raster / hybrid primary)
+      if (st.mode !== "rt") {
+        ctx.strokeStyle = A(c.vtx, 0.35); ctx.lineWidth = 1;
+        const pts = new Set(); for (const sg of segs) { pts.add(sg.a.join(",")); pts.add(sg.b.join(",")); }
+        ctx.beginPath(); pts.forEach((p) => { const q = p.split(",").map(Number); ctx.moveTo(X(CAM[0]), Y(CAM[1])); ctx.lineTo(X(q[0]), Y(q[1])); }); ctx.stroke();
+        ctx.fillStyle = c.vtx; pts.forEach((p) => { const q = p.split(",").map(Number); ctx.beginPath(); ctx.arc(X(q[0]), Y(q[1]), 2, 0, Math.PI * 2); ctx.fill(); });
+      }
+      // primary rays (rt mode) faint
+      if (st.mode === "rt") {
+        ctx.strokeStyle = A(c.accent, 0.18); ctx.lineWidth = 1; ctx.beginPath();
+        recs.forEach((r) => { const p = r.path[0]; if (p) { ctx.moveTo(X(p[0][0]), Y(p[0][1])); ctx.lineTo(X(p[1][0]), Y(p[1][1])); } }); ctx.stroke();
+      }
+      // scene geometry
+      ctx.lineCap = "round";
+      for (const sg of segs) { ctx.strokeStyle = RP.rgb2css(sg.col); ctx.lineWidth = sg.refl ? 4 : 3.2; ctx.beginPath(); ctx.moveTo(X(sg.a[0]), Y(sg.a[1])); ctx.lineTo(X(sg.b[0]), Y(sg.b[1])); ctx.stroke(); }
+      ctx.lineCap = "butt";
+      ctx.fillStyle = c.muted; ctx.font = "10px " + MONO; ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillText("mirror floor", X(57), Y(54) + 5);
+      // selected ray path
+      const r = recs[st.sel];
+      r.path.forEach((p, k) => { ctx.strokeStyle = k === 0 ? c.accent : c.frag; ctx.lineWidth = 2.2; ctx.setLineDash(p[2] ? [6, 4] : []); ctx.beginPath(); ctx.moveTo(X(p[0][0]), Y(p[0][1])); ctx.lineTo(X(p[1][0]), Y(p[1][1])); ctx.stroke(); ctx.setLineDash([]); if (!p[2]) { ctx.fillStyle = k === 0 ? c.accent : c.frag; ctx.beginPath(); ctx.arc(X(p[1][0]), Y(p[1][1]), 3.5, 0, Math.PI * 2); ctx.fill(); } });
+      r.shadow.forEach(([P, blocked]) => { ctx.strokeStyle = blocked ? c.bad : c.warn; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(X(P[0]), Y(P[1])); ctx.lineTo(X(LIGHT[0]), Y(LIGHT[1])); ctx.stroke(); ctx.setLineDash([]); });
+      // light
+      ctx.fillStyle = c.warn; ctx.beginPath(); ctx.arc(X(LIGHT[0]), Y(LIGHT[1]), 6, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = c.warn; ctx.lineWidth = 1.2; for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; ctx.beginPath(); ctx.moveTo(X(LIGHT[0]) + Math.cos(a) * 8, Y(LIGHT[1]) + Math.sin(a) * 8); ctx.lineTo(X(LIGHT[0]) + Math.cos(a) * 12, Y(LIGHT[1]) + Math.sin(a) * 12); ctx.stroke(); }
+      // camera + image plane
+      const ipx = CAM[0] + 5, ihalf = 5 * TH;
+      ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(ipx), Y(CAM[1] - ihalf)); ctx.lineTo(X(ipx), Y(CAM[1] + ihalf)); ctx.stroke();
+      ctx.fillStyle = c.ink; ctx.beginPath(); ctx.moveTo(X(CAM[0]) + 6, Y(CAM[1])); ctx.lineTo(X(CAM[0]) - 6, Y(CAM[1]) - 6); ctx.lineTo(X(CAM[0]) - 6, Y(CAM[1]) + 6); ctx.closePath(); ctx.fill();
+      // image strip
+      const sx = w - stripW - 8, sy0 = 24, sh = h - 48, ch = sh / N;
+      ctx.fillStyle = c.muted; ctx.textAlign = "center"; ctx.textBaseline = "bottom"; ctx.fillText("image", sx + stripW / 2, sy0 - 4);
+      colors.forEach((col, i) => { ctx.fillStyle = RP.rgb2css(col.map((x) => Math.pow(RP.clamp(x), 1 / 2.2))); ctx.fillRect(sx, sy0 + i * ch, stripW, Math.ceil(ch)); });
+      ctx.strokeStyle = c.accent; ctx.lineWidth = 2; ctx.strokeRect(sx - 1, sy0 + st.sel * ch, stripW + 2, ch);
+      ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.strokeRect(sx, sy0, stripW, sh);
+      let hud;
+      if (st.mode === "raster") hud = `rasterize: ${stats.tri} segments projected, ${stats.frag} fragments\nno rays: no shadows, mirror shows only its base color`;
+      else if (st.mode === "rt") hud = `ray trace: ${stats.rays} rays, ${stats.box} box tests, ${stats.seg} segment tests\n(brute force would need ${stats.rays * segs.length} segment tests)`;
+      else hud = `hybrid: raster primary (${stats.frag} fragments) + ${stats.rays} rays\n${stats.box} box tests, ${stats.seg} segment tests`;
+      $("#rt-hud").textContent = hud;
+    });
+    const selEl = $("#rt-i");
+    const selS = RP.slider("#rt-i", (x) => { st.sel = x; v.draw(); });
+    RP.toggleGroup("#rt-mode", (m) => { st.mode = m; v.draw(); });
+    RP.slider("#rt-b", (x) => { st.b = x; v.draw(); });
+    RP.slider("#rt-n", (x) => { st.N = x; selEl.max = String(x - 1); if (st.sel > x - 1) selS.value = x - 1; else v.draw(); });
+    const pick = (x, y) => {
+      if (!geo) return;
+      const wx = (x - geo.ox) / geo.sc, wy = (y - geo.oy) / geo.sc;
+      if (wx <= CAM[0] + 0.5) return;
+      const ratio = (wy - CAM[1]) / (wx - CAM[0]);
+      const i = Math.floor((ratio / TH * 0.5 + 0.5) * st.N);
+      if (i >= 0 && i < st.N && i !== st.sel) selS.value = i;
+    };
+    RP.drag(v.el, { down: (x, y) => { pick(x, y); }, move: pick, hover: pick });
+  })();
+
+  /* =====================================================================
+     STEP 6 — Custom pixel-art pipeline
+     ===================================================================== */
+  (function () {
+    const st = { ps: 4, filter: "nearest", quant: true, outline: true, ang: 0.6 };
+    const PALETTE = ["#1a1c2c", "#3b3355", "#5d6c9e", "#94b0c2", "#f4f4f4", "#38b764", "#257179", "#a7f070", "#ffcd75", "#ef7d57", "#b13e53", "#73464f"].map((h) => RP.hex2rgb(h).map((x) => Math.round(x * 255)));
+    const lo = document.createElement("canvas"), lctx = lo.getContext("2d", { willReadFrequently: true });
+    const mk = document.createElement("canvas"), mctx = mk.getContext("2d", { willReadFrequently: true });
+    const cube = RP.mesh.cube();
+    const faces = [];
+    for (let f = 0; f < 6; f++) faces.push({ idx: [cube.tri[f * 2][0], cube.tri[f * 2][1], cube.tri[f * 2][2], cube.tri[f * 2 + 1][2]], n: cube.nrm[cube.tri[f * 2][0]] });
+    const FACECOL = [[0.94, 0.49, 0.34], [0.94, 0.49, 0.34], [1.0, 0.8, 0.46], [0.69, 0.24, 0.33], [0.94, 0.49, 0.34], [0.94, 0.49, 0.34]];
+    function renderLow(lw, lh) {
+      lo.width = lw; lo.height = lh; mk.width = lw; mk.height = lh;
+      const sky = lctx.createLinearGradient(0, 0, 0, lh);
+      sky.addColorStop(0, "#5d6c9e"); sky.addColorStop(0.6, "#94b0c2"); sky.addColorStop(1, "#f4e4c4");
+      lctx.fillStyle = sky; lctx.fillRect(0, 0, lw, lh);
+      lctx.fillStyle = "#ffcd75"; lctx.beginPath(); lctx.arc(lw * 0.8, lh * 0.22, lh * 0.09, 0, Math.PI * 2); lctx.fill();
+      const hill = (base, amp, fr, ph, col) => { lctx.fillStyle = col; lctx.beginPath(); lctx.moveTo(0, lh); for (let x = 0; x <= lw; x += Math.max(1, lw / 80)) lctx.lineTo(x, lh * (base + amp * Math.sin(x / lw * fr + ph))); lctx.lineTo(lw, lh); lctx.closePath(); lctx.fill(); };
+      hill(0.6, 0.06, 7, 1, "#257179"); hill(0.72, 0.04, 11, 3, "#38b764");
+      const P = RP.m4.perspective(50 * Math.PI / 180, lw / lh, 0.1, 50);
+      const V = RP.m4.lookAt([0, 1.3, 4.2], [0, 0.35, 0], [0, 1, 0]);
+      const M = RP.m4.chain(RP.m4.translate(0, 0.55, 0), RP.m4.rotY(st.ang), RP.m4.rotX(0.35), RP.m4.scale(1.05, 1.05, 1.05));
+      const MVP = RP.m4.chain(P, V, M);
+      // ground shadow
+      lctx.fillStyle = "rgba(26,28,44,0.45)"; const g = RP.m4.project(RP.m4.chain(P, V), [0, -0.35, 0], lw, lh);
+      lctx.beginPath(); lctx.ellipse(g.x, g.y, lw * 0.13, lh * 0.04, 0, 0, Math.PI * 2); lctx.fill();
+      const pts = cube.pos.map((p) => RP.m4.project(MVP, p, lw, lh));
+      const light = RP.v3.norm([0.6, 0.9, 0.5]);
+      mctx.fillStyle = "#000"; mctx.fillRect(0, 0, lw, lh); mctx.fillStyle = "#fff";
+      faces.forEach((f, fi) => {
+        const q = f.idx.map((i) => pts[i]);
+        const area = (q[1].x - q[0].x) * (q[2].y - q[0].y) - (q[1].y - q[0].y) * (q[2].x - q[0].x);
+        if (area >= 0) return; // back-face (screen y is down, so CCW faces have negative area)
+        const nw = RP.v3.norm(RP.m4.xform(M, [f.n[0], f.n[1], f.n[2], 0]).slice(0, 3));
+        const k = 0.3 + 0.7 * Math.max(0, RP.v3.dot(nw, light));
+        lctx.fillStyle = RP.rgb2css(FACECOL[fi].map((x) => x * k));
+        for (const ctx2 of [lctx, mctx]) { ctx2.beginPath(); q.forEach((p, i) => (i ? ctx2.lineTo(p.x, p.y) : ctx2.moveTo(p.x, p.y))); ctx2.closePath(); ctx2.fill(); }
+      });
+    }
+    function post(lw, lh) {
+      if (!st.quant && !st.outline) return;
+      const img = lctx.getImageData(0, 0, lw, lh), d = img.data;
+      if (st.quant) {
+        for (let i = 0; i < d.length; i += 4) {
+          let best = 0, bd = Infinity;
+          for (let k = 0; k < PALETTE.length; k++) { const p = PALETTE[k], dr = d[i] - p[0], dg = d[i + 1] - p[1], db = d[i + 2] - p[2], dd = dr * dr * 0.3 + dg * dg * 0.59 + db * db * 0.11; if (dd < bd) { bd = dd; best = k; } }
+          d[i] = PALETTE[best][0]; d[i + 1] = PALETTE[best][1]; d[i + 2] = PALETTE[best][2];
+        }
+      }
+      if (st.outline) {
+        const m = mctx.getImageData(0, 0, lw, lh).data, inside = (x, y) => x >= 0 && y >= 0 && x < lw && y < lh && m[(y * lw + x) * 4] > 127;
+        const oc = PALETTE[0];
+        for (let y = 0; y < lh; y++) for (let x = 0; x < lw; x++) {
+          if (inside(x, y)) continue;
+          if (inside(x + 1, y) || inside(x - 1, y) || inside(x, y + 1) || inside(x, y - 1)) { const i = (y * lw + x) * 4; d[i] = oc[0]; d[i + 1] = oc[1]; d[i + 2] = oc[2]; }
+        }
+      }
+      lctx.putImageData(img, 0, 0);
+    }
+    const v = RP.canvas("#px", (s) => {
+      const { ctx, w, h } = s;
+      const lw = Math.max(8, Math.ceil(w / st.ps)), lh = Math.max(6, Math.ceil(h / st.ps));
+      renderLow(lw, lh); post(lw, lh);
+      ctx.imageSmoothingEnabled = st.filter === "smooth";
+      ctx.drawImage(lo, 0, 0, lw * st.ps, lh * st.ps);
+      $("#px-hud").textContent = `scene target ${lw}×${lh} → ${Math.round(w)}×${Math.round(h)} (×${st.ps}, ${st.filter})\n${st.quant ? PALETTE.length + "-color palette" : "full color"}${st.outline ? " + outline" : ""}`;
+    });
+    RP.slider("#px-s", (x) => { st.ps = x; v.draw(); }, { fmt: (x) => x + " px" });
+    RP.toggleGroup("#px-f", (x) => { st.filter = x; v.draw(); });
+    toggleBtn("px-q", (on) => { st.quant = on; v.draw(); });
+    toggleBtn("px-o", (on) => { st.outline = on; v.draw(); });
+    const anim = RP.loop(v.el, (t, dt) => { st.ang += dt * 0.6; v.draw(); });
+    const playBtn = $("#px-play");
+    if (RP.reduced) playBtn.setAttribute("aria-pressed", "false");
+    toggleBtn("px-play", (on) => { if (on) anim.start(); else anim.stop(); });
+  })();
+})();
+</script>
+</body>
+</html>

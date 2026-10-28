@@ -1,0 +1,808 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Forward, Deferred & Shadows · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .costbars { display: grid; gap: 8px; padding: 14px 16px; border-top: 1px solid var(--line); }
+  .costrow { display: grid; grid-template-columns: 96px 1fr 128px; gap: 10px; align-items: center; font: 400 0.78rem/1.2 var(--font-mono); color: var(--muted); }
+  .costrow b { color: var(--ink); font-weight: 600; }
+  .costrow .num { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .costbar { height: 12px; background: var(--surface-2); border-radius: 6px; overflow: hidden; }
+  .costbar i { display: block; height: 100%; width: 0; border-radius: 6px; transition: width 0.15s; }
+  .costbar.fwd i { background: var(--bad); } .costbar.def i { background: var(--out); } .costbar.til i { background: var(--ras); }
+  .costnote { font: 400 0.72rem/1.3 var(--font-mono); color: var(--muted); }
+  #sm-hud { left: auto; right: 10px; top: 48px; }
+  #cl-side-hud, #cl-hud { font-size: 0.7rem; }
+  @media (max-width: 480px) { .costrow { grid-template-columns: 70px 1fr 96px; font-size: 0.7rem; } }
+</style>
+</head>
+<body data-topic="06">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 06 · Modern techniques</p>
+    <h1>Forward, Deferred & Shadows</h1>
+    <p class="lede">A real game scene has hundreds of lights and needs shadows. This chapter is about organizing the fragment work so that the cost stays sane, and about the trick nearly every engine uses to decide what each light can actually see.</p>
+    <div class="stage-band"><span class="app">Application</span><span class="vtx">Vertex</span><span class="ras">Rasterize</span><span class="on frag">Fragment</span><span class="on out">Output</span></div>
+  </section>
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>Why classic forward rendering costs roughly <em>objects × lights</em>, and how deferred shading breaks that link</li>
+    <li>What a G-buffer stores, and what deferred shading costs you in memory bandwidth, MSAA support and transparency</li>
+    <li>How Forward+ (tiled) and clustered shading cull lights per screen tile or per 3D cluster</li>
+    <li>How shadow mapping works, and how to fix shadow acne and peter-panning with bias, PCF and cascades</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="cost">
+    <h2><span class="step-no">STEP 1</span>The cost of many lights</h2>
+    <p>In chapter 03 we lit a sphere with one light. The fragment shader looped over the lights and added up their contributions. This is <b>forward rendering</b>: each object is drawn and fully lit in the same pass, straight into the framebuffer.</p>
+    <p>The catch is how the cost grows. If the shader loops over every light, each fragment pays for <em>every</em> light, even ones on the far side of the level. Overdraw makes it worse: a fragment that is later hidden by a closer object was still fully lit. So the cost grows like <code>fragments × lights</code>, and the fragment count grows with the number of objects. Older engines often used <b>multi-pass forward</b> instead: draw each object once per light that touches it and add the results with additive blending. That avoids the "every light" loop, but you pay for the geometry again in every pass.</p>
+    <p><b>Deferred shading</b> splits the work in two. A geometry pass stores surface data for the closest surface at each pixel. A lighting pass then shades each pixel <em>once</em>, using only the lights whose range reaches it. <b>Tiled</b> shading goes further: it cuts the screen into tiles of 16×16 or 32×32 pixels and builds a short light list for each tile.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="cost-cv" aria-label="Top-down view of the screen with rectangular objects and moving point lights. Screen tiles are shaded by how many lights overlap them."></canvas><div class="hud" id="cost-hud"></div></div>
+      <div class="costbars" aria-live="polite">
+        <div class="costrow"><b>Forward</b><div class="costbar fwd"><i id="bar-fwd"></i></div><span class="num" id="num-fwd"></span></div>
+        <div class="costrow"><b>Deferred</b><div class="costbar def"><i id="bar-def"></i></div><span class="num" id="num-def"></span></div>
+        <div class="costrow"><b>Tiled (F+)</b><div class="costbar til"><i id="bar-til"></i></div><span class="num" id="num-til"></span></div>
+        <p class="costnote">Light evaluations per frame, scaled to 1920×1080 (log scale). Right column: average per pixel. Forward = every fragment (with overdraw) × every light. Deferred = each pixel × lights whose volume covers it. Tiled = every fragment × lights in its 32 px tile.</p>
+      </div>
+      <div class="controls">
+        <div class="control"><label for="cost-n">Lights <output for="cost-n"></output></label><input type="range" id="cost-n" min="1" max="256" value="32"></div>
+        <div class="control"><label for="cost-r">Light radius (px) <output for="cost-r"></output></label><input type="range" id="cost-r" min="20" max="160" value="70"></div>
+        <div class="btn-row" id="cost-show" aria-label="What to draw"><button class="btn" data-value="both" aria-pressed="true">Tiles + volumes</button><button class="btn" data-value="heat">Tile heatmap</button><button class="btn" data-value="vol">Light volumes</button></div>
+        <button class="btn" id="cost-play" type="button">Pause motion</button>
+      </div>
+      <figcaption><b>Try it:</b> push the light count to 256. Forward cost grows in a straight line with the number of lights. Deferred and tiled grow only with how many lights <em>overlap</em> each pixel. Shrink the radius and watch the heatmap cool down.</figcaption>
+    </figure>
+    <div class="callout out"><strong>Key idea.</strong> Shading cost should depend on how many lights actually <em>touch</em> a pixel, not on how many lights exist in the level. Every technique in this chapter is a way to get there.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="gbuffer">
+    <h2><span class="step-no">STEP 2</span>The G-buffer: shade later, from stored surfaces</h2>
+    <p>The deferred <b>geometry pass</b> runs the vertex and fragment shaders as usual, but the fragment shader doesn't compute any lighting. It writes the material and geometry inputs to several render targets at once (multiple render targets, or MRT). Together these targets are called the <b>G-buffer</b>. A typical layout:</p>
+    <ul>
+      <li><b>Albedo</b> (base color), 8 bits per channel.</li>
+      <li><b>Normal</b>: a direction in [−1, 1], packed into [0, 1] as <code>n·0.5 + 0.5</code>. That's why normal buffers look pastel: +X is reddish, +Y greenish, +Z bluish.</li>
+      <li><b>Roughness / metalness</b> (chapter 07 covers these) and other material flags.</li>
+      <li><b>Depth</b>: the normal depth buffer. The lighting pass rebuilds each pixel's 3D position from depth plus the pixel's screen coordinate.</li>
+    </ul>
+    <p>The <b>lighting pass</b> then reads these textures. For each light it draws a <em>light volume</em> (a sphere mesh, or just a screen rectangle around it). Only pixels inside the volume run the lighting shader, and the results are added into an accumulation buffer with additive blending. The scene below is ray-cast in software, one pixel at a time, into a 240×150 G-buffer.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="gb-cv" class="tall" aria-label="Software-rendered scene of three spheres and a box on a checkered floor, showing the selected G-buffer channel or the lit result."></canvas><div class="hud" id="gb-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row" id="gb-ch" aria-label="G-buffer channel"><button class="btn" data-value="alb">Albedo</button><button class="btn" data-value="nrm">Normal</button><button class="btn" data-value="dep">Depth</button><button class="btn" data-value="rm">Rough / metal</button><button class="btn" data-value="lit" aria-pressed="true">Lit result</button></div>
+        <div class="control"><label for="gb-k">Lights applied <output for="gb-k"></output></label><input type="range" id="gb-k" min="0" max="6" value="6"></div>
+        <button class="btn" id="gb-play" type="button">▶ Play lighting pass</button>
+      </div>
+      <figcaption><b>Try it:</b> flip through the channels, then press <b>Play</b>. Each light's volume (dashed circle) is added on top of the previous result. Hover the image to read the stored G-buffer values at that pixel.</figcaption>
+    </figure>
+    <p>Deferred shading has real costs. A 1080p G-buffer with four 32-bit targets plus depth is about 40&nbsp;MB, written once and then read once per overlapping light, so <b>memory bandwidth</b> is the price. That hurts most on mobile GPUs. <b>MSAA</b> (chapter 07) is hard, because each G-buffer pixel would need several samples, and those samples would all have to be stored and lit. And the G-buffer keeps only <b>one surface per pixel</b>, so glass, smoke and other transparent things can't go through it. Deferred engines draw them afterwards in a separate <b>forward pass</b>.</p>
+    <div class="callout frag"><strong>Key idea.</strong> Deferred shading separates "what is at this pixel" from "how is it lit". Lighting cost becomes <code>pixels × overlapping lights</code>, no matter how many objects or how much overdraw there was. You pay for that in memory bandwidth.</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="clustered">
+    <h2><span class="step-no">STEP 3</span>Forward+: tiled and clustered light culling</h2>
+    <p>Drawing one volume per light still means reading the G-buffer again for each light. <b>Tiled shading</b> does the light culling up front instead. A compute pass splits the screen into tiles and tests every light's bounding sphere against every tile. The result is a short <b>light list</b> per tile. Shading then loops over that list only. This works for deferred (read the G-buffer once, loop over the tile's lights) and for forward, where it's called <b>Forward+</b>. Forward+ keeps the advantages of forward: MSAA works, transparency works, and there's no fat G-buffer.</p>
+    <p>A tile is really a long thin box that runs from the near plane to the far plane. A light hovering in front of a distant wall still lands in that wall's tile, even though it's nowhere near the wall in depth. <b>Clustered shading</b> also slices the view depth, usually with exponentially thicker slices further away, which gives a 3D grid of <em>clusters</em>. Each pixel looks up the cluster that matches its own depth.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="cl-cv" aria-label="Screen split into tiles with draggable light circles; tiles are coloured by light count."></canvas><div class="hud" id="cl-hud"></div><span class="pane-label">Screen (x, y)</span></div>
+        <div class="viz-stage"><canvas id="cl-side" aria-label="Side view of view depth versus screen y, showing depth slices for the hovered tile column and the lights as ellipses."></canvas><div class="hud" id="cl-side-hud"></div><span class="pane-label">Side (depth, y)</span></div>
+      </div>
+      <div class="controls">
+        <div class="btn-row" id="cl-mode" aria-label="Culling mode"><button class="btn" data-value="tiled" aria-pressed="true">Tiled</button><button class="btn" data-value="clustered">Clustered</button></div>
+        <div class="control"><label for="cl-tile">Tile size (px) <output for="cl-tile"></output></label><input type="range" id="cl-tile" min="16" max="96" step="8" value="48"></div>
+        <div class="control"><label for="cl-sl">Depth slices <output for="cl-sl"></output></label><input type="range" id="cl-sl" min="2" max="16" value="8"></div>
+      </div>
+      <figcaption><b>Try it:</b> hover a tile to see its light list. Drag lights on the left to move them across the screen, or on the right to change their depth. Switch to <b>Clustered</b> and hover the side view to pick a depth slice. Lights that overlap a tile on screen but sit at a different depth fall out of that cluster's list.</figcaption>
+    </figure>
+    <div class="callout ras"><strong>Key idea.</strong> Cull once per tile or cluster, then shade from a short list. Tiles cut the screen in 2D. Clusters also cut along depth, so lists stay short even where near and far lights overlap on screen.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="shadows">
+    <h2><span class="step-no">STEP 4</span>Shadow mapping</h2>
+    <p>Lighting so far treats every surface as if nothing stands between it and the light. To get shadows we need to know what the light can see. Lance Williams' 1978 answer is still the standard one: <b>render the scene from the light's point of view, keeping only depth</b>. The result is the <b>shadow map</b>. Later, in the main pass, each fragment is transformed into the light's space and compares its own distance to the light with the value stored in the map. If the fragment is farther away than the stored value, something closer blocks the light, so the fragment is in shadow.</p>
+    <p>This side view shows it in 2D. The light's "image" is one row of texels (the strip at the top). Each texel stores the distance to the first thing its ray hits.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="sm-cv" class="tall" aria-label="Side view: a spot light, a box on the ground, a floating slab, a ground with a ramp. A strip at the top shows the light's one-dimensional depth buffer. Ground points are coloured lit or shadowed."></canvas><div class="hud" id="sm-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="sm-res">Shadow map texels <output for="sm-res"></output></label><input type="range" id="sm-res" min="8" max="256" step="4" value="48"></div>
+        <div class="control"><label for="sm-bias">Depth bias (px) <output for="sm-bias"></output></label><input type="range" id="sm-bias" min="0" max="40" step="0.5" value="0"></div>
+        <div class="btn-row" id="sm-pcf" aria-label="PCF filter"><button class="btn" data-value="0" aria-pressed="true">No PCF</button><button class="btn" data-value="1">PCF 3 taps</button><button class="btn" data-value="2">PCF 5 taps</button></div>
+      </div>
+      <figcaption><b>Try it:</b> with bias 0 the lit ground is striped. That's <b>shadow acne</b>. Raise the bias until the stripes vanish, then keep going: the shadow at the foot of the box detaches (<b>peter-panning</b>). Hover the ground to see the comparison. Drag the light.</figcaption>
+    </figure>
+    <p>Why acne? A texel covers a small wedge of directions, but it stores just one depth: the one along its centre ray. A ground point slightly off-centre lies a little farther away, so it "shadows itself". This happens in alternating bands, one per texel. Limited depth precision adds to it. The fix is a <b>depth bias</b>: subtract a small amount before comparing. Too much bias, and surfaces just behind an occluder's edge count as lit, so shadows lose contact with the objects that cast them. Engines combine a constant bias with a <b>slope-scaled</b> bias (more bias on surfaces seen at a grazing angle) and normal offsets.</p>
+    <p>A single comparison gives hard, blocky edges. <b>Percentage-closer filtering (PCF)</b> runs the comparison on several neighbouring texels and averages the yes/no results. You get a fraction between 0 and 1 and a softer edge. Note that PCF averages the <em>results</em> of the comparisons, not the depths themselves.</p>
+    <div class="callout warn"><strong>Key idea.</strong> A shadow map is a depth buffer rendered from the light. A fragment is in shadow if it is farther from the light than what the light saw. Bias trades acne against peter-panning, and PCF softens the edges.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="cascades">
+    <h2><span class="step-no">STEP 5</span>Cascaded shadow maps for the sun</h2>
+    <p>The sun lights everything the camera can see, from your feet out to the horizon. One shadow map stretched over 100&nbsp;m would make each texel tens of centimetres wide, which looks terrible up close. <b>Cascaded shadow maps</b> cut the view frustum into 3–4 depth ranges and give each range its own map. Near cascades cover a small area at high detail, far ones cover a big area at low detail. That roughly matches how much screen space things take up at each distance.</p>
+    <p>Where to split? Uniform splits waste resolution far away. Logarithmic splits match perspective in theory but make the first cascade tiny. The common "practical" scheme blends the two: <code>dᵢ = λ·n·(f/n)^(i/N) + (1−λ)·(n + (f−n)·i/N)</code>.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="csm-cv" class="tall" aria-label="Top-down view of a camera frustum split into coloured cascades, each with a dashed light-space bounding box aligned to the sun direction."></canvas><div class="hud" id="csm-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="csm-l">Split λ (0 uniform → 1 log) <output for="csm-l"></output></label><input type="range" id="csm-l" min="0" max="1" step="0.01" value="0.6"></div>
+        <div class="control"><label for="csm-n">Cascades <output for="csm-n"></output></label><input type="range" id="csm-n" min="2" max="4" value="4"></div>
+        <div class="control"><label for="csm-sun">Sun direction (°) <output for="csm-sun"></output></label><input type="range" id="csm-sun" min="0" max="180" value="35"></div>
+      </div>
+      <figcaption><b>Try it:</b> slide λ from 0 to 1 and watch the first cascade shrink and its texels get finer (HUD). Every cascade uses a 2048-texel map. The dashed boxes show the area each map has to cover once it's lined up with the sun. Seen from above, with the sun's elevation ignored.</figcaption>
+    </figure>
+    <div class="callout out"><strong>Key idea.</strong> Spend shadow resolution where the camera needs it. Several maps, each fitted to one slice of the frustum, give sharp shadows nearby without wasting texels far away.</div>
+  </section>
+
+  <section class="step" id="recap"><h2><span class="step-no">RECAP</span>What to remember</h2><ul>
+    <li><b>Forward</b> lights each fragment as it is drawn. Naively that costs fragments (with overdraw) × all lights. Multi-pass forward costs one geometry pass per light.</li>
+    <li><b>Deferred</b> writes a G-buffer (albedo, normal, roughness/metal, depth) and then lights each pixel once per overlapping light volume. The prices: bandwidth, awkward MSAA, and a separate forward pass for transparency.</li>
+    <li><b>Forward+ / tiled</b> builds per-tile light lists in a compute pass. <b>Clustered</b> also splits by depth. Both make shading cost scale with local light density.</li>
+    <li><b>Shadow mapping</b> (Williams 1978): render depth from the light, then compare each fragment's light-space depth against it.</li>
+    <li>Too little bias causes <b>acne</b>, too much causes <b>peter-panning</b>. <b>PCF</b> averages several comparisons for soft edges. <b>Cascades</b> spread a sun's shadow resolution over the view distance.</li>
+  </ul></section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const { clamp, lerp, v3, hex2rgb, rgb2css, alpha } = RP;
+
+  function rng(seed) {
+    let s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      let t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function fmtN(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + " B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + " M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + " k";
+    return String(Math.round(n));
+  }
+  function mixHex(a, b, t) {
+    const A = hex2rgb(a), B = hex2rgb(b);
+    return [lerp(A[0], B[0], t), lerp(A[1], B[1], t), lerp(A[2], B[2], t)];
+  }
+  // heat: teal -> amber -> red, with alpha
+  function heat(c, t, a) {
+    t = clamp(t);
+    const rgb = t < 0.5 ? mixHex(c.ras, c.warn, t * 2) : mixHex(c.warn, c.bad, (t - 0.5) * 2);
+    return rgb2css(rgb, a);
+  }
+  function circleRect(cx, cy, r, x0, y0, x1, y1) {
+    const nx = clamp(cx, x0, x1), ny = clamp(cy, y0, y1);
+    const dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy <= r * r;
+  }
+
+  /* =================== STEP 1: cost of many lights =================== */
+  const S1 = { n: 32, radius: 70, show: "both", t: 0, objs: [], lights: [] };
+  (function () {
+    const r = rng(7);
+    for (let i = 0; i < 14; i++) S1.objs.push({ x: 0.03 + r() * 0.82, y: 0.06 + r() * 0.74, w: 0.05 + r() * 0.12, h: 0.08 + r() * 0.14 });
+    for (let i = 0; i < 256; i++) S1.lights.push({ x: r(), y: r(), ph: r() * 6.283, sp: 0.2 + r() * 0.5, ox: 0.02 + r() * 0.05, rs: 0.6 + r() * 0.8 });
+  })();
+  const hud1 = document.getElementById("cost-hud");
+  function setBar(id, v) {
+    const pct = clamp((Math.log10(Math.max(1, v)) - 5) / 6) * 100;
+    document.getElementById("bar-" + id).style.width = pct.toFixed(1) + "%";
+    document.getElementById("num-" + id).textContent = fmtN(v) + " · " + (v / (1920 * 1080)).toFixed(1) + "/px";
+  }
+  const v1 = RP.canvas("#cost-cv", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const N = S1.n, T = 32, g = 6;
+    const gw = Math.ceil(w / g), gh = Math.ceil(h / g);
+    const lc = new Uint16Array(gw * gh);
+    const tw = Math.ceil(w / T), th = Math.ceil(h / T);
+    const tc = new Uint16Array(tw * th);
+    const L = [];
+    for (let i = 0; i < N; i++) {
+      const q = S1.lights[i];
+      const x = (q.x + Math.cos(S1.t * q.sp + q.ph) * q.ox) * w;
+      const y = (q.y + Math.sin(S1.t * q.sp * 1.3 + q.ph) * q.ox) * h;
+      const r = S1.radius * q.rs;
+      L.push([x, y, r]);
+      const x0 = Math.max(0, Math.floor((x - r) / g)), x1 = Math.min(gw - 1, Math.floor((x + r) / g));
+      const y0 = Math.max(0, Math.floor((y - r) / g)), y1 = Math.min(gh - 1, Math.floor((y + r) / g));
+      for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) {
+        const dx = (xx + 0.5) * g - x, dy = (yy + 0.5) * g - y;
+        if (dx * dx + dy * dy <= r * r) lc[yy * gw + xx]++;
+      }
+      const tx0 = Math.max(0, Math.floor((x - r) / T)), tx1 = Math.min(tw - 1, Math.floor((x + r) / T));
+      const ty0 = Math.max(0, Math.floor((y - r) / T)), ty1 = Math.min(th - 1, Math.floor((y + r) / T));
+      for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
+        if (circleRect(x, y, r, tx * T, ty * T, tx * T + T, ty * T + T)) tc[ty * tw + tx]++;
+      }
+    }
+    const O = S1.objs.map((o) => [o.x * w, o.y * h, o.x * w + o.w * w, o.y * h + o.h * h]);
+    let fwd = 0, def = 0, til = 0;
+    for (let yy = 0; yy < gh; yy++) for (let xx = 0; xx < gw; xx++) {
+      const px = (xx + 0.5) * g, py = (yy + 0.5) * g;
+      if (px > w || py > h) continue;
+      let layers = 1; // the floor covers every pixel
+      for (const o of O) if (px >= o[0] && px <= o[2] && py >= o[1] && py <= o[3]) layers++;
+      fwd += layers * N;
+      def += lc[yy * gw + xx];
+      til += layers * tc[Math.min(th - 1, Math.floor(py / T)) * tw + Math.min(tw - 1, Math.floor(px / T))];
+    }
+    const k = g * g * (1920 * 1080) / (w * h);
+    setBar("fwd", fwd * k); setBar("def", def * k); setBar("til", til * k);
+
+    let maxT = 0; for (let i = 0; i < tc.length; i++) if (tc[i] > maxT) maxT = tc[i];
+    if (S1.show !== "vol") {
+      ctx.font = "9px " + getComputedStyle(document.body).getPropertyValue("--font-mono");
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      for (let ty = 0; ty < th; ty++) for (let tx = 0; tx < tw; tx++) {
+        const n = tc[ty * tw + tx];
+        if (!n) continue;
+        ctx.fillStyle = heat(c, n / Math.max(1, maxT), 0.18 + 0.5 * n / Math.max(1, maxT));
+        ctx.fillRect(tx * T, ty * T, T, T);
+        if (T >= 28) { ctx.fillStyle = c.ink; ctx.fillText(String(n), tx * T + T / 2, ty * T + T / 2); }
+      }
+      ctx.strokeStyle = alpha(c.line, 0.9); ctx.lineWidth = 1; ctx.beginPath();
+      for (let x = T; x < w; x += T) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, h); }
+      for (let y = T; y < h; y += T) { ctx.moveTo(0, y + 0.5); ctx.lineTo(w, y + 0.5); }
+      ctx.stroke();
+    }
+    for (const o of O) {
+      ctx.fillStyle = alpha(c.surface, 0.85); ctx.strokeStyle = c.muted; ctx.lineWidth = 1.2;
+      ctx.fillRect(o[0], o[1], o[2] - o[0], o[3] - o[1]); ctx.strokeRect(o[0], o[1], o[2] - o[0], o[3] - o[1]);
+    }
+    for (const [x, y, r] of L) {
+      if (S1.show !== "heat") {
+        ctx.fillStyle = alpha(c.vtx, N > 64 ? 0.04 : 0.09); ctx.strokeStyle = alpha(c.vtx, N > 64 ? 0.25 : 0.55);
+        ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
+      ctx.fillStyle = c.vtx; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+    hud1.textContent = `${N} lights · 14 objects + floor\ntile 32 px · busiest tile: ${maxT} lights`;
+  });
+  RP.slider("#cost-n", (v) => { S1.n = v; v1.draw(); });
+  RP.slider("#cost-r", (v) => { S1.radius = v; v1.draw(); });
+  RP.toggleGroup("#cost-show", (v) => { S1.show = v; v1.draw(); });
+  const anim1 = RP.loop(document.getElementById("cost-cv"), (t, dt) => { S1.t += dt; v1.draw(); });
+  const play1 = document.getElementById("cost-play");
+  function syncPlay1() { play1.textContent = anim1.running ? "Pause motion" : "Play motion"; play1.setAttribute("aria-pressed", String(!anim1.running)); }
+  play1.addEventListener("click", () => { if (anim1.running) anim1.stop(); else anim1.start(); syncPlay1(); });
+  syncPlay1();
+
+  /* =================== STEP 2: G-buffer =================== */
+  const GW = 240, GH = 150, NP = GW * GH;
+  const gAlb = new Float32Array(NP * 3), gNrm = new Float32Array(NP * 3), gPos = new Float32Array(NP * 3);
+  const gDep = new Float32Array(NP), gRgh = new Float32Array(NP), gMet = new Float32Array(NP), gMsk = new Uint8Array(NP);
+  const EYE = [0, 2.4, 7.2], TGT = [0, 0.55, 0], TN = Math.tan(20 * Math.PI / 180), ASP = GW / GH;
+  const CF = v3.norm(v3.sub(TGT, EYE)), CR = v3.norm(v3.cross(CF, [0, 1, 0])), CU = v3.cross(CR, CF);
+  const SPH = [
+    { c: [-1.6, 0.8, 0], r: 0.8, a: [0.8, 0.18, 0.12], ro: 0.35, me: 0 },
+    { c: [0.9, 0.6, 0.9], r: 0.6, a: [1.0, 0.76, 0.33], ro: 0.25, me: 1 },
+    { c: [2.0, 0.45, -0.9], r: 0.45, a: [0.15, 0.3, 0.85], ro: 0.6, me: 0 },
+  ];
+  const BOX = { mn: [-0.5, 0, -1.9], mx: [0.6, 1.3, -0.8], a: [0.25, 0.65, 0.3], ro: 0.85, me: 0 };
+  const LIGHTS = [
+    { p: [-2.6, 1.3, 1.6], c: [1, 0.55, 0.25] }, { p: [2.6, 1.6, 1.9], c: [0.35, 0.55, 1] },
+    { p: [0.1, 2.5, -0.3], c: [1, 1, 1] }, { p: [-0.4, 0.35, 2.0], c: [1, 0.3, 0.7] },
+    { p: [3.0, 0.7, -2.0], c: [0.4, 1, 0.5] }, { p: [-3.0, 1.1, -2.0], c: [1, 0.85, 0.45] },
+  ];
+  const RANGE = 4.2, INTEN = 2.4;
+  function hitBox(o, d) {
+    let t0 = -1e9, t1 = 1e9, ax = 0, sg = -1;
+    for (let k = 0; k < 3; k++) {
+      if (Math.abs(d[k]) < 1e-9) { if (o[k] < BOX.mn[k] || o[k] > BOX.mx[k]) return null; continue; }
+      let ta = (BOX.mn[k] - o[k]) / d[k], tb = (BOX.mx[k] - o[k]) / d[k], s = -1;
+      if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; s = 1; }
+      if (ta > t0) { t0 = ta; ax = k; sg = s; }
+      if (tb < t1) t1 = tb;
+      if (t0 > t1) return null;
+    }
+    if (t0 < 1e-4) return null;
+    const n = [0, 0, 0]; n[ax] = sg;
+    return { t: t0, n };
+  }
+  let dMin = 1e9, dMax = 0;
+  for (let py = 0; py < GH; py++) for (let px = 0; px < GW; px++) {
+    const x = ((px + 0.5) / GW) * 2 - 1, y = 1 - ((py + 0.5) / GH) * 2;
+    const d = v3.norm(v3.add(CF, v3.add(v3.scale(CR, x * TN * ASP), v3.scale(CU, y * TN))));
+    let best = { t: 1e9 };
+    for (const s of SPH) {
+      const oc = v3.sub(EYE, s.c), b = v3.dot(oc, d), cc = v3.dot(oc, oc) - s.r * s.r, disc = b * b - cc;
+      if (disc > 0) {
+        const t = -b - Math.sqrt(disc);
+        if (t > 1e-4 && t < best.t) { const p = v3.add(EYE, v3.scale(d, t)); best = { t, n: v3.scale(v3.sub(p, s.c), 1 / s.r), a: s.a, ro: s.ro, me: s.me }; }
+      }
+    }
+    const hb = hitBox(EYE, d);
+    if (hb && hb.t < best.t) best = { t: hb.t, n: hb.n, a: BOX.a, ro: BOX.ro, me: BOX.me };
+    if (d[1] < 0) {
+      const t = -EYE[1] / d[1];
+      if (t < best.t) {
+        const p = v3.add(EYE, v3.scale(d, t));
+        if (Math.abs(p[0]) < 4.5 && p[2] > -4 && p[2] < 3.2) {
+          const chk = (Math.floor(p[0]) + Math.floor(p[2])) & 1;
+          best = { t, n: [0, 1, 0], a: chk ? [0.55, 0.52, 0.48] : [0.32, 0.31, 0.3], ro: 0.9, me: 0 };
+        }
+      }
+    }
+    const i = py * GW + px;
+    if (best.t < 1e9) {
+      const p = v3.add(EYE, v3.scale(d, best.t));
+      gMsk[i] = 1;
+      for (let k = 0; k < 3; k++) { gAlb[i * 3 + k] = best.a[k]; gNrm[i * 3 + k] = best.n[k]; gPos[i * 3 + k] = p[k]; }
+      gDep[i] = v3.dot(v3.sub(p, EYE), CF); // view-space depth along the camera axis
+      gRgh[i] = best.ro; gMet[i] = best.me;
+      dMin = Math.min(dMin, gDep[i]); dMax = Math.max(dMax, gDep[i]);
+    }
+  }
+  const toSRGB = (v) => { v = clamp(v); return v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055; };
+  function shadePx(i, k, out) {
+    out[0] = out[1] = out[2] = 0;
+    if (!gMsk[i]) return 0;
+    const a = [gAlb[i * 3], gAlb[i * 3 + 1], gAlb[i * 3 + 2]];
+    const n = [gNrm[i * 3], gNrm[i * 3 + 1], gNrm[i * 3 + 2]];
+    const p = [gPos[i * 3], gPos[i * 3 + 1], gPos[i * 3 + 2]];
+    const V = v3.norm(v3.sub(EYE, p));
+    const r = gRgh[i], m = gMet[i];
+    const sh = Math.min(2000, 2 / Math.max(1e-3, Math.pow(r, 4)) - 2);
+    const norm = (sh + 8) / (8 * Math.PI);
+    const F0 = [lerp(0.04, a[0], m), lerp(0.04, a[1], m), lerp(0.04, a[2], m)];
+    for (let c = 0; c < 3; c++) out[c] = a[c] * 0.04;
+    let cnt = 0;
+    for (let j = 0; j < k; j++) {
+      const Lv = v3.sub(LIGHTS[j].p, p), dist = v3.len(Lv);
+      if (dist >= RANGE) continue;
+      cnt++;
+      const q = 1 - (dist / RANGE) * (dist / RANGE), att = q * q;
+      const Ln = v3.scale(Lv, 1 / dist), ndl = v3.dot(n, Ln);
+      if (ndl <= 0) continue;
+      const H = v3.norm(v3.add(Ln, V)), ndh = Math.max(0, v3.dot(n, H));
+      const sp = Math.pow(ndh, sh) * norm;
+      for (let c = 0; c < 3; c++) out[c] += LIGHTS[j].c[c] * INTEN * att * ndl * (a[c] * (1 - m) + F0[c] * sp);
+    }
+    return cnt;
+  }
+  const off2 = document.createElement("canvas"); off2.width = GW; off2.height = GH;
+  const offCtx = off2.getContext("2d");
+  const img2 = offCtx ? offCtx.createImageData(GW, GH) : null;
+  const S2 = { ch: "lit", k: 6, hover: null, playing: false, acc: 0, dirty: true };
+  function buildImage() {
+    if (!img2) return;
+    const D = img2.data, o = [0, 0, 0];
+    for (let i = 0; i < NP; i++) {
+      let r = 0, g = 0, b = 0;
+      if (gMsk[i]) {
+        switch (S2.ch) {
+          case "alb": r = toSRGB(gAlb[i * 3]); g = toSRGB(gAlb[i * 3 + 1]); b = toSRGB(gAlb[i * 3 + 2]); break;
+          case "nrm": r = gNrm[i * 3] * 0.5 + 0.5; g = gNrm[i * 3 + 1] * 0.5 + 0.5; b = gNrm[i * 3 + 2] * 0.5 + 0.5; break;
+          case "dep": { const t = 1 - (gDep[i] - dMin) / (dMax - dMin); r = g = b = 0.1 + 0.9 * t; break; }
+          case "rm": r = gRgh[i]; g = gMet[i]; b = 0; break;
+          default: shadePx(i, S2.k, o); r = toSRGB(o[0]); g = toSRGB(o[1]); b = toSRGB(o[2]);
+        }
+      }
+      D[i * 4] = r * 255; D[i * 4 + 1] = g * 255; D[i * 4 + 2] = b * 255; D[i * 4 + 3] = 255;
+    }
+    offCtx.putImageData(img2, 0, 0);
+    S2.dirty = false;
+  }
+  function projectCam(p) {
+    const rel = v3.sub(p, EYE), z = v3.dot(rel, CF);
+    return { x: (v3.dot(rel, CR) / (z * TN * ASP) * 0.5 + 0.5) * GW, y: (0.5 - v3.dot(rel, CU) / (z * TN) * 0.5) * GH, z };
+  }
+  const hud2 = document.getElementById("gb-hud");
+  function fit2(w, h) { const sc = Math.min(w / GW, h / GH); return { sc, ox: (w - GW * sc) / 2, oy: (h - GH * sc) / 2 }; }
+  const v2 = RP.canvas("#gb-cv", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    if (!img2) { ctx.fillStyle = c.muted; ctx.fillText("2D canvas unavailable", 20, 30); return; }
+    if (S2.dirty) buildImage();
+    const { sc, ox, oy } = fit2(w, h);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(off2, ox, oy, GW * sc, GH * sc);
+    if (S2.ch === "lit") {
+      for (let j = 0; j < S2.k; j++) {
+        const pr = projectCam(LIGHTS[j].p);
+        const x = ox + pr.x * sc, y = oy + pr.y * sc;
+        const col = rgb2css(LIGHTS[j].c, 1);
+        if (j === S2.k - 1) {
+          const rad = RANGE / (pr.z * TN) * 0.5 * GH * sc;
+          ctx.save(); ctx.setLineDash([6, 5]); ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+          ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+        }
+        ctx.fillStyle = col; ctx.strokeStyle = "#000"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
+    }
+    const names = { alb: "Albedo (RGB8, shown in sRGB)", nrm: "Normal (world, n·0.5+0.5)", dep: `Depth (view z, ${dMin.toFixed(1)}–${dMax.toFixed(1)} m, near = bright)`, rm: "Roughness (R) / metalness (G)", lit: `Lighting pass: ${S2.k}/6 lights accumulated` };
+    let txt = names[S2.ch];
+    if (S2.hover != null && gMsk[S2.hover]) {
+      const i = S2.hover, o = [0, 0, 0], cnt = shadePx(i, 6, o);
+      const f = (v) => v.toFixed(2);
+      txt += `\nalbedo  ${f(gAlb[i * 3])} ${f(gAlb[i * 3 + 1])} ${f(gAlb[i * 3 + 2])}\nnormal  ${f(gNrm[i * 3])} ${f(gNrm[i * 3 + 1])} ${f(gNrm[i * 3 + 2])}\ndepth   ${gDep[i].toFixed(2)} m\nrough ${f(gRgh[i])} metal ${f(gMet[i])}\nlights in range: ${cnt}/6`;
+    }
+    hud2.textContent = txt;
+  });
+  RP.drag(v2.el, {
+    down: () => false,
+    hover(x, y) {
+      const { sc, ox, oy } = fit2(v2.w, v2.h);
+      const px = Math.floor((x - ox) / sc), py = Math.floor((y - oy) / sc);
+      S2.hover = px >= 0 && py >= 0 && px < GW && py < GH ? py * GW + px : null;
+      v2.draw();
+    },
+  });
+  v2.el.addEventListener("pointerleave", () => { S2.hover = null; v2.draw(); });
+  const gbK = RP.slider("#gb-k", (v) => { S2.k = v; S2.dirty = true; v2.draw(); });
+  const gbCh = RP.toggleGroup("#gb-ch", (v) => { S2.ch = v; S2.dirty = true; v2.draw(); });
+  const play2 = document.getElementById("gb-play");
+  const anim2 = RP.loop(v2.el, (t, dt) => {
+    if (!S2.playing) return;
+    S2.acc += dt;
+    if (S2.acc > 0.85) { S2.acc = 0; gbK.value = S2.k >= 6 ? 0 : S2.k + 1; }
+  });
+  anim2.stop();
+  play2.addEventListener("click", () => {
+    S2.playing = !S2.playing;
+    if (S2.playing) { S2.acc = 0; gbK.value = 0; gbCh.set("lit"); anim2.start(); } else anim2.stop();
+    play2.textContent = S2.playing ? "❚❚ Pause lighting pass" : "▶ Play lighting pass";
+    play2.setAttribute("aria-pressed", String(S2.playing));
+  });
+
+  /* =================== STEP 3: tiled / clustered =================== */
+  const S3 = { tile: 48, slices: 8, mode: "tiled", hover: null, sel: null, lights: [], drag: null };
+  (function () {
+    const r = rng(21);
+    for (let i = 0; i < 10; i++) S3.lights.push({ x: 0.1 + 0.8 * r(), y: 0.12 + 0.76 * r(), z: 0.08 + 0.85 * r(), R: 0.06 + 0.08 * r() });
+  })();
+  const LCOL = ["vtx", "ras", "frag", "out", "good", "warn", "bad", "accent", "vtx", "ras"];
+  const SIDE_PAD = 26;
+  function sliceEdges() {
+    const S = S3.mode === "tiled" ? 1 : S3.slices, n = 0.03, e = [0];
+    for (let k = 1; k <= S; k++) e.push(n * Math.pow(1 / n, k / S));
+    e[S] = 1;
+    return e;
+  }
+  function buildClusters(w1, h1) {
+    const T = S3.tile, tw = Math.ceil(w1 / T), th = Math.ceil(h1 / T), E = sliceEdges(), S = E.length - 1;
+    const lists = [];
+    for (let ty = 0; ty < th; ty++) {
+      const row = [];
+      for (let tx = 0; tx < tw; tx++) {
+        const cell = [];
+        for (let s = 0; s < S; s++) {
+          const L = [];
+          S3.lights.forEach((l, i) => {
+            if (!circleRect(l.x * w1, l.y * h1, l.R * h1, tx * T, ty * T, tx * T + T, ty * T + T)) return;
+            if (l.z + l.R < E[s] || l.z - l.R > E[s + 1]) return;
+            L.push(i);
+          });
+          cell.push(L);
+        }
+        row.push(cell);
+      }
+      lists.push(row);
+    }
+    return { T, tw, th, E, S, lists };
+  }
+  let CL = null;
+  const hud3 = document.getElementById("cl-hud"), hud3s = document.getElementById("cl-side-hud");
+  const v3a = RP.canvas("#cl-cv", (s) => {
+    const { ctx, w, h, c } = s;
+    CL = buildClusters(w, h);
+    const { T, tw, th, S, lists } = CL;
+    if (!S3.hover) S3.hover = [Math.min(tw - 1, Math.floor(S3.lights[0].x * w / T)), Math.min(th - 1, Math.floor(S3.lights[0].y * h / T))];
+    S3.hover[0] = Math.min(S3.hover[0], tw - 1); S3.hover[1] = Math.min(S3.hover[1], th - 1);
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const countOf = (cell) => {
+      if (S3.mode === "tiled") return cell[0].length;
+      if (S3.sel != null && S3.sel < S) return cell[S3.sel].length;
+      return Math.max(...cell.map((l) => l.length));
+    };
+    let mx = 1;
+    for (const row of lists) for (const cell of row) mx = Math.max(mx, countOf(cell));
+    ctx.font = "10px " + getComputedStyle(document.body).getPropertyValue("--font-mono");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (let ty = 0; ty < th; ty++) for (let tx = 0; tx < tw; tx++) {
+      const n = countOf(lists[ty][tx]);
+      if (n) { ctx.fillStyle = heat(c, n / mx, 0.2 + 0.45 * n / mx); ctx.fillRect(tx * T, ty * T, T, T); }
+      if (n && T >= 32) { ctx.fillStyle = c.ink; ctx.fillText(String(n), tx * T + T / 2, ty * T + T / 2); }
+    }
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x = T; x < w; x += T) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, h); }
+    for (let y = T; y < h; y += T) { ctx.moveTo(0, y + 0.5); ctx.lineTo(w, y + 0.5); }
+    ctx.stroke();
+    const [hx, hy] = S3.hover;
+    const cell = lists[hy][hx];
+    const tileSet = new Set(); cell.forEach((l) => l.forEach((i) => tileSet.add(i)));
+    S3.lights.forEach((l, i) => {
+      const col = c[LCOL[i]], on = tileSet.has(i);
+      ctx.fillStyle = alpha(col, on ? 0.16 : 0.06); ctx.strokeStyle = alpha(col, on ? 0.95 : 0.4); ctx.lineWidth = on ? 2 : 1;
+      ctx.beginPath(); ctx.arc(l.x * w, l.y * h, l.R * h, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(l.x * w, l.y * h, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = c.paper; ctx.font = "bold 8px sans-serif"; ctx.fillText(String(i), l.x * w, l.y * h + 0.5);
+    });
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.strokeRect(hx * T + 1, hy * T + 1, T - 2, T - 2);
+    const tileList = [...tileSet].sort((a, b) => a - b);
+    let totalT = 0, nonEmpty = 0, maxL = 0;
+    for (const row of lists) for (const cl of row) for (const l of cl) { totalT += l.length; if (l.length) nonEmpty++; maxL = Math.max(maxL, l.length); }
+    hud3.textContent = `${tw}×${th} tiles${S3.mode === "clustered" ? ` × ${S} slices = ${tw * th * S} clusters` : ""}\nhovered tile (${hx},${hy}): ${tileList.length ? "L" + tileList.join(" L") : "no lights"}\navg list ${nonEmpty ? (totalT / nonEmpty).toFixed(1) : 0} · longest ${maxL}`;
+    if (v3b) v3b.draw();
+  });
+  const v3b = RP.canvas("#cl-side", (s) => {
+    const { ctx, w, h, c } = s;
+    if (!CL || !v3a.h) return;
+    const { T, th, E, S, lists } = CL;
+    const h1 = v3a.h, w1 = v3a.w;
+    const X = (z) => SIDE_PAD + z * (w - SIDE_PAD - 10), Y = (y) => (y / h1) * h;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const [hx, hy] = S3.hover;
+    const col = lists.map((row) => row[hx]);
+    let mx = 1; col.forEach((cell) => cell.forEach((l) => { mx = Math.max(mx, l.length); }));
+    for (let ty = 0; ty < th; ty++) for (let si = 0; si < S; si++) {
+      const n = col[ty][si].length, x0 = X(E[si]), x1 = X(E[si + 1]), y0 = Y(ty * T), y1 = Y(Math.min(h1, ty * T + T));
+      if (n) { ctx.fillStyle = heat(c, n / mx, 0.15 + 0.4 * n / mx); ctx.fillRect(x0, y0, x1 - x0, y1 - y0); }
+    }
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.beginPath();
+    for (let si = 0; si <= S; si++) { const x = Math.round(X(E[si])) + 0.5; ctx.moveTo(x, 0); ctx.lineTo(x, h); }
+    for (let ty = 1; ty < th; ty++) { const y = Math.round(Y(ty * T)) + 0.5; ctx.moveTo(SIDE_PAD, y); ctx.lineTo(w - 10, y); }
+    ctx.stroke();
+    ctx.strokeStyle = c.ink; ctx.lineWidth = 2;
+    if (S3.mode === "clustered" && S3.sel != null && S3.sel < S) {
+      ctx.strokeRect(X(E[S3.sel]) + 1, Y(hy * T) + 1, X(E[S3.sel + 1]) - X(E[S3.sel]) - 2, Y(Math.min(h1, hy * T + T)) - Y(hy * T) - 2);
+    } else ctx.strokeRect(SIDE_PAD + 1, Y(hy * T) + 1, w - SIDE_PAD - 12, Y(Math.min(h1, hy * T + T)) - Y(hy * T) - 2);
+    const x0c = hx * T, x1c = hx * T + T;
+    S3.lights.forEach((l, i) => {
+      const inCol = l.x * w1 + l.R * h1 >= x0c && l.x * w1 - l.R * h1 <= x1c;
+      const cc = c[LCOL[i]];
+      ctx.fillStyle = alpha(cc, inCol ? 0.16 : 0.04); ctx.strokeStyle = alpha(cc, inCol ? 0.95 : 0.3); ctx.lineWidth = inCol ? 1.8 : 1;
+      ctx.beginPath(); ctx.ellipse(X(l.z), Y(l.y * h1), l.R * (w - SIDE_PAD - 10), l.R * h, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = cc; ctx.beginPath(); ctx.arc(X(l.z), Y(l.y * h1), 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = c.paper; ctx.font = "bold 8px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(String(i), X(l.z), Y(l.y * h1) + 0.5);
+    });
+    ctx.fillStyle = c.muted; ctx.font = "10px sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.save(); ctx.translate(12, h - 8); ctx.rotate(-Math.PI / 2); ctx.fillText("eye · near → far", 0, 0); ctx.restore();
+    const cell = lists[hy][hx];
+    let txt;
+    if (S3.mode === "tiled") {
+      txt = `tile column ${hx}: one list for ALL depths\nrow ${hy}: ${cell[0].length ? "L" + cell[0].join(" L") : "—"}`;
+    } else {
+      const lines = [];
+      for (let si = 0; si < S; si++) if (cell[si].length) lines.push(`s${si}: L${cell[si].join(" L")}`);
+      txt = `tile (${hx},${hy}) per depth slice${S3.sel != null ? ` · picked s${S3.sel}` : ""}\n` + (lines.length ? lines.slice(0, 7).join("\n") + (lines.length > 7 ? "\n…" : "") : "all clusters empty");
+    }
+    hud3s.textContent = txt;
+  });
+  function pickLight3(x, y, side) {
+    const w1 = v3a.w, h1 = v3a.h, w2 = v3b.w, h2 = v3b.h;
+    for (let i = S3.lights.length - 1; i >= 0; i--) {
+      const l = S3.lights[i];
+      const px = side ? SIDE_PAD + l.z * (w2 - SIDE_PAD - 10) : l.x * w1, py = side ? l.y * h2 : l.y * h1;
+      if (Math.hypot(px - x, py - y) < 14) return i;
+    }
+    return -1;
+  }
+  function hoverTile(x, y) {
+    if (!CL) return;
+    S3.hover = [clamp(Math.floor(x / CL.T), 0, CL.tw - 1), clamp(Math.floor(y / CL.T), 0, CL.th - 1)];
+  }
+  RP.drag(v3a.el, {
+    down(x, y) { const i = pickLight3(x, y, false); if (i < 0) { hoverTile(x, y); v3a.draw(); return false; } S3.drag = i; },
+    move(x, y) { const l = S3.lights[S3.drag]; l.x = clamp(x / v3a.w, 0.02, 0.98); l.y = clamp(y / v3a.h, 0.02, 0.98); hoverTile(x, y); v3a.draw(); },
+    up() { S3.drag = null; },
+    hover(x, y) { hoverTile(x, y); v3a.draw(); },
+  });
+  RP.drag(v3b.el, {
+    down(x, y) { const i = pickLight3(x, y, true); if (i < 0) { sideHover(x, y); return false; } S3.drag = i; },
+    move(x, y) { const l = S3.lights[S3.drag]; l.z = clamp((x - SIDE_PAD) / (v3b.w - SIDE_PAD - 10), 0.02, 0.98); l.y = clamp(y / v3b.h, 0.02, 0.98); v3a.draw(); },
+    up() { S3.drag = null; },
+    hover(x, y) { sideHover(x, y); },
+  });
+  function sideHover(x, y) {
+    if (!CL) return;
+    const z = (x - SIDE_PAD) / (v3b.w - SIDE_PAD - 10);
+    let si = null;
+    if (S3.mode === "clustered" && z >= 0 && z <= 1) for (let k = 0; k < CL.S; k++) if (z >= CL.E[k] && z <= CL.E[k + 1]) si = k;
+    S3.sel = si;
+    S3.hover = [S3.hover[0], clamp(Math.floor((y / v3b.h) * v3a.h / CL.T), 0, CL.th - 1)];
+    v3a.draw();
+  }
+  v3b.el.addEventListener("pointerleave", () => { if (S3.sel != null) { S3.sel = null; v3a.draw(); } });
+  RP.toggleGroup("#cl-mode", (v) => { S3.mode = v; S3.sel = null; v3a.draw(); });
+  RP.slider("#cl-tile", (v) => { S3.tile = v; v3a.draw(); });
+  RP.slider("#cl-sl", (v) => { S3.slices = v; S3.sel = null; v3a.draw(); });
+
+  /* =================== STEP 4: shadow mapping =================== */
+  const S4 = { res: 48, bias: 0, pcf: 0, L: [0.1, 0.26], hx: null, drag: false };
+  function geo4(w, h) {
+    const gy = h * 0.86, ry = gy - h * 0.13;
+    const ground = [[0, gy], [w * 0.58, gy], [w * 0.8, ry], [w, ry]];
+    const b1 = { x0: w * 0.27, x1: w * 0.34, y0: gy - h * 0.24, y1: gy };
+    const b2 = { x0: w * 0.44, x1: w * 0.54, y0: gy - h * 0.5, y1: gy - h * 0.44 };
+    const segs = [];
+    for (let i = 0; i < ground.length - 1; i++) segs.push([ground[i][0], ground[i][1], ground[i + 1][0], ground[i + 1][1]]);
+    for (const b of [b1, b2]) segs.push([b.x0, b.y0, b.x1, b.y0], [b.x1, b.y0, b.x1, b.y1], [b.x1, b.y1, b.x0, b.y1], [b.x0, b.y1, b.x0, b.y0]);
+    return { gy, ground, b1, b2, segs };
+  }
+  function groundY(G, x) {
+    const p = G.ground;
+    for (let i = 0; i < p.length - 1; i++) if (x >= p[i][0] && x <= p[i + 1][0]) return lerp(p[i][1], p[i + 1][1], (x - p[i][0]) / (p[i + 1][0] - p[i][0]));
+    return p[p.length - 1][1];
+  }
+  function raySegs(ox, oy, dx, dy, segs) {
+    let best = Infinity;
+    for (const [ax, ay, bx, by] of segs) {
+      const ex = bx - ax, ey = by - ay, den = dx * ey - dy * ex;
+      if (Math.abs(den) < 1e-9) continue;
+      const qx = ax - ox, qy = ay - oy;
+      const t = (qx * ey - qy * ex) / den, u = (qx * dy - qy * dx) / den;
+      if (t > 1e-6 && u >= 0 && u <= 1 && t < best) best = t;
+    }
+    return best;
+  }
+  const hud4 = document.getElementById("sm-hud");
+  const FOV4 = 1.9;
+  const v4 = RP.canvas("#sm-cv", (s) => {
+    const { ctx, w, h, c } = s;
+    const G = geo4(w, h), R = S4.res;
+    const lx = S4.L[0] * w, ly = S4.L[1] * h;
+    const aim = Math.atan2(G.gy - ly, w * 0.55 - lx), a0 = aim - FOV4 / 2;
+    const map = new Float32Array(R), hits = [];
+    const dMaxV = Math.hypot(w, h);
+    for (let i = 0; i < R; i++) {
+      const a = a0 + ((i + 0.5) / R) * FOV4, dx = Math.cos(a), dy = Math.sin(a);
+      const t = Math.min(raySegs(lx, ly, dx, dy, G.segs), dMaxV);
+      map[i] = t; hits.push([lx + dx * t, ly + dy * t]);
+    }
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    // lit cone
+    ctx.fillStyle = alpha(c.vtx, 0.1); ctx.beginPath(); ctx.moveTo(lx, ly);
+    for (const p of hits) ctx.lineTo(p[0], p[1]);
+    ctx.closePath(); ctx.fill();
+    if (R <= 96) {
+      ctx.strokeStyle = alpha(c.vtx, R <= 48 ? 0.35 : 0.18); ctx.lineWidth = 1; ctx.beginPath();
+      for (const p of hits) { ctx.moveTo(lx, ly); ctx.lineTo(p[0], p[1]); }
+      ctx.stroke();
+    }
+    // ground + boxes
+    ctx.fillStyle = c.surface; ctx.strokeStyle = c.muted; ctx.lineWidth = 1.2; ctx.beginPath();
+    ctx.moveTo(0, h); G.ground.forEach((p) => ctx.lineTo(p[0], p[1])); ctx.lineTo(w, h); ctx.closePath(); ctx.fill(); ctx.stroke();
+    for (const b of [G.b1, G.b2]) {
+      ctx.fillStyle = c.surface; ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5;
+      ctx.fillRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0); ctx.strokeRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+    }
+    // receivers on the ground
+    const K = S4.pcf;
+    const test = (x, y) => {
+      const dx = x - lx, dy = y - ly, dist = Math.hypot(dx, dy);
+      let rel = Math.atan2(dy, dx) - a0;
+      while (rel > Math.PI) rel -= 2 * Math.PI;
+      while (rel < -Math.PI) rel += 2 * Math.PI;
+      const u = (rel / FOV4) * R;
+      if (u < 0 || u >= R) return { lit: 0, outside: true, dist };
+      const i = Math.floor(u);
+      let sum = 0, n = 0;
+      for (let j = i - K; j <= i + K; j++) { const jj = clamp(j, 0, R - 1); sum += dist - S4.bias <= map[jj] ? 1 : 0; n++; }
+      return { lit: sum / n, i, dist, outside: false };
+    };
+    const LIT = [0.96, 0.72, 0.18], SHD = [0.2, 0.24, 0.33];
+    for (let x = 1; x < w; x += 2) {
+      if (x > G.b1.x0 && x < G.b1.x1) continue;
+      const y = groundY(G, x), r = test(x, y);
+      ctx.fillStyle = rgb2css([lerp(SHD[0], LIT[0], r.lit), lerp(SHD[1], LIT[1], r.lit), lerp(SHD[2], LIT[2], r.lit)], 1);
+      ctx.fillRect(x - 1, y - 2.5, 2.2, 5);
+    }
+    // shadow map strip
+    const sx0 = 10, sx1 = w - 10, sy = 24, sh = 16, cw = (sx1 - sx0) / R;
+    ctx.fillStyle = c.muted; ctx.font = "11px sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.fillText(`Shadow map: ${R} texels of depth seen from the light (dark = near)`, sx0, 17);
+    let mn = Infinity, mxd = 0; for (const d of map) { mn = Math.min(mn, d); mxd = Math.max(mxd, d); }
+    for (let i = 0; i < R; i++) {
+      const t = (map[i] - mn) / Math.max(1, mxd - mn);
+      ctx.fillStyle = rgb2css(mixHex(c.ink, c.paper, 0.15 + 0.8 * t), 1);
+      ctx.fillRect(sx0 + i * cw, sy, Math.max(1, cw - (cw > 4 ? 1 : 0)), sh);
+    }
+    ctx.strokeStyle = c.line; ctx.strokeRect(sx0 - 0.5, sy - 0.5, sx1 - sx0 + 1, sh + 1);
+    // light
+    ctx.fillStyle = c.vtx; ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(lx, ly, 9, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = c.ink; ctx.font = "11px sans-serif"; ctx.textAlign = "center"; ctx.fillText("light (drag)", lx, ly - 15);
+    // hover probe
+    let txt = `bias ${S4.bias.toFixed(1)} px · ${K ? `PCF ${2 * K + 1} taps` : "single tap"}`;
+    if (S4.hx != null && !(S4.hx > G.b1.x0 && S4.hx < G.b1.x1)) {
+      const x = S4.hx, y = groundY(G, x), r = test(x, y);
+      ctx.save(); ctx.setLineDash([5, 4]); ctx.strokeStyle = c.accent; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(x, y); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+      if (r.outside) txt += `\nprobe is outside the light's cone`;
+      else {
+        ctx.strokeStyle = c.accent; ctx.lineWidth = 2; ctx.strokeRect(sx0 + r.i * cw - 1, sy - 2, Math.max(3, cw) + 2, sh + 4);
+        const hp = hits[r.i]; ctx.fillStyle = c.accent; ctx.beginPath(); ctx.arc(hp[0], hp[1], 3, 0, Math.PI * 2); ctx.fill();
+        const shadowed = r.dist - S4.bias > map[r.i];
+        txt += `\nreceiver depth  ${r.dist.toFixed(1)}\nmap[${r.i}]        ${map[r.i].toFixed(1)}\n${r.dist.toFixed(1)} − ${S4.bias.toFixed(1)} ${shadowed ? ">" : "≤"} ${map[r.i].toFixed(1)} → ${shadowed ? "SHADOW" : "LIT"}` + (K ? `\nPCF lit fraction ${(r.lit * 100).toFixed(0)}%` : "");
+      }
+    } else txt += "\nhover the ground to probe";
+    hud4.textContent = txt;
+  });
+  RP.drag(v4.el, {
+    down(x, y) {
+      if (Math.hypot(x - S4.L[0] * v4.w, y - S4.L[1] * v4.h) < 20) { S4.drag = true; return; }
+      S4.hx = x; v4.draw(); return false;
+    },
+    move(x, y) { S4.L = [clamp(x / v4.w, 0.03, 0.97), clamp(y / v4.h, 0.14, 0.62)]; v4.draw(); },
+    up() { S4.drag = false; },
+    hover(x) { S4.hx = x; v4.draw(); },
+  });
+  v4.el.addEventListener("pointerleave", () => { S4.hx = null; v4.draw(); });
+  RP.slider("#sm-res", (v) => { S4.res = v; v4.draw(); });
+  RP.slider("#sm-bias", (v) => { S4.bias = v; v4.draw(); }, { fmt: (v) => v.toFixed(1) });
+  RP.toggleGroup("#sm-pcf", (v) => { S4.pcf = parseInt(v, 10); v4.draw(); });
+
+  /* =================== STEP 5: cascades =================== */
+  const S5 = { lam: 0.6, n: 4, sun: 35 };
+  const NEAR = 0.5, FAR = 100, HALF = 20 * Math.PI / 180, MAPRES = 2048;
+  const hud5 = document.getElementById("csm-hud");
+  const v5 = RP.canvas("#csm-cv", (s) => {
+    const { ctx, w, h, c } = s;
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const tn = Math.tan(HALF);
+    const sc = Math.min((w - 60) / FAR, (h - 30) / (2 * FAR * tn));
+    const cx = 30, cy = h / 2;
+    const P = (x, y) => [cx + x * sc, cy - y * sc];
+    const n = S5.n, splits = [];
+    for (let i = 0; i <= n; i++) {
+      const uni = NEAR + (FAR - NEAR) * i / n, lg = NEAR * Math.pow(FAR / NEAR, i / n);
+      splits.push(S5.lam * lg + (1 - S5.lam) * uni);
+    }
+    const cols = ["vtx", "ras", "frag", "out"];
+    const th = S5.sun * Math.PI / 180, dir = [Math.cos(th), Math.sin(th)], perp = [-dir[1], dir[0]];
+    const lines = [];
+    for (let i = 0; i < n; i++) {
+      const a = splits[i], b = splits[i + 1];
+      const pts = [[a, -a * tn], [b, -b * tn], [b, b * tn], [a, a * tn]];
+      const col = c[cols[i]];
+      ctx.fillStyle = alpha(col, 0.3); ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+      ctx.beginPath(); pts.forEach((p, k) => { const q = P(p[0], p[1]); if (k) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]); }); ctx.closePath(); ctx.fill(); ctx.stroke();
+      // light-space bounding box
+      let u0 = Infinity, u1 = -Infinity, w0 = Infinity, w1 = -Infinity;
+      for (const p of pts) { const u = p[0] * perp[0] + p[1] * perp[1], v = p[0] * dir[0] + p[1] * dir[1]; u0 = Math.min(u0, u); u1 = Math.max(u1, u); w0 = Math.min(w0, v); w1 = Math.max(w1, v); }
+      const corner = (u, v) => P(u * perp[0] + v * dir[0], u * perp[1] + v * dir[1]);
+      ctx.save(); ctx.setLineDash([5, 4]); ctx.strokeStyle = col; ctx.lineWidth = 1.2; ctx.beginPath();
+      [[u0, w0], [u1, w0], [u1, w1], [u0, w1]].forEach((q, k) => { const p = corner(q[0], q[1]); if (k) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); });
+      ctx.closePath(); ctx.stroke(); ctx.restore();
+      const width = u1 - u0, texel = width / MAPRES * 100;
+      lines.push(`C${i + 1} ${a.toFixed(1)}–${b.toFixed(1)} m · map ${width.toFixed(1)} m wide · texel ≈ ${texel < 1 ? texel.toFixed(2) : texel.toFixed(1)} cm`);
+      const lp = P(b, b * tn);
+      ctx.fillStyle = c.ink; ctx.font = "10px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+      if (i < n - 1) ctx.fillText(b.toFixed(1) + " m", lp[0], lp[1] - 3);
+    }
+    // camera
+    ctx.fillStyle = c.ink; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.font = "11px sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.fillText("camera", cx - 22, cy + 8);
+    // sun arrow
+    const ax = w - 50, ay = h - 50, L = 30;
+    const sx = ax - dir[0] * L, sy = ay + dir[1] * L, ex = ax + dir[0] * L, ey = ay - dir[1] * L;
+    ctx.strokeStyle = c.warn; ctx.fillStyle = c.warn; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+    const ang = Math.atan2(ey - sy, ex - sx);
+    ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(ex - 9 * Math.cos(ang - 0.45), ey - 9 * Math.sin(ang - 0.45)); ctx.lineTo(ex - 9 * Math.cos(ang + 0.45), ey - 9 * Math.sin(ang + 0.45)); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx, sy, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillStyle = c.muted; ctx.fillText("sun light", ax, ay + 34 > h - 14 ? h - 14 : ay + 34);
+    hud5.textContent = `near ${NEAR} m · far ${FAR} m · λ = ${S5.lam.toFixed(2)}\n` + lines.join("\n");
+  });
+  RP.slider("#csm-l", (v) => { S5.lam = v; v5.draw(); });
+  RP.slider("#csm-n", (v) => { S5.n = v; v5.draw(); });
+  RP.slider("#csm-sun", (v) => { S5.sun = v; v5.draw(); }, { fmt: (v) => v + "°" });
+})();
+</script>
+</body>
+</html>

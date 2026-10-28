@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rasterization & Depth · Render Pipeline</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .viz-stage canvas#edge, .viz-stage canvas#fill { cursor: crosshair; }
+  .btn-row .btn[disabled] { opacity: 0.5; cursor: default; }
+  .viz + .viz { margin-top: 4px; }
+  .swatch-legend i.v0 { background: var(--vtx); }
+  .swatch-legend i.v1 { background: var(--ras); }
+  .swatch-legend i.v2 { background: var(--frag); }
+  .legend i.e0 { background: var(--vtx); }
+  .legend i.e1 { background: var(--frag); }
+  .legend i.e2 { background: var(--out); }
+  .legend i.in { background: var(--ras); }
+  .legend i.bb { background: var(--warn); }
+  .legend i.bad { background: var(--bad); }
+  .legend i.a { background: var(--vtx); }
+  .legend i.b { background: var(--frag); }
+  .legend i.t { background: var(--ras); }
+</style>
+</head>
+<body data-topic="02">
+<header class="topbar"><div class="topbar-inner"></div></header>
+<main class="lesson">
+  <section class="hero">
+    <p class="eyebrow">Chapter 02 · Foundations</p>
+    <h1>Rasterization & Depth</h1>
+    <p class="lede">After the vertex stage, a triangle is just three points on the screen. The rasterizer works out exactly which pixels it covers, blends the vertex data across them, and, with the depth buffer, decides which surface you actually see.</p>
+    <div class="stage-band"><span class="app">Application</span><span class="vtx">Vertex</span><span class="on ras">Rasterize</span><span class="frag">Fragment</span><span class="out">Output</span></div>
+  </section>
+
+  <aside class="objectives"><h2>You'll learn</h2><ul>
+    <li>How primitive assembly and clipping (especially against the near plane) prepare triangles for rasterizing</li>
+    <li>How three <em>edge functions</em> decide whether a pixel center is inside a triangle, and why GPUs test a bounding box</li>
+    <li>Why pixel centers sit at half-integers, and how the <em>top-left fill rule</em> stops shared edges being drawn twice</li>
+    <li>What barycentric coordinates are and how they interpolate colors, UVs and depth</li>
+    <li>Why the painter's algorithm fails and how the z-buffer, the depth test and early-z fix it</li>
+  </ul></aside>
+
+  <!-- STEP 1 -->
+  <section class="step" id="coverage">
+    <h2><span class="step-no">STEP 1</span>From three vertices to a set of pixels</h2>
+    <p>The vertex shader outputs one position per vertex in <em>clip space</em> (chapter 01). <strong>Primitive assembly</strong> then groups those vertices into primitives: every three indices of a triangle list form one triangle. Each triangle goes through a few checks before any pixel is touched.</p>
+    <p>The first check is <strong>clipping</strong>. A point is inside the view volume when <code>−w ≤ x, y, z ≤ w</code> in clip space. The side planes are easy to handle, but the <strong>near plane</strong> is essential. For a perspective camera, <code>w = −z<sub>view</sub></code>, the distance in front of the camera. A vertex behind the camera has <code>w ≤ 0</code>, and dividing by it flips the signs of <code>x/w</code> and <code>y/w</code>. That vertex lands on the <em>wrong side</em> of the screen and the triangle smears across the view. So the triangle is cut against <code>z = −w</code> (the near plane) <em>before</em> the perspective divide. Cutting one corner off a triangle leaves a quadrilateral, which is split back into two triangles.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="clip" aria-label="Top-down view of camera space with a camera, its 90 degree frustum and the near plane. A draggable triangle is clipped against the near plane; a strip at the bottom shows where the vertices project on screen, including the viewport and a guard band."></canvas><div class="hud" id="clip-hud"></div></div>
+      <div class="controls">
+        <div class="legend"><span><i class="t"></i>clipped polygon</span><span><i class="bad"></i>vertex behind camera (w ≤ 0)</span><span><i class="bb"></i>guard band</span></div>
+        <div class="btn-row"><button class="btn" id="clip-reset" type="button">Reset triangle</button></div>
+      </div>
+      <figcaption><b>Try it:</b> this is camera space seen from above, with the camera looking up the screen (−Z). Drag a vertex below the camera. In the strip at the bottom, its naive projection <code>x/w</code> jumps to the opposite side, while the clipped polygon (teal) still projects correctly.</figcaption>
+    </figure>
+    <p>Clipping against the four side planes is more expensive than it is useful, so many GPUs use a <strong>guard band</strong>: a region much larger than the viewport where the rasterizer can still work with its fixed-point math. A triangle that pokes outside the viewport but stays inside the guard band is not cut up. The rasterizer simply never visits the pixels outside the viewport (a scissor test). Only triangles that cross the near plane, or reach past the guard band, need real geometric clipping.</p>
+    <p>After clipping comes the perspective divide, the viewport transform and <strong>triangle setup</strong>. Setup computes everything the rasterizer needs per triangle: the edge equations, the bounding box and the triangle's signed area. The sign of the area gives the winding, which is what <em>back-face culling</em> uses to drop triangles that face away. Then the rasterizer answers one question for every pixel in the bounding box: is the pixel's center inside the triangle?</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="cov" class="tall" aria-label="A magnified pixel grid with a draggable triangle. Pixels whose centers are inside the triangle are filled teal; the bounding box of candidate pixels is outlined."></canvas><div class="hud" id="cov-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="cov-grid">Pixels across (short side) <output for="cov-grid"></output></label><input type="range" id="cov-grid" min="6" max="40" value="14"></div>
+        <div class="btn-row" id="cov-samp" aria-label="Sample points"><button class="btn" data-value="on" aria-pressed="true">Sample points on</button><button class="btn" data-value="off">Off</button></div>
+        <div class="btn-row" id="cov-box" aria-label="Bounding box"><button class="btn" data-value="on" aria-pressed="true">Bounding box on</button><button class="btn" data-value="off">Off</button></div>
+      </div>
+      <figcaption><b>Try it:</b> drag the three vertices. A pixel lights up only when its <em>center dot</em> is inside the triangle, even if the triangle covers most of the square. Lower the resolution to see how blocky the result gets: this stair-stepping is <em>aliasing</em>.</figcaption>
+    </figure>
+    <div class="callout ras"><strong>Key idea.</strong> A pixel is not covered "a bit". With one sample per pixel, coverage is a yes/no test at a single point, the pixel center. Everything the rasterizer outputs is a set of these yes/no decisions, called <em>fragments</em>.</div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" id="edges">
+    <h2><span class="step-no">STEP 2</span>Edge functions: the inside test</h2>
+    <p>How does a GPU test "is this point inside the triangle" millions of times per frame? It uses one small formula per edge. For a directed edge from <code>a</code> to <code>b</code>, the <strong>edge function</strong> of a point <code>p</code> is a 2D cross product:</p>
+    <div class="math">edge(a, b, p) = (b.x − a.x)·(p.y − a.y) − (b.y − a.y)·(p.x − a.x)
+
+E0(p) = edge(v1, v2, p)     ← the edge opposite v0
+E1(p) = edge(v2, v0, p)     ← the edge opposite v1
+E2(p) = edge(v0, v1, p)     ← the edge opposite v2
+
+inside  ⇔  E0(p) ≥ 0  and  E1(p) ≥ 0  and  E2(p) ≥ 0</div>
+    <p>Each edge function is zero on its edge's line, positive on one side and negative on the other. It is a <em>half-plane</em> test. A triangle is the overlap of three half-planes, so a point is inside exactly when all three functions agree. In screen space, where y points down, the signs above hold for a triangle wound clockwise on screen. For the other winding all three signs flip, so a rasterizer either flips them (or swaps two vertices) during setup, or culls the triangle as a back face.</p>
+    <p>Edge functions are linear in x and y. Stepping one pixel right changes <code>E</code> by the constant <code>−(b.y − a.y)</code>, and stepping one pixel down changes it by <code>(b.x − a.x)</code>. Hardware never recomputes the full formula. It adds constants, and it tests whole blocks of pixels (for example 2×2 "quads" or 8×8 tiles) in parallel.</p>
+    <p>Which pixels get tested? The simplest strategy is the triangle's <strong>bounding box</strong>: visit every pixel between the minimum and maximum x and y of the three vertices. For a thin diagonal triangle most of those tests fail, so real GPUs first reject whole tiles at once, but the per-pixel test is the same.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="edge" class="tall" aria-label="Pixel grid with a triangle. The positive half-plane of each edge function is shaded in that edge's color; a scan cursor can step through the bounding box pixel by pixel showing the inside test."></canvas><div class="hud" id="edge-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row" id="edge-mode" aria-label="Which edge function to show"><button class="btn" data-value="0">E0 ≥ 0</button><button class="btn" data-value="1">E1 ≥ 0</button><button class="btn" data-value="2">E2 ≥ 0</button><button class="btn" data-value="all" aria-pressed="true">All three</button></div>
+        <div class="btn-row"><button class="btn primary" id="scan-play" type="button" aria-pressed="false">▶ Scan box</button><button class="btn" id="scan-step" type="button">Step 1 pixel</button><button class="btn" id="scan-reset" type="button">Reset</button></div>
+        <div class="control"><label for="scan-speed">Scan speed <output for="scan-speed"></output></label><input type="range" id="scan-speed" min="2" max="60" value="10"></div>
+        <div class="legend"><span><i class="e0"></i>E0</span><span><i class="e1"></i>E1</span><span><i class="e2"></i>E2</span><span><i class="in"></i>all ≥ 0 (inside)</span><span><i class="bb"></i>bounding box</span></div>
+      </div>
+      <figcaption><b>Try it:</b> pick one edge to see its positive half-plane, with an arrow pointing to the "+" side. Hover any pixel to read its three values. Press <em>Scan box</em> to watch the rasterizer walk the bounding box: the pixel is kept only when no value is negative.</figcaption>
+    </figure>
+    <div class="callout ras"><strong>Key idea.</strong> "Inside the triangle" means three signs at once. Each edge function is a cheap linear formula, which is why rasterization maps so well onto wide parallel hardware.</div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" id="fill-rule">
+    <h2><span class="step-no">STEP 3</span>Pixel centers and the top-left fill rule</h2>
+    <p>The convention in Direct3D 10+, OpenGL and Vulkan is that pixel <code>(i, j)</code> covers the square from <code>(i, j)</code> to <code>(i+1, j+1)</code>, so its <strong>center</strong> is at <code>(i + 0.5, j + 0.5)</code>. (Direct3D 9 put centers on integers, which was a classic source of half-pixel offset bugs.)</p>
+    <p>Meshes are made of triangles that share edges. If a pixel center falls <em>exactly</em> on a shared edge, the test <code>E ≥ 0</code> passes for both triangles, so that pixel is drawn twice. With blending, the doubled pixel shows up as a visible seam. Switching to a strict <code>E &gt; 0</code> is no better, because then neither triangle draws the pixel and you get a crack.</p>
+    <p>The fix is a tie-break called the <strong>top-left rule</strong>. A pixel center lying exactly on an edge counts as inside only if that edge is a <em>top</em> edge (exactly horizontal, with the rest of the triangle below it) or a <em>left</em> edge (on the triangle's left side). A shared edge is "left" for one of its triangles and "right" for the other, so exactly one of them takes the pixel. In our clockwise, y-down setup, an edge from <code>a</code> to <code>b</code> is top-left when <code>b.y &lt; a.y</code>, or when <code>b.y = a.y</code> and <code>b.x &gt; a.x</code>.</p>
+    <p>Direct3D spells this rule out exactly. OpenGL and Vulkan require only that a pixel on a shared edge be produced exactly once, and in practice GPUs use a top-left-style convention. To make exact ties reliable, vertex positions are snapped to a fixed-point sub-pixel grid first. Direct3D 11, for example, requires 8 bits of sub-pixel precision.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="fill" class="tall" aria-label="Two triangles, amber and magenta, sharing a diagonal edge that passes exactly through pixel centers. Pixels drawn by both triangles are highlighted in red; pixels on the shared edge drawn by neither are outlined."></canvas><div class="hud" id="fill-hud"></div></div>
+      <div class="controls">
+        <div class="btn-row" id="fill-rule-mode" aria-label="Edge tie rule"><button class="btn" data-value="ge" aria-pressed="true">E ≥ 0 (no rule)</button><button class="btn" data-value="tl">Top-left rule</button><button class="btn" data-value="gt">E &gt; 0 (strict)</button></div>
+        <div class="btn-row"><button class="btn" id="fill-reset" type="button">Reset</button></div>
+        <div class="legend"><span><i class="a"></i>amber triangle</span><span><i class="b"></i>magenta triangle</span><span><i class="bad"></i>drawn twice</span><span><i class="bb"></i>missed (crack)</span></div>
+      </div>
+      <figcaption><b>Try it:</b> the shared edge runs through pixel centers. Compare the three rules and watch the counts in the corner. With the top-left rule on, each triangle's top-left edges are drawn solid. Vertices snap to half-pixels so exact ties keep happening as you drag.</figcaption>
+    </figure>
+    <div class="callout ras"><strong>Key idea.</strong> A good rasterizer gives every pixel along a shared edge to exactly one triangle: no gaps, no double hits. That "watertight" property is what lets meshes made of thousands of triangles look like one smooth surface.</div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" id="barycentric">
+    <h2><span class="step-no">STEP 4</span>Barycentric coordinates and interpolation</h2>
+    <p>Covering pixels is only half the job. Each vertex carries data, such as a color, a normal, texture coordinates and a depth, and every fragment needs a value for each of them. The edge functions already computed in Step 2 give us the weights for free. Divide each one by the triangle's total (doubled) area and you get the <strong>barycentric coordinates</strong>:</p>
+    <div class="math">area = edge(v0, v1, v2)                   (twice the triangle's area)
+
+λ0 = E0(p) / area     λ1 = E1(p) / area     λ2 = E2(p) / area
+
+λ0 + λ1 + λ2 = 1
+
+value(p) = λ0·A0 + λ1·A1 + λ2·A2           (A = any vertex attribute)</div>
+    <p>Geometrically, <code>λ0</code> is the area of the small triangle formed by <code>p</code> and the edge opposite <code>v0</code>, divided by the whole area. At <code>v0</code> itself <code>λ0 = 1</code> and the others are 0. On the edge opposite <code>v0</code>, <code>λ0 = 0</code>. Inside the triangle all three weights are between 0 and 1. Outside, at least one is negative, which is exactly the inside test again.</p>
+    <p>For example, at the centroid every <code>λ</code> is <code>1/3</code>, so with red, green and blue vertices the color there is <code>(0.33, 0.33, 0.33)</code>, a dark gray. This screen-space blend is correct for depth (<code>z/w</code> varies linearly across the screen), but texture coordinates and colors on a perspective-projected triangle need <em>perspective-correct</em> interpolation. Chapter 04 shows the fix and the warping you get without it.</p>
+    <figure class="viz">
+      <div class="viz-stage"><canvas id="bary" class="tall" aria-label="A triangle on a pixel grid filled with vertex colors interpolated by barycentric coordinates. Hovering shows the three sub-triangles whose areas are the barycentric weights."></canvas><div class="hud" id="bary-hud"></div></div>
+      <div class="controls">
+        <div class="control"><label for="bary-res">Pixels across (short side) <output for="bary-res"></output></label><input type="range" id="bary-res" min="6" max="60" value="22"></div>
+        <div class="btn-row" id="bary-col" aria-label="Vertex colors"><button class="btn" data-value="rgb" aria-pressed="true">RGB vertices</button><button class="btn" data-value="stage">Stage colors</button></div>
+        <div class="legend swatch-legend"><span><i class="v0"></i>v0 / λ0</span><span><i class="v1"></i>v1 / λ1</span><span><i class="v2"></i>v2 / λ2</span></div>
+      </div>
+      <figcaption><b>Try it:</b> hover inside and outside the triangle. The three shaded sub-triangles are the weights: each one's share of the total area is that vertex's <code>λ</code>. Move outside and one weight turns negative. Drag the vertices to reshape the blend.</figcaption>
+    </figure>
+    <div class="callout ras"><strong>Key idea.</strong> One set of three weights per fragment interpolates <em>every</em> attribute. The rasterizer computes <code>λ0, λ1, λ2</code> once and the fragment shader receives smoothly blended inputs.</div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" id="depth">
+    <h2><span class="step-no">STEP 5</span>Hidden surfaces: painter's algorithm vs the z-buffer</h2>
+    <p>When triangles overlap, which one should a pixel show? The oldest answer is the <strong>painter's algorithm</strong>: sort the triangles by depth and draw the farthest first, so nearer ones paint over them. It breaks in two common cases. Triangles that <em>interpenetrate</em> (one is in front at one end and behind at the other) have no correct order. Three triangles that overlap in a cycle can't be sorted either. And sorting by a single number per triangle, such as its average depth, is often wrong even without either problem.</p>
+    <p>The <strong>z-buffer</strong> (depth buffer) settles visibility per pixel instead of per triangle. Alongside the color buffer it stores one depth value per pixel, cleared to the farthest value, <code>1.0</code>. For each fragment the rasterizer interpolates depth with the barycentric weights. In OpenGL's default depth range, window depth is <code>(z<sub>ndc</sub> + 1) / 2</code>, from 0 at the near plane to 1 at the far plane. Then comes the <strong>depth test</strong>: with the common <code>LESS</code> comparison, the fragment survives only if its depth is smaller than the stored one. A surviving fragment writes its color and its depth. Draw order no longer matters for opaque surfaces.</p>
+    <figure class="viz">
+      <div class="viz-split">
+        <div class="viz-stage"><canvas id="zcol" aria-label="Color buffer of three overlapping triangles: amber, teal and a tilted magenta triangle that interpenetrates the teal one. In painter mode, wrong pixels are marked."></canvas><div class="hud" id="z-hud"></div></div>
+        <div class="viz-stage"><canvas id="zbuf" aria-label="Depth buffer shown in grayscale: dark is near, white is far (cleared to 1.0)."></canvas><span class="pane-label" id="zbuf-label">Depth buffer</span></div>
+      </div>
+      <div class="controls">
+        <div class="btn-row" id="z-mode" aria-label="Visibility method"><button class="btn" data-value="painter">Painter's algorithm</button><button class="btn" data-value="z" aria-pressed="true">Z-buffer</button></div>
+        <div class="btn-row" id="z-order" aria-label="Submission order"><button class="btn" data-value="b2f" aria-pressed="true">Submit back-to-front</button><button class="btn" data-value="f2b">Front-to-back</button></div>
+        <div class="control"><label for="z-a">Amber depth <output for="z-a"></output></label><input type="range" id="z-a" min="0.05" max="0.95" step="0.01" value="0.55"></div>
+        <div class="control"><label for="z-b">Teal depth <output for="z-b"></output></label><input type="range" id="z-b" min="0.05" max="0.95" step="0.01" value="0.35"></div>
+        <div class="control"><label for="z-tilt">Magenta tilt <output for="z-tilt"></output></label><input type="range" id="z-tilt" min="-1" max="1" step="0.01" value="0.8"></div>
+      </div>
+      <figcaption><b>Try it:</b> in <em>Painter's</em> mode, the red-crossed pixels are wrong. The tilted magenta triangle passes through the teal one, so no order of whole triangles is right. Switch to <em>Z-buffer</em> and the intersection line appears. Then compare submission orders and watch how many fragments pass the depth test.</figcaption>
+    </figure>
+    <p>The z-buffer has a cost: every fragment is still rasterized, and in the simplest pipeline it is <em>shaded</em> before its depth is tested, so hidden fragments waste fragment-shader work (<em>overdraw</em>). Modern GPUs run the depth test <strong>before</strong> the fragment shader whenever the result can't change. This is called <strong>early-z</strong>, and it typically requires that the shader not write its own depth or discard fragments. Many GPUs also keep a coarse per-tile depth ("hierarchical Z") to reject whole blocks at once. That's why engines draw opaque objects roughly <em>front-to-back</em>, or render a depth-only <em>pre-pass</em> first. In the demo, <em>Front-to-back</em> lets far fragments fail early.</p>
+    <p>Edges are still jagged at one sample per pixel. <strong>MSAA</strong> runs the coverage test and depth test at several sample points per pixel (4× is common) while running the fragment shader only once per pixel, then averages the samples. Chapter 07 covers it in detail. Transparent surfaces are the one place sorting returns: they're drawn after the opaque ones, back to front, with depth testing on but depth <em>writes</em> usually off.</p>
+    <div class="callout ras"><strong>Key idea.</strong> The z-buffer turns "which surface is in front?" from a global sorting problem into a tiny per-pixel comparison. It handles interpenetration and cycles for free, and early-z makes it cheap.</div>
+  </section>
+
+  <section class="step" id="recap"><h2><span class="step-no">RECAP</span>What to remember</h2>
+    <ul>
+      <li><strong>Primitive assembly</strong> groups vertices into triangles. <strong>Clipping</strong> against the near plane must happen before the perspective divide, because vertices with <code>w ≤ 0</code> project to the wrong side of the screen. A <strong>guard band</strong> lets GPUs skip most side-plane clipping.</li>
+      <li><strong>Triangle setup</strong> computes edge equations, a bounding box and the signed area (winding, used for back-face culling).</li>
+      <li>Three <strong>edge functions</strong> <code>E0, E1, E2</code> are linear half-plane tests. A pixel center is inside when none is negative.</li>
+      <li>Pixel centers sit at <code>(i + 0.5, j + 0.5)</code>. The <strong>top-left rule</strong> gives pixels on a shared edge to exactly one triangle: no cracks, no double hits.</li>
+      <li><strong>Barycentric coordinates</strong> <code>λi = Ei / area</code> sum to 1 and blend every vertex attribute. Depth interpolates linearly in screen space, while UVs need perspective correction (chapter 04).</li>
+      <li>The <strong>painter's algorithm</strong> fails on interpenetrating or cyclic triangles. The <strong>z-buffer</strong> stores per-pixel depth, and the <strong>depth test</strong> (e.g. <code>LESS</code>) keeps the nearest fragment.</li>
+      <li><strong>Early-z</strong> tests depth before shading. Front-to-back order or a depth pre-pass cuts overdraw. <strong>MSAA</strong> adds extra coverage samples per pixel (chapter 07).</li>
+    </ul>
+  </section>
+</main>
+<nav class="pager" aria-label="Chapter navigation"></nav>
+<script src="../assets/common.js"></script>
+<script>
+(function () {
+  "use strict";
+  const $ = (s) => document.querySelector(s);
+  const A = RP.alpha;
+  const MONO = '600 11px "JetBrains Mono", ui-monospace, monospace';
+
+  /* ---------- Rasterization core (screen space: y down, pixel centers at +0.5) ---------- */
+  function edge(a, b, p) { return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]); }
+  // In y-down screen space, a clockwise-on-screen triangle has positive area; its top/left edges:
+  function isTopLeft(a, b) { const dx = b[0] - a[0], dy = b[1] - a[1]; return dy < 0 || (dy === 0 && dx > 0); }
+  function setup(v) {
+    const area = edge(v[0], v[1], v[2]);
+    const s = area < 0 ? -1 : 1;
+    const tl = [0, 1, 2].map((i) => { const a = v[(i + 1) % 3], b = v[(i + 2) % 3]; return s > 0 ? isTopLeft(a, b) : isTopLeft(b, a); });
+    return { v, s, area: Math.abs(area), tl };
+  }
+  function edges(T, p) { const v = T.v, s = T.s; return [s * edge(v[1], v[2], p), s * edge(v[2], v[0], p), s * edge(v[0], v[1], p)]; }
+  function inside(T, E, rule) {
+    if (!(T.area > 0)) return false;
+    for (let i = 0; i < 3; i++) {
+      const e = E[i];
+      if (e > 0) continue;
+      if (e === 0 && (rule === "ge" || (rule === "tl" && T.tl[i]))) continue;
+      return false;
+    }
+    return true;
+  }
+  function bbox(V, g) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of V) { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }
+    return { i0: Math.max(0, Math.floor(x0)), j0: Math.max(0, Math.floor(y0)), i1: Math.min(g.cols - 1, Math.ceil(x1) - 1), j1: Math.min(g.rows - 1, Math.ceil(y1) - 1) };
+  }
+
+  /* ---------- Grid helpers ---------- */
+  function makeGrid(s, minCols, minRows) {
+    const cell = Math.min(s.w / minCols, s.h / minRows);
+    const cols = Math.max(1, Math.floor(s.w / cell + 1e-6)), rows = Math.max(1, Math.floor(s.h / cell + 1e-6));
+    return { cell, cols, rows, ox: (s.w - cols * cell) / 2, oy: (s.h - rows * cell) / 2 };
+  }
+  const gpx = (g, p) => [g.ox + p[0] * g.cell, g.oy + p[1] * g.cell];
+  const gfrom = (g, x, y) => [(x - g.ox) / g.cell, (y - g.oy) / g.cell];
+  function cellFill(ctx, g, i, j, style) { ctx.fillStyle = style; ctx.fillRect(g.ox + i * g.cell, g.oy + j * g.cell, g.cell, g.cell); }
+  function drawGrid(ctx, g, c) {
+    if (g.cell < 5) return;
+    ctx.strokeStyle = A(c.muted, 0.22); ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = 0; i <= g.cols; i++) { const x = Math.round(g.ox + i * g.cell) + 0.5; ctx.moveTo(x, g.oy); ctx.lineTo(x, g.oy + g.rows * g.cell); }
+    for (let j = 0; j <= g.rows; j++) { const y = Math.round(g.oy + j * g.cell) + 0.5; ctx.moveTo(g.ox, y); ctx.lineTo(g.ox + g.cols * g.cell, y); }
+    ctx.stroke();
+  }
+  function polyPath(ctx, P) { ctx.beginPath(); P.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); }
+  function label(ctx, c, text, x, y, color) {
+    ctx.font = MONO; const w = ctx.measureText(text).width;
+    ctx.fillStyle = A(c.surface, 0.85); ctx.fillRect(x - w / 2 - 4, y - 8, w + 8, 16);
+    ctx.fillStyle = color || c.ink; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(text, x, y);
+  }
+  function drawVerts(ctx, c, P, colors, names) {
+    P.forEach((p, i) => {
+      ctx.beginPath(); ctx.arc(p[0], p[1], 8, 0, Math.PI * 2);
+      ctx.fillStyle = colors ? colors[i] : c.ink; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = c.surface; ctx.stroke();
+      if (names) label(ctx, c, names[i], p[0] + 18, p[1] - 14, c.ink);
+    });
+  }
+  function arrow(ctx, x0, y0, x1, y1, color) {
+    const a = Math.atan2(y1 - y0, x1 - x0);
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - 8 * Math.cos(a - 0.45), y1 - 8 * Math.sin(a - 0.45)); ctx.lineTo(x1 - 8 * Math.cos(a + 0.45), y1 - 8 * Math.sin(a + 0.45)); ctx.closePath(); ctx.fill();
+  }
+  /* Draggable points on a canvas. pts() returns the live array; toPx/fromPx convert. */
+  function draggable(view, o) {
+    let idx = -1;
+    const near = (x, y) => { let best = -1, bd = 26 * 26; o.pts().forEach((p, i) => { const q = o.toPx(p); const d = (q[0] - x) ** 2 + (q[1] - y) ** 2; if (d < bd) { bd = d; best = i; } }); return best; };
+    RP.drag(view.el, {
+      down(x, y) { idx = near(x, y); if (idx < 0) { if (o.hover) { o.hover([x, y]); view.draw(); } return false; } view.el.style.cursor = "grabbing"; if (o.hover) o.hover(null); },
+      move(x, y) { const p = o.fromPx(x, y); const P = o.pts()[idx]; P[0] = p[0]; P[1] = p[1]; if (o.change) o.change(); view.draw(); },
+      up() { idx = -1; view.el.style.cursor = ""; },
+      hover(x, y) { view.el.style.cursor = near(x, y) >= 0 ? "grab" : "crosshair"; if (o.hover) { o.hover([x, y]); view.draw(); } },
+    });
+    view.el.addEventListener("pointerleave", () => { if (o.hover && idx < 0) { o.hover(null); view.draw(); } });
+  }
+  const fmt = (v, d = 1) => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(d);
+  const clampN = (p) => [RP.clamp(p[0], 0.01, 0.99), RP.clamp(p[1], 0.01, 0.99)];
+
+  /* =====================================================================
+     STEP 1a — near-plane clipping (top-down camera space)
+     ===================================================================== */
+  const NEAR = 0.8;
+  const clipInit = () => [[-1.8, -4.6], [2.3, -2.4], [0.5, 1.3]];
+  const clip = { pts: clipInit(), m: null };
+  function clipNear(poly, n) {
+    const out = [];
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i + 1) % poly.length];
+      const da = -a[1] - n, db = -b[1] - n; // distance in front of the near plane
+      if (da >= 0) out.push(a);
+      if ((da >= 0) !== (db >= 0)) { const t = da / (da - db); out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]); }
+    }
+    return out;
+  }
+  const clipHud = $("#clip-hud");
+  const clipV = RP.canvas("#clip", (s) => {
+    const { ctx, w, h, c } = s;
+    const scale = Math.min(w / 8.6, (h - 74) / 8.8), cx = w / 2, camY = 16 + 6.3 * scale;
+    const m = clip.m = { scale, cx, camY };
+    const P = (p) => [cx + p[0] * scale, camY + p[1] * scale];
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    // regions
+    const stripTop = h - 48;
+    ctx.fillStyle = A(c.bad, 0.08); ctx.fillRect(0, camY, w, stripTop - 8 - camY);
+    ctx.fillStyle = A(c.warn, 0.10); ctx.fillRect(0, camY - NEAR * scale, w, NEAR * scale);
+    // frustum (90° FOV: x = ±(−z))
+    ctx.strokeStyle = A(c.muted, 0.7); ctx.lineWidth = 1.5; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(cx, camY); ctx.lineTo(cx - camY, 0); ctx.moveTo(cx, camY); ctx.lineTo(cx + camY, 0); ctx.stroke();
+    ctx.strokeStyle = c.ras; ctx.beginPath(); ctx.moveTo(0, camY - NEAR * scale); ctx.lineTo(w, camY - NEAR * scale); ctx.stroke(); ctx.setLineDash([]);
+    ctx.font = MONO; ctx.textAlign = "right"; ctx.textBaseline = "bottom"; ctx.fillStyle = c.ras;
+    ctx.fillText("near plane  z = −n", w - 8, camY - NEAR * scale - 3);
+    ctx.fillStyle = c.bad; ctx.textBaseline = "top"; ctx.fillText("behind camera: w ≤ 0", w - 8, camY + 4);
+    // camera
+    ctx.fillStyle = c.ink; ctx.beginPath(); ctx.moveTo(cx, camY - 9); ctx.lineTo(cx - 7, camY + 6); ctx.lineTo(cx + 7, camY + 6); ctx.closePath(); ctx.fill();
+    // original triangle + clipped polygon
+    const tri = clip.pts;
+    polyPath(ctx, tri.map(P)); ctx.setLineDash([4, 4]); ctx.strokeStyle = c.muted; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    const poly = clipNear(tri, NEAR);
+    if (poly.length >= 3) {
+      const pp = poly.map(P);
+      polyPath(ctx, pp); ctx.fillStyle = A(c.ras, 0.35); ctx.fill(); ctx.strokeStyle = c.ras; ctx.lineWidth = 2; ctx.stroke();
+      ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+      for (let k = 2; k < pp.length - 1; k++) { ctx.beginPath(); ctx.moveTo(pp[0][0], pp[0][1]); ctx.lineTo(pp[k][0], pp[k][1]); ctx.stroke(); }
+      ctx.setLineDash([]);
+    }
+    drawVerts(ctx, c, tri.map(P), tri.map((p) => (-p[1] <= 0 ? c.bad : -p[1] < NEAR ? c.warn : c.ink)), ["v0", "v1", "v2"]);
+    // screen strip: x_ndc in [-2.5, 2.5]
+    const sx = (xn) => 16 + (RP.clamp(xn, -2.5, 2.5) + 2.5) / 5 * (w - 32);
+    ctx.fillStyle = c.surface; ctx.fillRect(16, stripTop, w - 32, 26);
+    ctx.fillStyle = A(c.warn, 0.18); ctx.fillRect(sx(-2), stripTop, sx(-1) - sx(-2), 26); ctx.fillRect(sx(1), stripTop, sx(2) - sx(1), 26);
+    ctx.fillStyle = A(c.out, 0.16); ctx.fillRect(sx(-1), stripTop, sx(1) - sx(-1), 26);
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1; ctx.strokeRect(16.5, stripTop + 0.5, w - 33, 25);
+    ctx.font = MONO; ctx.textBaseline = "top"; ctx.textAlign = "center"; ctx.fillStyle = c.muted;
+    ctx.fillText("viewport  −1 … +1", (sx(-1) + sx(1)) / 2, stripTop + 28);
+    if (w > 420) { ctx.fillText("guard band", (sx(-2) + sx(-1)) / 2, stripTop + 28); ctx.fillText("guard band", (sx(1) + sx(2)) / 2, stripTop + 28); }
+    if (poly.length >= 3) {
+      const xs = poly.map((p) => p[0] / -p[1]);
+      const lo = Math.min(...xs), hi = Math.max(...xs);
+      ctx.fillStyle = A(c.ras, 0.75); ctx.fillRect(sx(lo), stripTop + 9, Math.max(2, sx(hi) - sx(lo)), 8);
+    }
+    const lines = [];
+    tri.forEach((p, i) => {
+      const wv = -p[1];
+      const xn = Math.abs(wv) < 1e-3 ? (p[0] >= 0 ? 99 : -99) : p[0] / wv;
+      const x = sx(xn), col = wv <= 0 ? c.bad : c.ink;
+      ctx.fillStyle = col; ctx.fillRect(x - 1.5, stripTop - 2, 3, 30);
+      ctx.font = MONO; ctx.textAlign = "center"; ctx.textBaseline = "bottom"; ctx.fillText("v" + i, x, stripTop - 3);
+      let note = "";
+      if (wv <= 0) note = "  ← behind camera, x/w flips sign";
+      else if (wv < NEAR) note = "  ← in front, but closer than near";
+      lines.push(`v${i}: z=${p[1].toFixed(2)}  w=${wv.toFixed(2)}  x/w=${Math.abs(xn) > 50 ? "∞" : fmt(xn, 2)}${note}`);
+    });
+    const tris = Math.max(0, poly.length - 2);
+    lines.push(`after near clip: ${poly.length} vertices → ${tris} triangle${tris === 1 ? "" : "s"}`);
+    clipHud.textContent = lines.join("\n");
+  });
+  draggable(clipV, {
+    pts: () => clip.pts,
+    toPx: (p) => { const m = clip.m; return [m.cx + p[0] * m.scale, m.camY + p[1] * m.scale]; },
+    fromPx: (x, y) => { const m = clip.m; return [RP.clamp((x - m.cx) / m.scale, -4.2, 4.2), RP.clamp((y - m.camY) / m.scale, -6.2, 2.3)]; },
+  });
+  $("#clip-reset").addEventListener("click", () => { clip.pts = clipInit(); clipV.draw(); });
+
+  /* =====================================================================
+     STEP 1b — coverage
+     ===================================================================== */
+  const cov = { pts: [[0.16, 0.14], [0.86, 0.34], [0.38, 0.9]], n: 14, samples: true, box: true, g: null };
+  const covHud = $("#cov-hud");
+  const covV = RP.canvas("#cov", (s) => {
+    const { ctx, w, h, c } = s;
+    const g = cov.g = makeGrid(s, cov.n, cov.n);
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const V = cov.pts.map((p) => [p[0] * g.cols, p[1] * g.rows]);
+    const T = setup(V), bb = bbox(V, g);
+    const hit = new Uint8Array(g.cols * g.rows);
+    let n = 0, tested = 0;
+    for (let j = bb.j0; j <= bb.j1; j++) for (let i = bb.i0; i <= bb.i1; i++) {
+      tested++;
+      if (inside(T, edges(T, [i + 0.5, j + 0.5]), "tl")) { hit[j * g.cols + i] = 1; n++; cellFill(ctx, g, i, j, A(c.ras, 0.78)); }
+      else if (cov.box) cellFill(ctx, g, i, j, A(c.warn, 0.10));
+    }
+    drawGrid(ctx, g, c);
+    if (cov.box && bb.i1 >= bb.i0 && bb.j1 >= bb.j0) {
+      ctx.setLineDash([6, 4]); ctx.strokeStyle = c.warn; ctx.lineWidth = 2;
+      ctx.strokeRect(g.ox + bb.i0 * g.cell, g.oy + bb.j0 * g.cell, (bb.i1 - bb.i0 + 1) * g.cell, (bb.j1 - bb.j0 + 1) * g.cell); ctx.setLineDash([]);
+    }
+    if (cov.samples) {
+      const r = Math.max(1.3, Math.min(3.5, g.cell * 0.09));
+      for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) {
+        const p = gpx(g, [i + 0.5, j + 0.5]);
+        ctx.fillStyle = hit[j * g.cols + i] ? c.surface : A(c.muted, 0.7);
+        ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    const P = V.map((p) => gpx(g, p));
+    polyPath(ctx, P); ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke();
+    drawVerts(ctx, c, P, null, ["v0", "v1", "v2"]);
+    const bw = Math.max(0, bb.i1 - bb.i0 + 1), bh = Math.max(0, bb.j1 - bb.j0 + 1);
+    covHud.textContent = `grid ${g.cols}×${g.rows} px\ncovered: ${n} px\nbbox ${bw}×${bh} = ${tested} tested\nhit rate ${tested ? Math.round(n / tested * 100) : 0}%`;
+  });
+  draggable(covV, {
+    pts: () => cov.pts,
+    toPx: (p) => gpx(cov.g, [p[0] * cov.g.cols, p[1] * cov.g.rows]),
+    fromPx: (x, y) => { const q = gfrom(cov.g, x, y); return clampN([q[0] / cov.g.cols, q[1] / cov.g.rows]); },
+  });
+  RP.slider("#cov-grid", (v) => { cov.n = v; covV.draw(); });
+  RP.toggleGroup("#cov-samp", (v) => { cov.samples = v === "on"; covV.draw(); });
+  RP.toggleGroup("#cov-box", (v) => { cov.box = v === "on"; covV.draw(); });
+
+  /* =====================================================================
+     STEP 2 — edge functions + scan
+     ===================================================================== */
+  const ed = { pts: [[0.14, 0.2], [0.82, 0.12], [0.56, 0.9]], mode: "all", hover: null, g: null, total: 0, bb: null,
+    scan: { on: false, k: 0, acc: 0, speed: 10 } };
+  const edHud = $("#edge-hud"), playBtn = $("#scan-play");
+  const edV = RP.canvas("#edge", (s) => {
+    const { ctx, w, h, c } = s;
+    const g = ed.g = makeGrid(s, 12, 12);
+    const EC = [c.vtx, c.frag, c.out];
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const V = ed.pts.map((p) => [p[0] * g.cols, p[1] * g.rows]);
+    const T = setup(V), bb = ed.bb = bbox(V, g);
+    const bw = Math.max(0, bb.i1 - bb.i0 + 1), bh = Math.max(0, bb.j1 - bb.j0 + 1);
+    ed.total = bw * bh;
+    const sc = ed.scan, started = sc.on || sc.k > 0;
+    const bbIndex = (i, j) => (i >= bb.i0 && i <= bb.i1 && j >= bb.j0 && j <= bb.j1 ? (j - bb.j0) * bw + (i - bb.i0) : -1);
+    for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) {
+      const E = edges(T, [i + 0.5, j + 0.5]);
+      if (ed.mode === "all") {
+        const ins = inside(T, E, "tl");
+        const k = bbIndex(i, j);
+        const revealed = !started || (k >= 0 && k < sc.k);
+        if (ins && revealed) cellFill(ctx, g, i, j, A(c.ras, 0.72));
+        else { const npos = E.filter((e) => e >= 0).length; if (npos) cellFill(ctx, g, i, j, A(c.muted, 0.06 * npos)); }
+        if (started && !ins && k >= 0 && k < sc.k) {
+          const p = gpx(g, [i + 0.5, j + 0.5]), r = g.cell * 0.18;
+          ctx.strokeStyle = A(c.muted, 0.8); ctx.lineWidth = 1.5; ctx.beginPath();
+          ctx.moveTo(p[0] - r, p[1] - r); ctx.lineTo(p[0] + r, p[1] + r); ctx.moveTo(p[0] + r, p[1] - r); ctx.lineTo(p[0] - r, p[1] + r); ctx.stroke();
+        }
+      } else {
+        const e = E[+ed.mode];
+        if (e >= 0) cellFill(ctx, g, i, j, A(EC[+ed.mode], 0.26));
+      }
+    }
+    drawGrid(ctx, g, c);
+    if (bw && bh) { ctx.setLineDash([6, 4]); ctx.strokeStyle = c.warn; ctx.lineWidth = 2; ctx.strokeRect(g.ox + bb.i0 * g.cell, g.oy + bb.j0 * g.cell, bw * g.cell, bh * g.cell); ctx.setLineDash([]); }
+    // pixel centers
+    const r = Math.max(1.2, Math.min(3, g.cell * 0.07));
+    ctx.fillStyle = A(c.ink, 0.45);
+    for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) { const p = gpx(g, [i + 0.5, j + 0.5]); ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, Math.PI * 2); ctx.fill(); }
+    // edges
+    const P = V.map((p) => gpx(g, p));
+    for (let i = 0; i < 3; i++) {
+      const a = P[(i + 1) % 3], b = P[(i + 2) % 3];
+      const show = ed.mode === "all" || +ed.mode === i;
+      if (!show) { ctx.strokeStyle = A(c.muted, 0.6); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); continue; }
+      const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, ux = dx / L, uy = dy / L, ext = w + h;
+      ctx.setLineDash([5, 5]); ctx.strokeStyle = A(EC[i], 0.6); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(a[0] - ux * ext, a[1] - uy * ext); ctx.lineTo(b[0] + ux * ext, b[1] + uy * ext); ctx.stroke(); ctx.setLineDash([]);
+      ctx.strokeStyle = EC[i]; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+      let nx = -uy, ny = ux; const o = P[i];
+      if ((o[0] - mx) * nx + (o[1] - my) * ny < 0) { nx = -nx; ny = -ny; }
+      if (ed.mode !== "all") { arrow(ctx, mx, my, mx + nx * 34, my + ny * 34, EC[i]); label(ctx, c, "+", mx + nx * 46, my + ny * 46, EC[i]); }
+      label(ctx, c, "E" + i, mx - nx * 16, my - ny * 16, EC[i]);
+    }
+    drawVerts(ctx, c, P, null, ["v0", "v1", "v2"]);
+    // target pixel: hover or scan cursor
+    let tgt = null;
+    if (ed.hover) { const q = gfrom(g, ed.hover[0], ed.hover[1]); const i = Math.floor(q[0]), j = Math.floor(q[1]); if (i >= 0 && j >= 0 && i < g.cols && j < g.rows) tgt = [i, j]; }
+    if (!tgt && started && sc.k < ed.total && bw) tgt = [bb.i0 + (sc.k % bw), bb.j0 + Math.floor(sc.k / bw)];
+    else if (!tgt && started && sc.k > 0 && bw) { const kk = Math.min(sc.k, ed.total) - 1; tgt = [bb.i0 + (kk % bw), bb.j0 + Math.floor(kk / bw)]; }
+    let txt = "";
+    if (tgt) {
+      const [i, j] = tgt;
+      ctx.strokeStyle = c.ink; ctx.lineWidth = 2.5; ctx.strokeRect(g.ox + i * g.cell + 1.5, g.oy + j * g.cell + 1.5, g.cell - 3, g.cell - 3);
+      const E = edges(T, [i + 0.5, j + 0.5]);
+      const ins = inside(T, E, "tl");
+      const neg = E.map((e, k) => (e < 0 ? "E" + k : null)).filter(Boolean);
+      txt = `pixel (${i}, ${j})  center (${i + 0.5}, ${j + 0.5})\nE0 = ${fmt(E[0])}   E1 = ${fmt(E[1])}   E2 = ${fmt(E[2])}\n→ ${ins ? "inside: keep fragment" : "outside" + (neg.length ? " (" + neg.join(", ") + " < 0)" : " (on a bottom/right edge)")}\n`;
+    } else txt = "hover a pixel to read E0, E1, E2\n";
+    txt += `bbox ${bw}×${bh} · scanned ${Math.min(sc.k, ed.total)}/${ed.total}`;
+    edHud.textContent = txt;
+  });
+  function resetScan() { setPlaying(false); ed.scan.k = 0; ed.scan.acc = 0; }
+  const edAnim = RP.loop($("#edge"), (t, dt) => {
+    const sc = ed.scan; if (!sc.on) return;
+    sc.acc += dt * sc.speed; let moved = false;
+    while (sc.acc >= 1) { sc.acc -= 1; sc.k++; moved = true; }
+    if (sc.k >= ed.total) { sc.k = ed.total; setPlaying(false); moved = true; }
+    if (moved) edV.draw();
+  });
+  edAnim.stop();
+  function setPlaying(on) {
+    ed.scan.on = on;
+    playBtn.setAttribute("aria-pressed", String(on));
+    playBtn.textContent = on ? "❚❚ Pause" : "▶ Scan box";
+    if (on) edAnim.start(); else edAnim.stop();
+  }
+  playBtn.addEventListener("click", () => {
+    if (ed.scan.on) { setPlaying(false); edV.draw(); return; }
+    if (ed.scan.k >= ed.total) ed.scan.k = 0;
+    ed.mode = "all"; edMode.set("all");
+    setPlaying(true); edV.draw();
+  });
+  $("#scan-step").addEventListener("click", () => { setPlaying(false); if (ed.scan.k >= ed.total) ed.scan.k = 0; ed.scan.k++; if (ed.mode !== "all") edMode.set("all"); edV.draw(); });
+  $("#scan-reset").addEventListener("click", () => { resetScan(); edV.draw(); });
+  RP.slider("#scan-speed", (v) => { ed.scan.speed = v; }, { fmt: (v) => v + " px/s" });
+  const edMode = RP.toggleGroup("#edge-mode", (v) => { ed.mode = v; edV.draw(); });
+  draggable(edV, {
+    pts: () => ed.pts,
+    toPx: (p) => gpx(ed.g, [p[0] * ed.g.cols, p[1] * ed.g.rows]),
+    fromPx: (x, y) => { const q = gfrom(ed.g, x, y); return clampN([q[0] / ed.g.cols, q[1] / ed.g.rows]); },
+    change: resetScan,
+    hover: (p) => { ed.hover = p; },
+  });
+
+  /* =====================================================================
+     STEP 3 — top-left fill rule (design area 16 × 12, half-pixel snapping)
+     ===================================================================== */
+  const fillInit = () => [[3, 1], [13, 11], [15, 2], [2, 10]]; // P, Q (shared edge), R (amber), S (magenta)
+  const fl = { pts: fillInit(), rule: "ge", g: null, dx: 0, dy: 0 };
+  const flHud = $("#fill-hud");
+  const fillV = RP.canvas("#fill", (s) => {
+    const { ctx, w, h, c } = s;
+    const g = fl.g = makeGrid(s, 17, 13);
+    fl.dx = Math.floor((g.cols - 16) / 2); fl.dy = Math.floor((g.rows - 12) / 2);
+    const toG = (p) => [p[0] + fl.dx, p[1] + fl.dy];
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const [P, Q, R, S] = fl.pts.map(toG);
+    const TA = setup([P, Q, R]), TB = setup([P, Q, S]);
+    let na = 0, nb = 0, nd = 0, nm = 0;
+    const misses = [];
+    const sx0 = Math.min(P[0], Q[0]), sx1 = Math.max(P[0], Q[0]), sy0 = Math.min(P[1], Q[1]), sy1 = Math.max(P[1], Q[1]);
+    for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) {
+      const p = [i + 0.5, j + 0.5];
+      const a = inside(TA, edges(TA, p), fl.rule), b = inside(TB, edges(TB, p), fl.rule);
+      if (a) na++; if (b) nb++;
+      if (a && b) { nd++; cellFill(ctx, g, i, j, A(c.bad, 0.85)); }
+      else if (a) cellFill(ctx, g, i, j, A(c.vtx, 0.55));
+      else if (b) cellFill(ctx, g, i, j, A(c.frag, 0.55));
+      else if (TA.area > 0 && TB.area > 0 && edge(P, Q, p) === 0 && p[0] >= sx0 && p[0] <= sx1 && p[1] >= sy0 && p[1] <= sy1) { nm++; misses.push([i, j]); }
+    }
+    drawGrid(ctx, g, c);
+    ctx.strokeStyle = c.warn; ctx.lineWidth = 3;
+    misses.forEach(([i, j]) => ctx.strokeRect(g.ox + i * g.cell + 2.5, g.oy + j * g.cell + 2.5, g.cell - 5, g.cell - 5));
+    // centers
+    const r = Math.max(1.3, Math.min(3, g.cell * 0.08));
+    for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) {
+      const p = [i + 0.5, j + 0.5]; const onShared = edge(P, Q, p) === 0;
+      const q = gpx(g, p); ctx.fillStyle = onShared ? c.ink : A(c.ink, 0.35);
+      ctx.beginPath(); ctx.arc(q[0], q[1], onShared ? r * 1.5 : r, 0, Math.PI * 2); ctx.fill();
+    }
+    // triangle edges
+    const drawTriEdges = (T, col, dash) => {
+      const V = T.v.map((p) => gpx(g, p));
+      for (let i = 0; i < 3; i++) {
+        const a = V[(i + 1) % 3], b = V[(i + 2) % 3];
+        const strong = fl.rule === "tl" && T.tl[i];
+        ctx.setLineDash(strong ? dash : [4, 4]); ctx.strokeStyle = col; ctx.lineWidth = strong ? 4 : 1.5;
+        ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    };
+    drawTriEdges(TA, c.vtx, []); drawTriEdges(TB, c.frag, [10, 6]);
+    drawVerts(ctx, c, [P, Q, R, S].map((p) => gpx(g, p)), [c.ink, c.ink, c.vtx, c.frag], null);
+    const names = { ge: "E ≥ 0 (no tie-break)", tl: "top-left rule", gt: "E > 0 (strict)" };
+    flHud.textContent = `rule: ${names[fl.rule]}\namber: ${na} px   magenta: ${nb} px\ndrawn twice: ${nd}\nmissed on shared edge: ${nm}`;
+  });
+  draggable(fillV, {
+    pts: () => fl.pts,
+    toPx: (p) => gpx(fl.g, [p[0] + fl.dx, p[1] + fl.dy]),
+    fromPx: (x, y) => {
+      const q = gfrom(fl.g, x, y);
+      return [RP.clamp(Math.round((q[0] - fl.dx) * 2) / 2, -fl.dx, fl.g.cols - fl.dx), RP.clamp(Math.round((q[1] - fl.dy) * 2) / 2, -fl.dy, fl.g.rows - fl.dy)];
+    },
+  });
+  RP.toggleGroup("#fill-rule-mode", (v) => { fl.rule = v; fillV.draw(); });
+  $("#fill-reset").addEventListener("click", () => { fl.pts = fillInit(); fillV.draw(); });
+
+  /* =====================================================================
+     STEP 4 — barycentrics
+     ===================================================================== */
+  const br = { pts: [[0.5, 0.07], [0.92, 0.9], [0.08, 0.76]], n: 22, mode: "rgb", hover: null, g: null };
+  const brHud = $("#bary-hud");
+  const baryV = RP.canvas("#bary", (s) => {
+    const { ctx, w, h, c } = s;
+    const g = br.g = makeGrid(s, br.n, br.n);
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const C = br.mode === "rgb" ? [[1, 0, 0], [0, 1, 0], [0, 0, 1]] : [RP.hex2rgb(c.vtx), RP.hex2rgb(c.ras), RP.hex2rgb(c.frag)];
+    const V = br.pts.map((p) => [p[0] * g.cols, p[1] * g.rows]);
+    const T = setup(V), bb = bbox(V, g);
+    const mix = (L) => [0, 1, 2].map((k) => L[0] * C[0][k] + L[1] * C[1][k] + L[2] * C[2][k]);
+    for (let j = bb.j0; j <= bb.j1; j++) for (let i = bb.i0; i <= bb.i1; i++) {
+      const E = edges(T, [i + 0.5, j + 0.5]);
+      if (inside(T, E, "tl")) cellFill(ctx, g, i, j, RP.rgb2css(mix(E.map((e) => e / T.area))));
+    }
+    drawGrid(ctx, g, c);
+    const P = V.map((p) => gpx(g, p));
+    polyPath(ctx, P); ctx.strokeStyle = c.ink; ctx.lineWidth = 1.5; ctx.stroke();
+    let txt = "hover to see (λ0, λ1, λ2)";
+    if (br.hover && T.area > 0) {
+      const q = gfrom(g, br.hover[0], br.hover[1]);
+      const L = edges(T, q).map((e) => e / T.area);
+      const hp = br.hover;
+      for (let i = 0; i < 3; i++) {
+        const a = P[(i + 1) % 3], b = P[(i + 2) % 3];
+        polyPath(ctx, [hp, a, b]); ctx.fillStyle = RP.rgb2css(C[i], L[i] >= 0 ? 0.28 : 0.12); ctx.fill();
+      }
+      ctx.strokeStyle = c.ink; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      P.forEach((p) => { ctx.beginPath(); ctx.moveTo(hp[0], hp[1]); ctx.lineTo(p[0], p[1]); ctx.stroke(); }); ctx.setLineDash([]);
+      for (let i = 0; i < 3; i++) {
+        const a = P[(i + 1) % 3], b = P[(i + 2) % 3];
+        label(ctx, c, "λ" + i, (hp[0] + a[0] + b[0]) / 3, (hp[1] + a[1] + b[1]) / 3, c.ink);
+      }
+      const col = mix(L);
+      const ins = L.every((l) => l >= 0);
+      ctx.beginPath(); ctx.arc(hp[0] + 22, hp[1] + 22, 11, 0, Math.PI * 2); ctx.fillStyle = RP.rgb2css(col); ctx.fill();
+      ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke();
+      txt = `λ0 = ${L[0].toFixed(2)}   λ1 = ${L[1].toFixed(2)}   λ2 = ${L[2].toFixed(2)}\nsum = ${(L[0] + L[1] + L[2]).toFixed(2)}\nvalue = Σ λi·Ci = (${col.map((x) => x.toFixed(2)).join(", ")})\n${ins ? "inside: all λ ≥ 0" : "outside: a λ is negative"}`;
+    }
+    drawVerts(ctx, c, P, C.map((x) => RP.rgb2css(x)), ["v0", "v1", "v2"]);
+    brHud.textContent = txt;
+  });
+  draggable(baryV, {
+    pts: () => br.pts,
+    toPx: (p) => gpx(br.g, [p[0] * br.g.cols, p[1] * br.g.rows]),
+    fromPx: (x, y) => { const q = gfrom(br.g, x, y); return clampN([q[0] / br.g.cols, q[1] / br.g.rows]); },
+    hover: (p) => { br.hover = p; },
+  });
+  RP.slider("#bary-res", (v) => { br.n = v; baryV.draw(); });
+  RP.toggleGroup("#bary-col", (v) => { br.mode = v; baryV.draw(); });
+
+  /* =====================================================================
+     STEP 5 — painter's algorithm vs z-buffer
+     ===================================================================== */
+  const dz = { zA: 0.55, zB: 0.35, tilt: 0.8, mode: "z", order: "b2f" };
+  function depthTris(c) {
+    const mag = [[0.26, 0.55], [0.96, 0.14], [0.9, 0.92]];
+    return [
+      { name: "amber", col: c.vtx, pts: [[0.05, 0.1], [0.6, 0.2], [0.18, 0.92]], z: [dz.zA, dz.zA, dz.zA] },
+      { name: "teal", col: c.ras, pts: [[0.36, 0.05], [0.95, 0.44], [0.4, 0.95]], z: [dz.zB, dz.zB, dz.zB] },
+      { name: "magenta", col: c.frag, pts: mag, z: mag.map((p) => RP.clamp(0.4 + dz.tilt * (p[0] - 0.62), 0.01, 0.99)) },
+    ];
+  }
+  function renderDepth(g, c) {
+    const N = g.cols * g.rows;
+    const zb = new Float32Array(N).fill(1), zc = new Int8Array(N).fill(-1);
+    const pz = new Float32Array(N).fill(1), pc = new Int8Array(N).fill(-1);
+    const tris = depthTris(c).map((t, idx) => {
+      const V = t.pts.map((p) => [p[0] * g.cols, p[1] * g.rows]);
+      return Object.assign({}, t, { idx, V, T: setup(V), avg: (t.z[0] + t.z[1] + t.z[2]) / 3 });
+    });
+    const painter = tris.slice().sort((a, b) => b.avg - a.avg); // far → near
+    const zorder = dz.order === "b2f" ? painter : painter.slice().reverse();
+    const raster = (t, cb) => {
+      const bb = bbox(t.V, g);
+      for (let j = bb.j0; j <= bb.j1; j++) for (let i = bb.i0; i <= bb.i1; i++) {
+        const E = edges(t.T, [i + 0.5, j + 0.5]);
+        if (!inside(t.T, E, "tl")) continue;
+        const z = (E[0] * t.z[0] + E[1] * t.z[1] + E[2] * t.z[2]) / t.T.area;
+        cb(j * g.cols + i, z);
+      }
+    };
+    painter.forEach((t) => raster(t, (k, z) => { pc[k] = t.idx; pz[k] = z; }));
+    let frags = 0, passed = 0;
+    zorder.forEach((t) => raster(t, (k, z) => { frags++; if (z < zb[k]) { zb[k] = z; zc[k] = t.idx; passed++; } }));
+    let wrong = 0; for (let k = 0; k < N; k++) if (pc[k] !== zc[k]) wrong++;
+    let visible = 0; for (let k = 0; k < N; k++) if (zc[k] >= 0) visible++;
+    return { tris, painter, zorder, zb, zc, pz, pc, frags, passed, wrong, visible };
+  }
+  const zHud = $("#z-hud"), zLabel = $("#zbuf-label");
+  const zcolV = RP.canvas("#zcol", (s) => {
+    const { ctx, w, h, c } = s;
+    const g = makeGrid(s, 20, 20);
+    const R = renderDepth(g, c);
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    const owner = dz.mode === "z" ? R.zc : R.pc;
+    for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) {
+      const k = j * g.cols + i, o = owner[k];
+      if (o >= 0) cellFill(ctx, g, i, j, A(R.tris[o].col, 0.88));
+    }
+    drawGrid(ctx, g, c);
+    if (dz.mode === "painter") {
+      ctx.strokeStyle = c.bad; ctx.lineWidth = 2;
+      for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) {
+        const k = j * g.cols + i; if (R.pc[k] === R.zc[k]) continue;
+        const x = g.ox + i * g.cell, y = g.oy + j * g.cell, m = g.cell * 0.22;
+        ctx.beginPath(); ctx.moveTo(x + m, y + m); ctx.lineTo(x + g.cell - m, y + g.cell - m); ctx.moveTo(x + g.cell - m, y + m); ctx.lineTo(x + m, y + g.cell - m); ctx.stroke();
+      }
+    }
+    R.tris.forEach((t) => {
+      const P = t.V.map((p) => gpx(g, p));
+      polyPath(ctx, P); ctx.strokeStyle = t.col; ctx.lineWidth = 1.5; ctx.stroke();
+      P.forEach((p, i) => label(ctx, c, t.z[i].toFixed(2), p[0], p[1], t.col));
+    });
+    const order = R.painter.map((t) => t.name).join(" → ");
+    if (dz.mode === "painter") {
+      zHud.textContent = `painter's: sort by average depth\ndraw order: ${order}\nwrong pixels vs z-buffer: ${R.wrong}\nfragments shaded: ${R.frags} (all, ${(R.frags / Math.max(1, R.visible)).toFixed(2)}× overdraw)`;
+    } else {
+      const sub = R.zorder.map((t) => t.name).join(" → ");
+      zHud.textContent = `z-buffer, depth test LESS\nsubmit: ${sub}\nfragments rasterized: ${R.frags}\npass depth test (shaded w/ early-z): ${R.passed}\nrejected early: ${R.frags - R.passed}`;
+    }
+  });
+  const zbufV = RP.canvas("#zbuf", (s) => {
+    const { ctx, w, h, c } = s;
+    const g = makeGrid(s, 20, 20);
+    const R = renderDepth(g, c);
+    ctx.fillStyle = c.surface2; ctx.fillRect(0, 0, w, h);
+    for (let j = 0; j < g.rows; j++) for (let i = 0; i < g.cols; i++) {
+      const k = j * g.cols + i;
+      const z = dz.mode === "z" ? R.zb[k] : (R.pc[k] >= 0 ? R.pz[k] : 1);
+      const v = Math.round(z * 255);
+      cellFill(ctx, g, i, j, `rgb(${v},${v},${v})`); // depth image: physically meant grayscale
+    }
+    drawGrid(ctx, g, c);
+    zLabel.textContent = dz.mode === "z" ? "Depth buffer · near = dark" : "No depth buffer · depth of last-drawn";
+  });
+  const zDraw = () => { zcolV.draw(); zbufV.draw(); };
+  RP.slider("#z-a", (v) => { dz.zA = v; zDraw(); });
+  RP.slider("#z-b", (v) => { dz.zB = v; zDraw(); });
+  RP.slider("#z-tilt", (v) => { dz.tilt = v; zDraw(); }, { fmt: (v) => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(2) });
+  RP.toggleGroup("#z-mode", (v) => { dz.mode = v; zDraw(); });
+  RP.toggleGroup("#z-order", (v) => { dz.order = v; zDraw(); });
+})();
+</script>
+</body>
+</html>
