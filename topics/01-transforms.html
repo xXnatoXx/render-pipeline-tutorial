@@ -10,6 +10,16 @@
   .chain-table td.num { font-family: var(--font-mono); font-size: 0.82rem; white-space: pre; font-variant-numeric: tabular-nums; }
   .chain-table tr.hl td { background: color-mix(in srgb, var(--vtx) 12%, transparent); }
   .space-tag { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; background: var(--vtx); vertical-align: 0; }
+  .space-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr)); gap: 14px; }
+  .space-card { background: var(--surface); border: 1px solid var(--line); border-top: 3px solid var(--vtx); border-radius: var(--radius); padding: 14px 16px; display: grid; gap: 8px; align-content: start; }
+  .space-card h3 { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .space-card h3 small { font: 600 0.72rem/1 var(--font-mono); color: var(--muted); letter-spacing: 0.04em; }
+  .space-card dl { margin: 0; display: grid; gap: 6px; font-size: 0.94rem; }
+  .space-card dt { font: 600 0.7rem/1.2 var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .space-card dd { margin: 0; }
+  .space-card a { color: inherit; }
+  .why { border-left: 3px solid var(--vtx); padding: 2px 0 2px 14px; display: grid; gap: 8px; }
+  .why > strong { font: 600 0.75rem/1.2 var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 </style>
 </head>
 <body data-topic="01">
@@ -22,17 +32,80 @@
     <div class="stage-band"><span class="app">Application</span><span class="on vtx">Vertex</span><span class="ras">Rasterize</span><span class="frag">Fragment</span><span class="out">Output</span></div>
   </section>
   <aside class="objectives"><h2>You'll learn</h2><ul>
-    <li>The six coordinate spaces: object, world, view, clip, NDC and screen.</li>
+    <li>The six coordinate spaces (object, world, view, clip, NDC and screen), why each one exists, and what it is used for.</li>
     <li>Why graphics uses 4D homogeneous coordinates, and what <code>w</code> is for.</li>
     <li>Why matrix order matters (<code>T·R</code> ≠ <code>R·T</code>), and why MVP is written <code>P·V·M</code>.</li>
     <li>How perspective and orthographic projection differ, and why depth precision is uneven.</li>
     <li>How normalized device coordinates become pixel positions, including the y flip.</li>
   </ul></aside>
 
+  <!-- OVERVIEW: why each space exists -->
+  <section class="step" id="why-spaces">
+    <h2><span class="step-no">OVERVIEW</span>Why so many spaces?</h2>
+    <p>Why not one matrix that goes straight from the model file to pixels? Because every question a renderer asks is easy in one space and awkward in the others. "Where is the sword's tip on the mesh?" is an object-space question. "Is the player touching the wall?" is a world-space question. "How far is this from the camera?" is a view-space question. "Is this triangle on screen?" is a clip-space question. "Which pixel does it cover?" is a screen-space question.</p>
+    <p>So each space is a frame where one group of jobs becomes simple, and each matrix is just a way to get from one frame to the next. Here is what each space is for:</p>
+    <div class="space-grid wide">
+      <article class="space-card">
+        <h3><a href="#model">Object space</a> <small>a.k.a. model / local</small></h3>
+        <dl>
+          <dt>What it is</dt><dd>Coordinates relative to the model's own origin, as the artist built it.</dd>
+          <dt>Why it exists</dt><dd>One mesh can be stored once and drawn many times. A forest of 1,000 trees uses one tree mesh plus 1,000 model matrices. The vertex data never changes when the object moves.</dd>
+          <dt>Used for</dt><dd>Modelling tools, skeletal animation (bones bend the mesh before it is placed), local bounding boxes, collision shapes attached to an object, object-space normal maps.</dd>
+        </dl>
+      </article>
+      <article class="space-card">
+        <h3><a href="#model">World space</a></h3>
+        <dl>
+          <dt>What it is</dt><dd>One shared frame for the whole scene, with a fixed origin and fixed axes.</dd>
+          <dt>Why it exists</dt><dd>Objects built in separate files can only be compared once they share a frame. Two positions in different object spaces can't be subtracted; two world positions can.</dd>
+          <dt>Used for</dt><dd>Game logic and level layout, physics and collisions, placing lights, lighting calculations, shadow casting, ray casts and AI line-of-sight.</dd>
+        </dl>
+      </article>
+      <article class="space-card">
+        <h3><a href="#view">View space</a> <small>a.k.a. eye / camera</small></h3>
+        <dl>
+          <dt>What it is</dt><dd>The world re-expressed around the camera: the camera is at the origin, looking down <code>−Z</code>.</dd>
+          <dt>Why it exists</dt><dd>Camera-relative questions become trivial. Distance from the camera is just <code>−z</code>. "In front" means <code>z &lt; 0</code>. It also lets the projection matrix assume a camera at the origin, so it stays simple.</dd>
+          <dt>Used for</dt><dd>Fog and depth effects, sorting transparent objects back-to-front, level-of-detail by distance, view-space normals in deferred shading, SSAO, keeping precision in huge worlds (camera-relative rendering).</dd>
+        </dl>
+      </article>
+      <article class="space-card">
+        <h3><a href="#projection">Clip space</a></h3>
+        <dl>
+          <dt>What it is</dt><dd>4D coordinates <code>(x, y, z, w)</code> output by the vertex shader, before the divide by <code>w</code>.</dd>
+          <dt>Why it exists</dt><dd>A matrix can't divide, so perspective is set up by putting depth into <code>w</code>. Clipping has to happen <i>before</i> the divide: a point behind the camera has <code>w ≤ 0</code>, and dividing by it would flip it onto the screen or blow up. Here the visible test is just <code>−w ≤ x, y, z ≤ w</code>.</dd>
+          <dt>Used for</dt><dd>The vertex shader's output (<code>gl_Position</code>), clipping triangles at the frustum edges, frustum culling, and perspective-correct interpolation of textures and colours (which needs <code>w</code>).</dd>
+        </dl>
+      </article>
+      <article class="space-card">
+        <h3><a href="#divide">NDC</a> <small>normalized device coordinates</small></h3>
+        <dl>
+          <dt>What it is</dt><dd>Clip space divided by <code>w</code>. Everything visible is inside the cube <code>[−1, 1]³</code>.</dd>
+          <dt>Why it exists</dt><dd>It is the same for every camera, field of view and window size. Everything before it can ignore the screen, and everything after it can ignore the camera.</dd>
+          <dt>Used for</dt><dd>The hand-off from the programmable stages to the fixed hardware, depth values for the depth buffer, rebuilding positions from depth in screen-space effects, temporal anti-aliasing jitter, resolution-independent overlays.</dd>
+        </dl>
+      </article>
+      <article class="space-card">
+        <h3><a href="#viewport">Screen space</a> <small>a.k.a. window / pixel</small></h3>
+        <dl>
+          <dt>What it is</dt><dd>Pixel coordinates in the framebuffer, plus a depth value in <code>[0, 1]</code>.</dd>
+          <dt>Why it exists</dt><dd>The final image is a grid of pixels. The rasterizer needs to know exactly which pixel centres a triangle covers, and memory is addressed by pixel.</dd>
+          <dt>Used for</dt><dd>Rasterization, the depth test, <code>gl_FragCoord</code> in fragment shaders, post-processing (blur, bloom, screen-space reflections), UI layout, and mouse picking.</dd>
+        </dl>
+      </article>
+    </div>
+    <p>The chain also runs backwards. To find what the mouse clicked, a game takes the mouse's pixel, turns it into NDC, multiplies by the inverse projection to get a ray in view space, then by the inverse view matrix to get a ray in world space, and finally tests that ray against objects. Each space is a stop you can get on or off at.</p>
+    <div class="callout vtx"><strong>Key idea.</strong> A coordinate space is a point of view chosen to make a job easy. Authoring happens in object space, the simulation in world space, camera maths in view space, clipping in clip space, the hand-off to hardware in NDC, and drawing in pixels.</div>
+  </section>
+
   <!-- STEP 1 -->
   <section class="step" id="model">
     <h2><span class="step-no">STEP 1</span>Object space → world space</h2>
     <p>An artist builds a model around its own origin. A cube's corners might sit at <code>(±0.5, ±0.5, ±0.5)</code>. That is <b>object space</b> (also called model space). It says nothing about where the cube is in the game. The <b>model matrix</b> <code>M</code> places the object in the shared <b>world space</b>: it scales it, rotates it and moves it.</p>
+    <div class="why"><strong>Why two spaces here</strong>
+      <p><b>Object space</b> keeps the mesh reusable. The vertex buffer for a car is uploaded once; driving the car only changes its 16-number model matrix, not its 50,000 vertices. Ten parked cars are the same mesh with ten matrices. Animation also works here: a skeleton bends the arm in the character's own frame, before the character is placed anywhere.</p>
+      <p><b>World space</b> is where things meet. Physics, collisions, light positions, shadows and gameplay distances all need every object in one frame, so that "the lamp is 3 m from the car" has a meaning.</p>
+    </div>
     <p>Moving (translation) is the awkward part. A 3×3 matrix can scale and rotate, but it can't add a constant offset, because a matrix times the zero vector is always zero. The trick is to add a fourth coordinate, <code>w</code>. Points get <code>w = 1</code>, and a 4×4 matrix can then put the offset in its last column. These are <b>homogeneous coordinates</b>. As a bonus, directions such as normals get <code>w = 0</code>, so translation leaves them alone.</p>
     <div class="math"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="center" columnspacing="0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><msub><mi>p</mi><mtext>world</mtext></msub><mo>=</mo><mi>M</mi><mtext> </mtext><msub><mi>p</mi><mtext>object</mtext></msub><mspace width="2em"/><mi>M</mi><mo>=</mo><mi>T</mi><mtext> </mtext><mi>R</mi><mtext> </mtext><mi>S</mi><mspace width="1em"/><mtext>(scale first, then rotate, then translate)</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mi>T</mi><mo stretchy="false">(</mo><msub><mi>t</mi><mi>x</mi></msub><mo separator="true">,</mo><msub><mi>t</mi><mi>y</mi></msub><mo separator="true">,</mo><msub><mi>t</mi><mi>z</mi></msub><mo stretchy="false">)</mo><mo>=</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center center center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>1</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>t</mi><mi>x</mi></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>1</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>t</mi><mi>y</mi></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>1</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>t</mi><mi>z</mi></msub></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>1</mn></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mtable rowspacing="0.25em" columnalign="right left right left" columnspacing="0em 1em 0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mi>T</mi><mtext> </mtext><mo stretchy="false">[</mo><mi>x</mi><mtext>  </mtext><mtext> </mtext><mi>y</mi><mtext>  </mtext><mtext> </mtext><mi>z</mi><mtext>  </mtext><mtext> </mtext><mn>1</mn><msup><mo stretchy="false">]</mo><mi mathvariant="sans-serif">T</mi></msup></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mo stretchy="false">[</mo><mi>x</mi><mo>+</mo><msub><mi>t</mi><mi>x</mi></msub><mtext>  </mtext><mtext>  </mtext><mtext> </mtext><mi>y</mi><mo>+</mo><msub><mi>t</mi><mi>y</mi></msub><mtext>  </mtext><mtext>  </mtext><mtext> </mtext><mi>z</mi><mo>+</mo><msub><mi>t</mi><mi>z</mi></msub><mtext>  </mtext><mtext>  </mtext><mtext> </mtext><mn>1</mn><msup><mo stretchy="false">]</mo><mi mathvariant="sans-serif">T</mi></msup></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mtext>point: moves</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mi>T</mi><mtext> </mtext><mo stretchy="false">[</mo><mi>x</mi><mtext>  </mtext><mtext> </mtext><mi>y</mi><mtext>  </mtext><mtext> </mtext><mi>z</mi><mtext>  </mtext><mtext> </mtext><mn>0</mn><msup><mo stretchy="false">]</mo><mi mathvariant="sans-serif">T</mi></msup></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mo stretchy="false">[</mo><mi>x</mi><mtext>  </mtext><mtext> </mtext><mi>y</mi><mtext>  </mtext><mtext> </mtext><mi>z</mi><mtext>  </mtext><mtext> </mtext><mn>0</mn><msup><mo stretchy="false">]</mo><mi mathvariant="sans-serif">T</mi></msup></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mtext>direction: unchanged</mtext></mrow></mstyle></mtd></mtr></mtable></mstyle></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{gathered}
 p_{\text{world}} = M\,p_{\text{object}} \qquad M = T\,R\,S \quad \text{(scale first, then rotate, then translate)}\\[10pt]
@@ -60,6 +133,10 @@ T\,[x\;\,y\;\,z\;\,0]^{\mathsf T} &amp;= [x\;\,y\;\,z\;\,0]^{\mathsf T} &amp;&am
   <section class="step" id="view">
     <h2><span class="step-no">STEP 2</span>World space → view space</h2>
     <p>GPUs don't have a "camera" object. Instead, we move the <i>whole world</i> so that the camera sits at the origin and looks down <code>−Z</code>, with <code>+Y</code> up and <code>+X</code> to the right. The result is <b>view space</b> (eye or camera space). The <b>view matrix</b> <code>V</code> that does this is the inverse of the camera's own placement in the world. If the camera is 6 units in front of the cube, then in view space the cube is 6 units <i>down −Z</i>, at <code>z = −6</code>.</p>
+    <div class="why"><strong>Why view space exists</strong>
+      <p>Once the camera is fixed at the origin, every camera question gets cheap. Depth is just <code>−z</code>, so fog, depth of field and level-of-detail can read it directly. Transparent objects can be sorted back-to-front by <code>z</code>. In lighting, the direction to the viewer is simply <code>−p</code>. And the projection matrix in the next step can be one fixed formula, because it never has to know where the camera is.</p>
+      <p>It also helps precision. In a planet-sized world, world coordinates can be millions of units from the origin, where 32-bit floats get coarse. Near the camera, view-space numbers stay small and accurate.</p>
+    </div>
     <p>A common way to build <code>V</code> is <code>lookAt(eye, target, up)</code>. It works out the camera's right vector <code>r</code>, up vector <code>u</code> and backward vector <code>b</code> (pointing away from the target), puts them in the rows, and subtracts the eye position:</p>
     <div class="math"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>V</mi><mo>=</mo><mrow><mo fence="true">[</mo><mtable rowspacing="0.16em" columnalign="center center center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>r</mi><mi>x</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>r</mi><mi>y</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>r</mi><mi>z</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><mi>r</mi><mo>⋅</mo><mtext>eye</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>u</mi><mi>x</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>u</mi><mi>y</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>u</mi><mi>z</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><mi>u</mi><mo>⋅</mo><mtext>eye</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>b</mi><mi>x</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>b</mi><mi>y</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><msub><mi>b</mi><mi>z</mi></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mrow><mo>−</mo><mi>b</mi><mo>⋅</mo><mtext>eye</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>0</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>1</mn></mstyle></mtd></mtr></mtable><mo fence="true">]</mo></mrow><mspace width="2em"/><mtable rowspacing="0.25em" columnalign="right left" columnspacing="0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mi>b</mi></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi mathvariant="normal">normalize</mi><mo>⁡</mo><mo stretchy="false">(</mo><mtext>eye</mtext><mo>−</mo><mtext>target</mtext><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mi>r</mi></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi mathvariant="normal">normalize</mi><mo>⁡</mo><mo stretchy="false">(</mo><mtext>up</mtext><mo>×</mo><mi>b</mi><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mi>u</mi></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mi>b</mi><mo>×</mo><mi>r</mi></mrow></mstyle></mtd></mtr></mtable></mrow><annotation encoding="application/x-tex">V = \begin{bmatrix} r_x &amp; r_y &amp; r_z &amp; -r\cdot\text{eye}\\ u_x &amp; u_y &amp; u_z &amp; -u\cdot\text{eye}\\ b_x &amp; b_y &amp; b_z &amp; -b\cdot\text{eye}\\ 0 &amp; 0 &amp; 0 &amp; 1 \end{bmatrix}
 \qquad
@@ -94,6 +171,10 @@ P = \begin{bmatrix} \dfrac{k}{\text{aspect}} &amp; 0 &amp; 0 &amp; 0\\[6pt] 0 &a
 \end{gathered}</annotation></semantics></math></span></div>
     <p>The bottom row is where perspective happens. It copies the vertex's distance in front of the camera, <code>−z_view</code>, into <code>w</code>. A point 8 units away gets <code>w = 8</code>, and one 2 units away gets <code>w = 2</code>. In the next step everything gets divided by <code>w</code>, so distant things shrink. An <b>orthographic</b> projection keeps <code>w = 1</code>. It just scales and shifts a box, so size no longer depends on distance. That suits CAD views, 2D games and shadow maps.</p>
     <p>A point is inside the frustum exactly when <code>−w ≤ x, y, z ≤ w</code>. The GPU clips triangles against these planes in clip space, before any division, which is where the name comes from.</p>
+    <div class="why"><strong>Why clip space exists</strong>
+      <p>It exists because of a conflict. Perspective needs a divide, but a matrix can only multiply and add. So the projection matrix stops halfway: it prepares a divisor (<code>w</code>) and leaves the divide to the hardware.</p>
+      <p>That gap is the safe moment to clip. A vertex behind the camera has <code>w ≤ 0</code>. Dividing by it would flip it upside-down onto the screen, or divide by zero. In clip space the GPU can still cut triangles cleanly at the frustum's six planes with simple comparisons. This is also why the vertex shader's output, <code>gl_Position</code>, is a clip-space value, and why later stages keep <code>w</code> around for perspective-correct texture interpolation.</p>
+    </div>
     <figure class="viz">
       <div class="viz-stage"><canvas id="s3" class="tall" aria-label="Side view of the camera frustum, with the eye on the left and depth increasing to the right. A draggable point shows its projection onto the near plane and its clip coordinates."></canvas><div class="hud" id="s3-hud"></div></div>
       <div class="controls">
@@ -113,6 +194,10 @@ P = \begin{bmatrix} \dfrac{k}{\text{aspect}} &amp; 0 &amp; 0 &amp; 0\\[6pt] 0 &a
   <section class="step" id="divide">
     <h2><span class="step-no">STEP 4</span>Perspective divide → NDC, and why depth is nonlinear</h2>
     <p>After clipping, the GPU divides <code>x</code>, <code>y</code> and <code>z</code> by <code>w</code>. This is the <b>perspective divide</b>. It is fixed-function hardware, so your shader doesn't do it. The result is <b>normalized device coordinates</b> (NDC). The whole frustum becomes the cube <code>[−1, 1]³</code>, with the near plane at <code>z = −1</code> and the far plane at <code>z = +1</code> (OpenGL convention; chapter 08 covers APIs that use <code>[0, 1]</code>).</p>
+    <div class="why"><strong>Why NDC exists</strong>
+      <p>NDC is a contract between software and hardware. Your shaders handle cameras, lenses and field of view; the hardware handles windows and pixels. NDC is the one shape both sides agree on, so neither needs to know about the other. The same NDC image can go to a 640×480 window, a 4K monitor or a shadow map unchanged.</p>
+      <p>Screen-space effects also use it in reverse: they read a pixel's stored depth, rebuild its NDC position, and multiply by the inverse projection to recover where that pixel was in view space.</p>
+    </div>
     <div class="math"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="center" columnspacing="0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mtext>ndc</mtext><mo>=</mo><mrow><mo fence="true">(</mo><mfrac><msub><mi>x</mi><mi>c</mi></msub><mi>w</mi></mfrac><mo separator="true">,</mo><mtext> </mtext><mfrac><msub><mi>y</mi><mi>c</mi></msub><mi>w</mi></mfrac><mo separator="true">,</mo><mtext> </mtext><mfrac><msub><mi>z</mi><mi>c</mi></msub><mi>w</mi></mfrac><mo fence="true">)</mo></mrow></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><msub><mi>z</mi><mtext>ndc</mtext></msub><mo stretchy="false">(</mo><mi>d</mi><mo stretchy="false">)</mo><mo>=</mo><mfrac><mrow><mi>f</mi><mo>+</mo><mi>n</mi></mrow><mrow><mi>f</mi><mo>−</mo><mi>n</mi></mrow></mfrac><mo>−</mo><mfrac><mrow><mn>2</mn><mi>f</mi><mi>n</mi></mrow><mrow><mo stretchy="false">(</mo><mi>f</mi><mo>−</mo><mi>n</mi><mo stretchy="false">)</mo><mtext> </mtext><mi>d</mi></mrow></mfrac><mspace width="2em"/><mi>d</mi><mo>=</mo><mo>−</mo><msub><mi>z</mi><mtext>view</mtext></msub><mo>=</mo><mi>w</mi><mspace width="1em"/><mtext>(distance in front of the camera)</mtext></mrow></mstyle></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{gathered}
 \text{ndc} = \left(\frac{x_c}{w},\ \frac{y_c}{w},\ \frac{z_c}{w}\right)\\[10pt]
 z_{\text{ndc}}(d) = \frac{f+n}{f-n} - \frac{2fn}{(f-n)\,d} \qquad d = -z_{\text{view}} = w \quad \text{(distance in front of the camera)}
@@ -138,6 +223,10 @@ z_{\text{ndc}}(d) = \frac{f+n}{f-n} - \frac{2fn}{(f-n)\,d} \qquad d = -z_{\text{
   <section class="step" id="viewport">
     <h2><span class="step-no">STEP 5</span>Viewport: NDC → pixels</h2>
     <p>The last fixed step is the <b>viewport transform</b>. It stretches NDC <code>x</code> and <code>y</code> from <code>[−1, 1]</code> to the window size in pixels. There's one trap. NDC <code>y</code> points <i>up</i>, but this tutorial's screen space (like canvas, and most image formats) has its origin at the top-left with <code>y</code> pointing <i>down</i>. So <code>y</code> gets flipped. (OpenGL's own window coordinates actually have their origin at the bottom-left. The flip shown here is what you do when you draw into a top-left canvas.) Depth gets remapped too, from <code>[−1, 1]</code> to the depth buffer's <code>[0, 1]</code>.</p>
+    <div class="why"><strong>Why screen space exists</strong>
+      <p>The image is stored as a grid of pixels, so in the end every triangle has to be described in pixels. The rasterizer tests pixel centres against triangle edges, the depth test compares per-pixel values, and fragment shaders see their own position as <code>gl_FragCoord</code>.</p>
+      <p>Anything that works on the finished image lives here too: blur, bloom, screen-space reflections, UI layout, and mouse input. A mouse click arrives in pixels, so picking an object starts in screen space and runs the chain backwards to a ray in the world.</p>
+    </div>
     <div class="math"><span class="katex"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable rowspacing="0.25em" columnalign="right left right left" columnspacing="0em 1em 0em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>x</mi><mtext>px</mtext></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mfrac><mrow><msub><mi>x</mi><mtext>ndc</mtext></msub><mo>+</mo><mn>1</mn></mrow><mn>2</mn></mfrac><mtext> </mtext><mi>W</mi></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><msub><mi>y</mi><mtext>px</mtext></msub></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mfrac><mrow><mn>1</mn><mo>−</mo><msub><mi>y</mi><mtext>ndc</mtext></msub></mrow><mn>2</mn></mfrac><mtext> </mtext><mi>H</mi></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>←</mo><mtext>flip: NDC </mtext><mi>y</mi><mtext> up, screen </mtext><mi>y</mi><mtext> down</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mtext>depth</mtext></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mo>=</mo><mfrac><mrow><msub><mi>z</mi><mtext>ndc</mtext></msub><mo>+</mo><mn>1</mn></mrow><mn>2</mn></mfrac></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mtext>(default depth range </mtext><mn>0</mn><mo>…</mo><mn>1</mn><mtext>)</mtext></mrow></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow></mrow></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="true"><mrow><mrow></mrow><mtext>pixel </mtext><mo stretchy="false">(</mo><mi>i</mi><mo separator="true">,</mo><mi>j</mi><mo stretchy="false">)</mo><mtext> has its centre at </mtext><mo stretchy="false">(</mo><mi>i</mi><mo>+</mo><mn>0.5</mn><mo separator="true">,</mo><mtext> </mtext><mi>j</mi><mo>+</mo><mn>0.5</mn><mo stretchy="false">)</mo></mrow></mstyle></mtd></mtr></mtable><annotation encoding="application/x-tex">\begin{aligned}
 x_{\text{px}} &amp;= \frac{x_{\text{ndc}} + 1}{2}\,W\\[4pt]
 y_{\text{px}} &amp;= \frac{1 - y_{\text{ndc}}}{2}\,H &amp;&amp; \leftarrow \text{flip: NDC } y \text{ up, screen } y \text{ down}\\[4pt]
