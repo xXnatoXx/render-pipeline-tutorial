@@ -30,9 +30,25 @@ SPEC.md             page contract, conventions and definition of done
 
 Conventions: column-major matrices, `MVP = P · V · M`, right-handed and y-up, camera looks down −Z, OpenGL clip space (NDC z ∈ [−1, 1]). Chapter 08 covers how Direct3D, Vulkan, Metal and WebGPU differ.
 
+## Formulas
+
+Formula boxes (`<div class="math">`) contain **MathML**, which browsers render natively, so there is no math library and no network request. The MathML was generated from LaTeX with [KaTeX](https://katex.org) (`output: "mathml"`), and each formula keeps its LaTeX source in an `<annotation encoding="application/x-tex">` element.
+
+To change a formula, edit its LaTeX and regenerate the MathML, for example:
+
+```js
+katex.renderToString(tex, { displayMode: true, output: "mathml" })
+```
+
+Chrome ignores MathML's `columnalign` attribute, so `style.css` lines up multi-line equations (`aligned`, `cases`) with CSS.
+
+## Updating the stylesheet
+
+Every page links `style.css?v=N`. GitHub Pages lets browsers cache files for 10 minutes, so after changing `assets/style.css`, bump `N` in all pages. Otherwise visitors can get the new HTML with the old CSS.
+
 ## How it was made
 
-The shared kit and spec were written first, then frozen. Nine AI agents each wrote one chapter in parallel against that contract. All visuals are procedural (Canvas2D, plus WebGL where it helps), so the site makes no network requests beyond Google Fonts.
+The shared kit and spec were written first, then frozen. Nine AI agents each wrote one chapter in parallel against that contract. All visuals are procedural (Canvas2D, plus WebGL where it helps), and formulas are native MathML, so the site makes no network requests beyond Google Fonts.
 
 ## License
 
